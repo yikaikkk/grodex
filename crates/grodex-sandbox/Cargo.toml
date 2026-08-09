@@ -1,0 +1,28 @@
+[package]
+name = "grodex-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Sandbox runtime — profile management and path validation for Grodex"
+
+[dependencies]
+grodex-core.workspace = true
+grodex-sandbox-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+which = "8.0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "grodex-supervisor"
+path = "src/bin/supervisor.rs"
+
+[lints]
+workspace = true

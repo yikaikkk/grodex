@@ -1,0 +1,40 @@
+[package]
+name = "grodex-loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Agent Loop — Session Supervisor, Turn Coordinator, Sampling Step"
+
+[target.'cfg(not(loom))'.dependencies]
+grodex-core.workspace = true
+grodex-provider.workspace = true
+grodex-sampler.workspace = true
+grodex-config.workspace = true
+grodex-rollout.workspace = true
+grodex-permission.workspace = true
+grodex-skills.workspace = true
+grodex-memory.workspace = true
+grodex-sandbox.workspace = true
+grodex-subagent.workspace = true
+grodex-prompt.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+sha2 = "0.10"
+grodex-capability.workspace = true
+
+[target.'cfg(not(loom))'.dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = { version = "0.7", features = ["checkpoint"] }
+
+[lints]
+workspace = true

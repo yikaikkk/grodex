@@ -1,0 +1,77 @@
+# Grodex Configuration
+# Copy to ~/.grodex/config.toml or <project>/.grodex/config.toml
+
+# ── Provider ──────────────────────────────────────────
+# Provider name: "openai", "anthropic", or custom
+provider = "openai"
+
+# Model name
+model = "gpt-5"
+
+# Wire protocol: "responses", "chat", or "messages"
+#   responses  → OpenAI Responses API
+#   chat       → OpenAI Chat Completions API
+#   messages   → Anthropic Messages API
+wire_protocol = "responses"
+
+# API endpoint (optional, defaults to provider's standard endpoint)
+# endpoint = "https://api.openai.com/v1"
+
+# ── Authentication ────────────────────────────────────
+# API key can be set here or via environment variable:
+#   OPENAI_API_KEY=sk-...
+#   ANTHROPIC_API_KEY=sk-ant-...
+# Config file takes precedence over env vars.
+# api_key = "sk-..."
+
+# ── Tools ─────────────────────────────────────────────
+# [rules]
+# read_file = "allow"
+# write_file = "ask"
+# exec = "ask"
+
+# ── Sandbox ───────────────────────────────────────────
+# Profile: "workspace", "readonly", "restricted", "full"
+# sandbox_profile = "workspace"
+
+# ── Memory ────────────────────────────────────────────
+# Enable long-term memory
+# [memory]
+# enabled = true
+# path = "~/.grodex/memory.json"
+
+# ── Model Routes (failover) ───────────────────────────
+# Define multiple provider/model candidates with ordered failover.
+# When a candidate fails with a failover-eligible error (Transport, 5xx,
+# RateLimited), the next candidate is tried. Each candidate has its own
+# circuit breaker.
+#
+# [model_routes.default]
+# # How long to stay on a candidate after success:
+# #   "turn"    = reset every Turn (default)
+# #   "step"    = stay across Steps within a Turn
+# #   "session" = stay for the entire Session
+# sticky_scope = "turn"
+# # Max candidates to try in one failover sequence
+# max_candidates = 5
+# # Max wall-clock seconds for a single Turn's sampling
+# turn_deadline_secs = 120
+#
+# [[model_routes.default.candidates]]
+# candidate_id = "openai-primary"
+# provider_id = "openai"
+# model_id = "gpt-5"
+# wire_protocol = "responses"
+# endpoint = "https://api.openai.com/v1"
+# priority = 0
+# account_id = "default"
+# region = "us-east-1"
+# revision = "2024-08"
+#
+# [[model_routes.default.candidates]]
+# candidate_id = "anthropic-fallback"
+# provider_id = "anthropic"
+# model_id = "claude-3-opus"
+# wire_protocol = "messages"
+# endpoint = "https://api.anthropic.com/v1"
+# priority = 1

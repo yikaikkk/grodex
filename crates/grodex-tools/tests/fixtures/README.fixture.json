@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "fixture_directory": "crates/grodex-tools/tests/fixtures",
+  "description": "Golden fixtures for built-in tool response shapes. Each file follows the naming convention: <category>__<tool_variant>__<params>.json. Fixtures are serde-roundtrippable against the corresponding structs in grodex-tools/src/common.rs.",
+  "total_fixtures": 7,
+  "fixtures": [
+    {
+      "index": 1,
+      "filename": "tool_responses__read_file_small__whole.json",
+      "status": "existing",
+      "category": "read",
+      "tool_variant": "read_file_small",
+      "schema": "ReadTool output for files fitting entirely within the bounded view (no truncation). Includes FileSnapshot with Whole read_range and a ToolResultEnvelope carrying the full Text model_content.",
+      "related_structs": ["FileSnapshot", "ToolResultEnvelope", "ModelContent::Text"]
+    },
+    {
+      "index": 2,
+      "filename": "tool_responses__edit_in_place__hashline_ok.json",
+      "status": "existing",
+      "category": "edit",
+      "tool_variant": "edit_in_place",
+      "schema": "EditTool successful apply with hashline-anchored hunks. Includes expected_file_version fence, ChangeType=Updated changed_resources entry, and before/after content_hash pair.",
+      "related_structs": ["StaleFile", "ChangedResource", "FileSnapshot"]
+    },
+    {
+      "index": 3,
+      "filename": "tool_responses__apply_patch__multifile_atomic.json",
+      "status": "existing",
+      "category": "patch",
+      "tool_variant": "apply_patch",
+      "schema": "Multi-file PatchPlan apply: 3 targets (1 Add, 1 Update, 1 Delete). atomicity=StrictAtomic. Includes plan_hash, per-file PatchHunks with before/after byte ranges.",
+      "related_structs": ["PatchPlan", "PatchFile", "PatchHunk", "AtomicityLevel"]
+    },
+    {
+      "index": 4,
+      "filename": "tool_responses__exec_short__exit_zero.json",
+      "status": "existing",
+      "category": "exec",
+      "tool_variant": "exec_short",
+      "schema": "Short-lived exec (echo \"hello world\"). exit_code=0, ExecStatus=Success, HeadTailBuffer total output < capacities, so omitted_bytes=0. No full_output_ref.",
+      "related_structs": ["ExecOutput", "ExecStatus::Success", "HeadTailBuffer"]
+    },
+    {
+      "index": 5,
+      "filename": "tool_responses__write_file__atomic_rename.json",
+      "status": "existing",
+      "category": "write",
+      "tool_variant": "write_file",
+      "schema": "WriteTool atomic create with fsync. Includes FileSnapshot for the new file (ChangeType=Created), contract_version bump, and retryability=NotRetryable for non-idempotent path.",
+      "related_structs": ["ToolResultEnvelope", "ChangedResource", "FileSnapshot", "Retryability::NotRetryable"]
+    },
+    {
+      "index": 6,
+      "filename": "tool_responses__read_file_large__head100_tail100.json",
+      "status": "new",
+      "category": "read",
+      "tool_variant": "read_file_large",
+      "schema": "ReadTool HeadTail output for a 5000-line text log. truncated=true, head[100]=first 100 lines, tail[100]=last 100 lines. FileSnapshot marks oversized file. TruncationStrategy=HeadTail, omitted=4800 lines.",
+      "related_structs": ["FileSnapshot", "TruncationInfo", "TruncationStrategy::HeadTail"]
+    },
+    {
+      "index": 7,
+      "filename": "tool_responses__exec_long_running__head_tail.json",
+      "status": "new",
+      "category": "exec",
+      "tool_variant": "exec_long_running",
+      "schema": "Long-running cargo build (60s timeout fence). exit_code=0, total_output_bytes=2MB > head+tail capacities. Bounded view: head=4KB compile cascade, tail=4KB Finished line + warnings. Includes ProcessHandle with Exited state and lease_expires_at.",
+      "related_structs": ["ProcessHandle", "ProcessState::Exited", "HeadTailBuffer", "ExecOutput", "ExecStatus::Success"]
+    }
+  ],
+  "conventions": {
+    "naming_pattern": "<category>__<variant>__<params>.json",
+    "serde_compat_targets": "all top-level keys MUST match fields on structs in grodex-tools/src/common.rs; enums use serde default (external tag for ProcessState, internal for FileType, unit-like for ExecStatus)",
+    "head_tail_semantics": "When HeadTailBuffer is simulated in fixture JSON, the head/tail strings MUST be valid UTF-8; placeholders like *_TRUNCATED_FOR_BREVITY are permitted as long as the byte-size narrative in total_output_bytes / total_lines holds",
+    "process_state_serialization": "ProcessState::Exited(i32) serializes as { \"Exited\": 0 } under serde default tag; fixture follows same"
+  }
+}

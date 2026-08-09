@@ -1,0 +1,4 @@
+data: {"type":"response.reasoning_text.delta","output_index":0,"delta":"Let me think about this carefully."}
+data: {"type":"response.reasoning_text.delta","output_index":0,"delta":" The user is asking a simple question."}
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"The answer is 42."}
+data: {"type":"response.completed","response":{"id":"resp_test_004","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":8,"total_tokens":18,"output_tokens_details":{"reasoning_tokens":6}},"model":"gpt-5"}}

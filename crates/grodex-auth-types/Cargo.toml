@@ -1,0 +1,16 @@
+[package]
+name = "grodex-auth-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Authentication and credential data model for Grodex"
+
+[dependencies]
+serde.workspace = true
+chrono.workspace = true
+grodex-core.workspace = true
+
+[lints]
+workspace = true

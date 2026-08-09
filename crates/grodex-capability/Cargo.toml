@@ -1,0 +1,19 @@
+[package]
+name = "grodex-capability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Tool/Skill/MCP capability model for Grodex"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+grodex-core.workspace = true
+rand = "0.8"
+sha2.workspace = true
+
+[lints]
+workspace = true

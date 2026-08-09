@@ -1,0 +1,28 @@
+{
+  "input": {
+    "command": "cargo build --workspace --release --all-targets",
+    "timeout_s": 60
+  },
+  "process_handle": {
+    "process_id": 84213,
+    "operation_id": "op-cargo-build-20240613-001",
+    "environment_id": "sandbox-rust-stable-1.85",
+    "created_at": {
+      "secs_since_epoch": 1718237000,
+      "nanos_since_epoch": 500000000
+    },
+    "state": "Exited",
+    "stdin_open": false,
+    "tty": false,
+    "lease_expires_at": {
+      "secs_since_epoch": 1718237090,
+      "nanos_since_epoch": 0
+    }
+  },
+  "expected": {
+    "exit_code": 0,
+    "head": "   Compiling libc v0.2.158\n   Compiling proc-macro2 v1.0.86\n   Compiling unicode-ident v1.0.13\n   Compiling autocfg v1.3.0\n   Compiling version_check v0.9.5\n   Compiling cfg-if v1.0.0\n   Compiling serde_derive v1.0.210\n   Compiling serde v1.0.210\n   Compiling parking_lot_core v0.9.11\n   Compiling scopeguard v1.2.0\n   Compiling smallvec v1.13.2\n   Compiling lock_api v0.4.12\n   Compiling parking_lot v0.12.3\n   Compiling thiserror v2.0.66\n   Compiling anyhow v1.0.93\n   Compiling itoa v1.0.12\n   Compiling ryu v1.0.18\n   Compiling serde_json v1.0.128\n   Compiling bytes v1.7.2\n   Compiling fnv v1.0.7\n   Compiling subtle v2.6.1\n   Compiling crc32fast v1.4.2\n   Compiling adler v1.0.2\n   Compiling miniz_oxide v0.8.0\n   Compiling flate2 v1.0.33\n   Compiling tar v0.4.41\n   Compiling filetime v0.2.24\n   Compiling xattr v1.3.1\n   Compiling bzip2-sys v0.4.43+1.0.8\n   Compiling bzip2 v0.5.1\n   Compiling zstd-safe v7.2.1\n   Compiling zstd-sys v2.0.13+zstd.1.5.6\n   Compiling zstd v0.13.2\n   Compiling grodex-core v0.1.0\n   Compiling grodex-auth-types v0.1.0\n   Compiling grodex-capability v0.1.0\nHEAD_TRUNCATED_AT_4KB_BOUNDARY",
+    "tail": "   Compiling grodex-mcp v0.1.0\n   Compiling grodex-memory v0.1.0\n   Compiling grodex-loop v0.1.0\n   Compiling grodex-tools v0.1.0\n   Compiling grodex-skills v0.1.0\n   Compiling grodex-subagent v0.1.0\n   Compiling grodex-prompt v0.1.0\n   Compiling grodex-sandbox-types v0.1.0\n   Compiling grodex-provider v0.1.0\n   Compiling grodex-sampler v0.1.0\n   Compiling grodex-config v0.1.0\n   Compiling grodex-rollout v0.1.0\n   Compiling grodex-permission v0.1.0\n   Compiling grodex-protocol v0.1.0\n   Compiling grodex-auth v0.1.0\n   Compiling grodex-sandbox v0.1.0\n   Compiling grodex-cli v0.1.0\n    Finished `release` profile [optimized] target(s) in 3m 42s\nwarning: variant `VariantName` is never constructed\n  --> crates/grodex-core/src/context.rs:42:5\n   |\n   = note: this warning originates in the macro `...` which comes from the expansion of the derive macro `...`\n   = note: `#[warn(dead_code)]` on by default\nwarning: 3 warnings emitted\nTAIL_PADDED_TO_4KB_VIA_LOSSLESS_UTF8_BOUNDARY",
+    "total_output_bytes": 2000000
+  }
+}

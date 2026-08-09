@@ -1,0 +1,56 @@
+{
+  "input": {
+    "path": "/var/data/reports/large_dump_2024.log",
+    "head_lines": 100,
+    "tail_lines": 100
+  },
+  "snapshot": {
+    "canonical_resource_id": "fs:///var/data/reports/large_dump_2024.log",
+    "display_path": "/var/data/reports/large_dump_2024.log",
+    "file_type": "Text",
+    "size": 2847593,
+    "mtime_secs": 1718236800,
+    "content_hash": "sha256:a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef",
+    "range_hash": null,
+    "line_ending": "Lf",
+    "encoding": "utf-8",
+    "read_at": {
+      "secs_since_epoch": 1718237000,
+      "nanos_since_epoch": 123456789
+    },
+    "environment_id": "",
+    "read_range": "Whole"
+  },
+  "expected": {
+    "truncated": true,
+    "head": [
+      "2024-06-13T00:00:01Z INFO  service=router starting request_id=req-0001",
+      "2024-06-13T00:00:02Z INFO  service=router endpoint=/api/v1/users method=GET status=200 duration_ms=12",
+      "2024-06-13T00:00:03Z INFO  service=auth   user_login user_id=u-1001 success=true",
+      "2024-06-13T00:00:04Z DEBUG service=cache  hit key=session:u-1001 ttl_secs=86399",
+      "2024-06-13T00:00:05Z INFO  service=router endpoint=/api/v1/items method=POST status=201 duration_ms=47",
+      "2024-06-13T00:00:06Z INFO  service=router endpoint=/api/v1/search method=GET status=200 duration_ms=203",
+      "2024-06-13T00:00:07Z WARN  service=db     slow_query ms=850 query=\"SELECT * FROM orders WHERE ...\"",
+      "2024-06-13T00:00:08Z INFO  service=auth   user_login user_id=u-1002 success=true",
+      "2024-06-13T00:00:09Z INFO  service=router endpoint=/api/v1/users/u-1002 method=GET status=200 duration_ms=9",
+      "2024-06-13T00:00:10Z DEBUG service=cache  miss key=profile:u-1002",
+      "HEAD_LINES_11_TO_99_TRUNCATED_FOR_BREVITY",
+      "2024-06-13T00:01:40Z INFO  service=router endpoint=/healthz method=GET status=200 duration_ms=1"
+    ],
+    "tail": [
+      "2024-06-13T06:58:21Z INFO  service=router endpoint=/api/v1/orders/o-9988 method=GET status=200 duration_ms=18",
+      "2024-06-13T06:58:22Z DEBUG service=cache  hit key=inventory:sku-5544 ttl_secs=1200",
+      "2024-06-13T06:58:23Z INFO  service=auth   user_login user_id=u-8899 success=true",
+      "2024-06-13T06:58:24Z INFO  service=router endpoint=/api/v1/cart method=POST status=200 duration_ms=62",
+      "2024-06-13T06:58:25Z INFO  service=router endpoint=/api/v1/checkout method=POST status=201 duration_ms=315",
+      "2024-06-13T06:58:26Z INFO  service=billing charge_ok order=o-9989 amount_usd=299.00",
+      "2024-06-13T06:58:27Z WARN  service=db     slow_query ms=1200 query=\"SELECT SUM(amount) FROM transactions ...\"",
+      "2024-06-13T06:58:28Z INFO  service=router endpoint=/api/v1/users/u-8899/orders method=GET status=200 duration_ms=34",
+      "2024-06-13T06:58:29Z ERROR service=notify webhook_failed url=https://hooks.example.com/xxx status=502 attempts=3",
+      "2024-06-13T06:58:30Z INFO  service=router endpoint=/shutdown method=POST status=200 duration_ms=4 reason=deploy",
+      "TAIL_LINES_11_TO_99_TRUNCATED_FOR_BREVITY",
+      "2024-06-13T06:59:59Z INFO  service=supervisor graceful_shutdown_complete active_connections=0"
+    ],
+    "total_lines": 5000
+  }
+}

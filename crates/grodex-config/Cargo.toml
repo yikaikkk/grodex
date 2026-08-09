@@ -1,0 +1,22 @@
+[package]
+name = "grodex-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Layered configuration system for Grodex"
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+dirs.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+grodex-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

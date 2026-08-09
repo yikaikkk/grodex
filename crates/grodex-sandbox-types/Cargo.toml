@@ -1,0 +1,16 @@
+[package]
+name = "grodex-sandbox-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Sandbox profile and binding types for Grodex"
+
+[dependencies]
+serde.workspace = true
+chrono.workspace = true
+grodex-core.workspace = true
+
+[lints]
+workspace = true

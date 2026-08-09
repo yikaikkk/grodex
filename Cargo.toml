@@ -1,0 +1,82 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/grodex-core",
+    "crates/grodex-capability",
+    "crates/grodex-rollout",
+    "crates/grodex-protocol",
+    "crates/grodex-config",
+    "crates/grodex-auth-types",
+    "crates/grodex-sandbox-types",
+    "crates/grodex-provider",
+    "crates/grodex-sampler",
+    "crates/grodex-loop",
+    "crates/grodex-permission",
+    "crates/grodex-tools",
+    "crates/grodex-skills",
+    "crates/grodex-prompt",
+    "crates/grodex-subagent",
+    "crates/grodex-sandbox",
+    "crates/grodex-auth",
+    "crates/grodex-mcp",
+    "crates/grodex-memory",
+    "crates/grodex-cli",
+    "crates/grodex-tui",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/grodex/grodex"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+dirs = "6"
+sha2 = "0.10"
+tempfile = "3"
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+futures = "0.3"
+async-stream = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+base64 = "0.22"
+ratatui = { version = "0.27", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
+
+# Internal crates
+grodex-core = { path = "crates/grodex-core" }
+grodex-capability = { path = "crates/grodex-capability" }
+grodex-rollout = { path = "crates/grodex-rollout" }
+grodex-protocol = { path = "crates/grodex-protocol" }
+grodex-config = { path = "crates/grodex-config" }
+grodex-auth-types = { path = "crates/grodex-auth-types" }
+grodex-sandbox-types = { path = "crates/grodex-sandbox-types" }
+grodex-provider = { path = "crates/grodex-provider" }
+grodex-sampler = { path = "crates/grodex-sampler" }
+grodex-loop = { path = "crates/grodex-loop" }
+grodex-permission = { path = "crates/grodex-permission" }
+grodex-tools = { path = "crates/grodex-tools" }
+grodex-skills = { path = "crates/grodex-skills" }
+grodex-prompt = { path = "crates/grodex-prompt" }
+grodex-subagent = { path = "crates/grodex-subagent" }
+grodex-sandbox = { path = "crates/grodex-sandbox" }
+grodex-auth = { path = "crates/grodex-auth" }
+grodex-mcp = { path = "crates/grodex-mcp" }
+grodex-memory = { path = "crates/grodex-memory" }
+grodex-cli = { path = "crates/grodex-cli" }
+grodex-tui = { path = "crates/grodex-tui" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"

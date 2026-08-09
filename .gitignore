@@ -1,0 +1,41 @@
+# ── Rust build ──────────────────────────────────────
+/target
+**/*.rs.bk
+
+# ── IDE / editor ────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+\#*\#
+
+# ── macOS ───────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ── Grodex runtime data ─────────────────────────────
+# Session rollout journals and blob stores (user data, not tracked)
+.grodex/sessions/
+rollout.jsonl
+blobs/
+
+# Temp sandbox profile files leaked from tests
+grodex-sandbox-*.sb
+
+# Memory store (user data)
+.grodex/memory.json
+
+# ── Secret / credential files ───────────────────────
+*.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# ── Misc ────────────────────────────────────────────
+*.log
+*.tmp
+.direnv/
