@@ -3,13 +3,39 @@
 //! Combines the ApprovalBroker and PermissionPolicy into a single
 //! entry point for the Tool Pipeline.
 
+//! PermissionManager — session-scoped coordinator.
+//!
+//! Combines the ApprovalBroker and PermissionPolicy into a single
+//! entry point for the Tool Pipeline. When `check()` returns `Ask`,
+//! the manager optionally **publishes a notification** (see
+//! `approval_tx`) so a frontend can surface the pending approval for
+//! a user decision.
+
 use crate::broker::ApprovalBroker;
 use crate::policy::{ArgPattern, PermissionPolicy, PolicyRule};
 use crate::ticket::{ApprovalTicket, RiskLevel};
 use grodex_core::id::ToolCallId;
 use grodex_core::policy::PolicyDecision;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+
+/// Payload pushed through `PermissionManager.approval_tx` whenever a
+/// new pending approval ticket is created (i.e. when policy says Ask).
+///
+/// Plain struct with no lifetimes so the permission crate can ship it
+/// to higher layers without a circular dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequestedEvent {
+    pub ticket_id: String,
+    pub tool_name: String,
+    pub summary: String,
+    pub risk: String,
+    /// Remaining timeout in milliseconds at creation time. The frontend
+    /// counts down from here locally; the broker itself expires tickets
+    /// at `ticket.timeout` anyway, so this is only for UX.
+    pub timeout_remaining_ms: u64,
+}
 
 /// The result of a permission check — either immediate or requires approval.
 #[derive(Debug)]
@@ -36,6 +62,11 @@ pub struct PermissionManager {
     /// Monotonic revocation epoch — bumped when policies tighten.
     /// Previously-approved tickets with older epochs are invalidated.
     revocation_epoch: u64,
+    /// Optional unbounded bus: the manager sends one
+    /// `ApprovalRequestedEvent` through here every time `check()`
+    /// creates a new pending ticket. Fail-silent if the channel is
+    /// closed or full (frontend disconnected).
+    approval_tx: Option<mpsc::UnboundedSender<ApprovalRequestedEvent>>,
 }
 
 /// Validates tool arguments against sandbox profiles.
@@ -78,14 +109,27 @@ impl SandboxValidator {
 }
 
 impl PermissionManager {
-    /// Create a new manager with the given policy.
+    /// Create a new manager with the given policy (no approval bus).
     pub fn new(policy: PermissionPolicy) -> Self {
         Self {
             broker: ApprovalBroker::new(Duration::from_secs(120)),
             policy,
             sandbox_validator: None,
             revocation_epoch: 0,
+            approval_tx: None,
         }
+    }
+
+    /// Attach an unbounded notification channel that fires exactly once
+    /// per newly-created pending approval ticket. Used by turn
+    /// coordinator so the session event bus learns about Ask decisions
+    /// (→ the frontend renders a pending approval row).
+    pub fn with_approval_bus(
+        mut self,
+        tx: mpsc::UnboundedSender<ApprovalRequestedEvent>,
+    ) -> Self {
+        self.approval_tx = Some(tx);
+        self
     }
 
     /// Bump the revocation epoch. In-flight approvals from before this

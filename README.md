@@ -87,7 +87,7 @@ See `config.example.toml` for multi-provider failover routes and detailed option
 
 ## Architecture
 
-Grodex is a Rust workspace of **25 crates** organised into four layers:
+Grodex is a Rust workspace of **21 crates** organised into four layers:
 
 ### Core Loop (`grodex-loop`, `grodex-core`, `grodex-provider`, `grodex-sampler`)
 
@@ -157,7 +157,6 @@ grodex/
 │   ├── grodex-cli/             # CLI entry point: run, serve, resume, replay
 │   └── grodex-tui/             # Terminal UI (ratatui + crossterm)
 ├── docs/                       # v2 design documents (13 files)
-├── task/                       # Implementation gap audit and tracking
 ├── config.example.toml
 ├── Cargo.toml                  # Workspace manifest
 └── README.md
@@ -239,4 +238,3 @@ MIT OR Apache-2.0
 - `docs/15-built-in-tools-v2-design.md` — Built-in tool specifications
 - `docs/16-permission-approval-execution-v2-design.md` — Permission and approval system
 - `docs/17-frontend-acp-protocol-v2-design.md` — ACP protocol specification
-- `task/grodex-implementation-gap-audit.md` — Implementation audit and gap tracking

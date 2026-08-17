@@ -88,6 +88,24 @@ fn style_s(style: Style, s: impl Into<String>) -> Span<'static> {
     Span::styled(s.into(), style)
 }
 
+/// Drain at most `n` items from the front of a VecDeque into a Vec.
+/// Used by render_conversation to spread pending tool badges evenly
+/// across assistant paragraphs without borrow conflicts from a closure.
+#[inline]
+fn flush_n<T>(
+    queue: &mut std::collections::VecDeque<T>,
+    n: usize,
+    out: &mut Vec<T>,
+) -> usize {
+    let n = n.min(queue.len());
+    for _ in 0..n {
+        if let Some(b) = queue.pop_front() {
+            out.push(b);
+        }
+    }
+    n
+}
+
 /// Word-wrap `text` to `width` columns, returning the wrapped lines.
 /// Preserves real `\n` paragraphs and only breaks on whitespace/punctuation
 /// when a single word would otherwise exceed the width.
@@ -716,188 +734,478 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
         }
         rows.push(Line::from(vec![Span::raw("")]));
     } else {
-        for msg in &state.messages {
-            match msg {
-                ChatMessage::User { text } => {
-                    rows.push(Line::from(vec![
-                        Span::raw("  "),
-                        style_s(c_user(), "You"),
-                        Span::raw("  "),
-                    ]));
-                    if text.is_empty() {
-                        rows.push(Line::from(vec![Span::raw("      ·")]));
-                    } else {
-                        // md_to_lines returns pre-indented Lines (6-col
-                        // gutter). The left prefix matches the old
-                        // wrap_str layout so scrolling stays visually
-                        // aligned with other message types.
-                        rows.extend(md_to_lines(text, inner_w.max(12), c_fg()));
-                    }
-                    rows.push(Line::from(vec![Span::raw("")]));
-                }
+        // ── Turn-anchored linear render + turn-foot tool summary ────────
+        //
+        // Display rules (Claude-style compact tool status):
+        //   • Completed tools (has_result=true, done=true, not error) are
+        //     NOT rendered one-by-one with their UUID badge — users
+        //     reported that wall of "✓ exec(#deadbeef)  ok" made the
+        //     history unreadable.
+        //   • Instead, at the END of every turn we render a single
+        //     summary line: counts of completed OK vs completed ERROR vs
+        //     in-flight. The flight details are listed underneath with
+        //     elapsed time + 1-line preview, so users see exactly what
+        //     the agent is currently doing.
+        //   • Error tools render inline immediately so the failure
+        //     context is not hidden by aggregation.
+        //   • Turn anchoring (User-message slice boundaries) is retained
+        //     from the previous round to fix the classic "orphan tool
+        //     printed above the next Grodex header" race.
 
-                ChatMessage::Thinking { text, done } => {
-                    // Grok-style compact reasoning rail:
-                    //   🔭 Thought   <truncated one-liner preview>
-                    //
-                    // Thinking blocks can be tens of thousands of tokens
-                    // of raw chain-of-thought. We intentionally:
-                    //   * do NOT run md_to_lines on it (parser cost)
-                    //   * do NOT multi-line word-wrap (layout cost)
-                    //   * show at most a handful of lines clamped to a
-                    //     fixed char budget, so the scroll pane stays
-                    //     smooth even during long reasoning streams
-                    let tag = if *done { "Thought" } else { "Thinking…" };
-                    rows.push(Line::from(vec![
-                        Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                        style_s(c_thinking_label(), tag),
-                    ]));
-                    if text.is_empty() {
-                        let placeholder = if *done { "·" } else { "▋" };
-                        rows.push(Line::from(vec![
-                            Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                            style_s(c_thinking_text(), placeholder.to_string()),
-                        ]));
-                    } else {
-                        // Cap visible thinking to ~1200 chars / 12 lines
-                        // max — keeps rendering O(1) regardless of raw
-                        // CoT size. Grok itself collapses the reasoning
-                        // panel once the assistant starts answering; we
-                        // mirror that budget here.
-                        const MAX_CHARS: usize = 1400;
-                        const MAX_LINES: usize = 12;
-                        let clamped = if text.chars().count() > MAX_CHARS {
-                            let mut s: String = text.chars().take(MAX_CHARS).collect();
-                            s.push('…');
-                            s
-                        } else {
-                            text.clone()
-                        };
-                        let body_w = inner_w.saturating_sub(6).max(20);
-                        for (i, raw) in clamped.split('\n').take(MAX_LINES).enumerate() {
-                            for wl in wrap_str(raw, body_w) {
-                                rows.push(Line::from(vec![
-                                    Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                    style_s(c_thinking_text(), wl),
-                                ]));
-                            }
-                            if i + 1 == MAX_LINES {
-                                rows.push(Line::from(vec![
-                                    Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                    style_s(c_dim(), "… (truncated — view /export for full CoT)"),
-                                ]));
-                                break;
-                            }
-                        }
+        // Slice turns anchored at User messages
+        let turns: Vec<std::ops::Range<usize>> = {
+            let mut v: Vec<std::ops::Range<usize>> = Vec::new();
+            let mut cur_start: Option<usize> = None;
+            for (i, m) in state.messages.iter().enumerate() {
+                if matches!(m, ChatMessage::User { .. }) {
+                    if let Some(s) = cur_start.take() {
+                        v.push(s..i);
                     }
-                    rows.push(Line::from(vec![Span::raw("")]));
-                }
-
-                ChatMessage::Assistant { text, done } => {
-                    let streaming = if *done {
-                        Span::raw("")
-                    } else {
-                        style_s(c_dim(), "  ⏳ streaming…")
-                    };
-                    rows.push(Line::from(vec![
-                        Span::raw("  "),
-                        style_s(c_assistant(), "Grodex"),
-                        streaming,
-                    ]));
-                    if text.is_empty() {
-                        let placeholder = if *done { "·" } else { "▋" };
-                        rows.push(Line::from(vec![
-                            Span::raw("      "),
-                            style_s(c_fg(), placeholder.to_string()),
-                        ]));
-                    } else {
-                        // Full Markdown render — headings/lists/quotes/
-                        // fenced-code/inline styles all apply here.
-                        rows.extend(md_to_lines(text, inner_w.max(12), c_fg()));
-                    }
-                    rows.push(Line::from(vec![Span::raw("")]));
-                }
-
-                ChatMessage::Tool { name, call_id, is_error, done, has_result, .. } => {
-                    // Grok-style one-line tool badge (no args, no output).
-                    // Large JSON args and 100KB tool outputs were causing
-                    // multi-second stalls inside md_to_lines / wrap_str —
-                    // Grok doesn't render them inline either. Users can
-                    // always /export the conversation when they need the
-                    // full payload.
-                    //
-                    // State mapping (same icons as Grok):
-                    //   ⚙ starting   → ToolCallStart just arrived
-                    //   🟡 parsing    → ToolCallArgs streaming in
-                    //   🟠 running    → ToolCallEnd received, waiting result
-                    //   ✓ done       → ToolResult returned (success)
-                    //   ✗ error      → ToolResult returned (is_error)
-                    let (icon, icon_style, status_text): (&str, Style, &str) = match (*done, *has_result, *is_error) {
-                        (false, false, _) => ("⚙", c_tool_run(), "calling"),
-                        (true,  false, _) => ("🟠", c_tool_run(), "running"),
-                        (true,  true,  false) | (false, true,  false)
-                                          => ("✓",  c_tool_ok(),  "ok"),
-                        (true,  true,  true ) | (false, true,  true )
-                                          => ("✗",  c_tool_err(), "error"),
-                    };
-                    // Display name mirrors Grok: `name()` when there's no
-                    // call_id, otherwise `name(#id)` so parallel tool
-                    // calls are still distinguishable.
-                    let title = match call_id.as_ref().filter(|s| !s.is_empty()) {
-                        None => format!("{name}()"),
-                        Some(id) => format!("{name}(#{id})"),
-                    };
-                    // Left rail matches Thinking's ╎ style so the two
-                    // panels look like siblings — Grok groups both under
-                    // the agent stream.
-                    rows.push(Line::from(vec![
-                        Span::styled("  ╎ ", Style::default().fg(c_tool_rail())),
-                        style_s(icon_style, format!("{icon} ")),
-                        style_s(c_tool_name(), title),
-                        Span::raw("  "),
-                        style_s(c_dim(), status_text.to_string()),
-                    ]));
-                    // 1-line badge only — no spacer between consecutive
-                    // tool calls so they stack compactly, same as Grok.
-                }
-
-                ChatMessage::System { text, is_error } => {
-                    if *is_error {
-                        rows.push(Line::from(vec![
-                            Span::raw("    "),
-                            style_s(c_error(), "✗ Error"),
-                        ]));
-                        for l in wrap_str(text, inner_w.saturating_sub(8)) {
-                            rows.push(Line::from(vec![
-                                Span::raw("      "),
-                                style_s(c_error_bg(), format!(" {l} ")),
-                            ]));
-                        }
-                    } else {
-                        // 按 `\n` 拆成多行，使 /help、/skills 等本地命令的
-                        // 多行输出能正确换行渲染，而不是挤成一个逻辑行。
-                        // 首行带 "• " 前缀，续行与首行文本列对齐。
-                        let prefix = "• ";
-                        let cont_pad = "  ";
-                        for (idx, raw_line) in text.split('\n').enumerate() {
-                            if idx == 0 {
-                                rows.push(Line::from(vec![
-                                    Span::raw("    "),
-                                    style_s(c_dim().add_modifier(Modifier::BOLD), prefix),
-                                    style_s(c_muted(), raw_line.to_string()),
-                                ]));
-                            } else {
-                                rows.push(Line::from(vec![
-                                    Span::raw("    "),
-                                    style_s(c_dim().add_modifier(Modifier::BOLD), cont_pad),
-                                    style_s(c_muted(), raw_line.to_string()),
-                                ]));
-                            }
-                        }
-                    }
-                    rows.push(Line::from(vec![Span::raw("")]));
+                    cur_start = Some(i);
                 }
             }
+            match cur_start {
+                Some(s) => v.push(s..state.messages.len()),
+                None if !state.messages.is_empty() => v.push(0..state.messages.len()),
+                None => {}
+            }
+            v
+        };
+
+        // Best-effort preview of what a tool is "doing right now", shown
+        // under the turn-status summary for active tools. We try to pull
+        // a human-readable string out of the args JSON so the line is
+        // e.g. "$ grep …" for exec or "src/foo.rs" for read_file.
+        fn tool_preview(name: &str, args_json: &str) -> String {
+            use std::fmt::Write;
+            let trimmed = args_json.trim();
+            if trimmed.is_empty() {
+                return String::new();
+            }
+            let value: Option<serde_json::Value> = serde_json::from_str(trimmed).ok();
+            let v = match value {
+                Some(v) => v,
+                None => return format!("{}(…)", name),
+            };
+
+            // Tool-specific pickers ordered by commonality.
+            let mut out = String::new();
+            match name {
+                "exec" | "shell" | "bash" | "RunCommand" => {
+                    let cmd = v.get("command").and_then(|x| x.as_str())
+                        .or_else(|| v.get("cmd").and_then(|x| x.as_str()))
+                        .unwrap_or("…");
+                    let _ = write!(out, "$ {}", truncate(cmd, 120));
+                    if let Some(cwd) = v.get("cwd").and_then(|x| x.as_str()) {
+                        if !cwd.is_empty() && cwd != "." && cwd != "/" {
+                            let _ = write!(out, "  (in {})", truncate(cwd, 40));
+                        }
+                    }
+                }
+                "read_file" | "read" | "Read" => {
+                    let p = v.get("file_path").and_then(|x| x.as_str())
+                        .or_else(|| v.get("path").and_then(|x| x.as_str()))
+                        .unwrap_or("…");
+                    let mut extras: Vec<&str> = Vec::new();
+                    if let Some(o) = v.get("offset").and_then(|x| x.as_u64()) {
+                        extras.push("offset");
+                        let _ = write!(out, "{} (L{}", truncate(p, 100), o);
+                        if let Some(l) = v.get("limit").and_then(|x| x.as_u64()) {
+                            let _ = write!(out, "-L{}", o + l);
+                        }
+                        out.push(')');
+                    } else {
+                        let _ = write!(out, "{}", truncate(p, 120));
+                    }
+                    //no-op for lint
+                    let _ = extras;
+                }
+                "write_file" | "write" | "Write" => {
+                    let p = v.get("file_path").and_then(|x| x.as_str())
+                        .or_else(|| v.get("path").and_then(|x| x.as_str()))
+                        .unwrap_or("…");
+                    let sz = v.get("content").and_then(|x| x.as_str()).map(|s| s.len())
+                        .unwrap_or(0);
+                    let _ = write!(out, "{} ({} B)", truncate(p, 120), sz);
+                }
+                "edit" | "Edit" => {
+                    let p = v.get("file_path").and_then(|x| x.as_str())
+                        .or_else(|| v.get("path").and_then(|x| x.as_str()))
+                        .unwrap_or("…");
+                    let tag = if v.get("old_string").is_some() { "patch" } else { "replace" };
+                    let _ = write!(out, "{} [{}]", truncate(p, 120), tag);
+                }
+                "SearchCodebase" | "Grep" | "grep" | "search" => {
+                    let q = v.get("information_request").and_then(|x| x.as_str())
+                        .or_else(|| v.get("pattern").and_then(|x| x.as_str()))
+                        .unwrap_or("…");
+                    let _ = write!(out, "? {}", truncate(q, 140));
+                }
+                "Glob" | "glob" | "LS" | "ls" => {
+                    let pat = v.get("pattern").and_then(|x| x.as_str())
+                        .or_else(|| v.get("path").and_then(|x| x.as_str()))
+                        .unwrap_or("…");
+                    let _ = write!(out, "dir/ {}", truncate(pat, 140));
+                }
+                other => {
+                    // Generic: try to surface 2-3 scalar keys that look
+                    // meaningful (short string values).
+                    let obj = match v.as_object() {
+                        Some(o) => o,
+                        None => {
+                            return format!("{}(…)", other);
+                        }
+                    };
+                    let mut parts: Vec<String> = Vec::with_capacity(3);
+                    for key in ["path", "file", "query", "pattern", "url", "command",
+                                "name", "target", "scope", "dir", "directory", "id"] {
+                        if let Some(val) = obj.get(key).and_then(|x| x.as_str()) {
+                            if !val.is_empty() {
+                                parts.push(format!("{}={}", key, truncate(val, 60)));
+                            }
+                        }
+                        if parts.len() >= 3 { break; }
+                    }
+                    if parts.is_empty() {
+                        return format!("{}(…)", other);
+                    }
+                    let _ = write!(out, "{}({})", other, parts.join(", "));
+                }
+            }
+            out
+        }
+
+        fn truncate(s: &str, max: usize) -> &str {
+            if s.chars().count() <= max { s }
+            else {
+                let mut end = 0usize;
+                for (i, ch) in s.char_indices() {
+                    if i >= max { break; }
+                    end = i + ch.len_utf8();
+                }
+                &s[..end]
+            }
+        }
+
+        // Compact human-friendly duration like "29s" or "3m12s" or "5ms".
+        fn human_duration(d: std::time::Duration) -> String {
+            let total_ms = d.as_millis();
+            if total_ms < 1_000 {
+                return format!("{total_ms}ms");
+            }
+            let secs = total_ms / 1_000;
+            if secs < 60 {
+                return format!("{}s", secs);
+            }
+            let m = secs / 60;
+            let s = secs % 60;
+            if m < 60 {
+                return format!("{m}m{s:02}s");
+            }
+            let h = m / 60;
+            let m = m % 60;
+            format!("{h}h{m:02}m")
+        }
+
+        for turn_range in turns {
+            let turn = &state.messages[turn_range];
+
+            let mut assistant_header_rendered = false;
+            // Turn-level tool tallies
+            let mut completed_ok: Vec<(String, std::time::Duration)> = Vec::new();
+            let mut completed_err: Vec<(String, std::time::Duration)> = Vec::new();
+            let mut in_flight: Vec<(
+                String,           // short title name(#short)
+                std::time::Duration,
+                String,           // preview string
+                bool,             // is_running (else calling/parsing)
+            )> = Vec::new();
+
+            for msg in turn {
+                match msg {
+                    ChatMessage::User { text } => {
+                        rows.push(Line::from(vec![
+                            Span::raw("  "),
+                            style_s(c_user(), "You"),
+                            Span::raw("  "),
+                        ]));
+                        if text.is_empty() {
+                            rows.push(Line::from(vec![Span::raw("      ·")]));
+                        } else {
+                            rows.extend(md_to_lines(text, inner_w.max(12), c_fg()));
+                        }
+                        rows.push(Line::from(vec![Span::raw("")]));
+                    }
+
+                    ChatMessage::Thinking { text, done } => {
+                        let tag = if *done { "Thought" } else { "Thinking…" };
+                        rows.push(Line::from(vec![
+                            Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                            style_s(c_thinking_label(), tag),
+                        ]));
+                        if text.is_empty() {
+                            let placeholder = if *done { "·" } else { "▋" };
+                            rows.push(Line::from(vec![
+                                Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                style_s(c_thinking_text(), placeholder.to_string()),
+                            ]));
+                        } else {
+                            const MAX_CHARS: usize = 1400;
+                            const MAX_LINES: usize = 12;
+                            let clamped = if text.chars().count() > MAX_CHARS {
+                                let mut s: String = text.chars().take(MAX_CHARS).collect();
+                                s.push('…');
+                                s
+                            } else {
+                                text.clone()
+                            };
+                            let body_w = inner_w.saturating_sub(6).max(20);
+                            for (i, raw) in clamped.split('\n').take(MAX_LINES).enumerate() {
+                                for wl in wrap_str(raw, body_w) {
+                                    rows.push(Line::from(vec![
+                                        Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                        style_s(c_thinking_text(), wl),
+                                    ]));
+                                }
+                                if i + 1 == MAX_LINES {
+                                    rows.push(Line::from(vec![
+                                        Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                        style_s(c_dim(), "… (truncated — view /export for full CoT)"),
+                                    ]));
+                                    break;
+                                }
+                            }
+                        }
+                        rows.push(Line::from(vec![Span::raw("")]));
+                    }
+
+                    ChatMessage::Assistant { text, done } => {
+                        if !assistant_header_rendered {
+                            let streaming = if *done {
+                                Span::raw("")
+                            } else {
+                                style_s(c_dim(), "  ⏳ streaming…")
+                            };
+                            rows.push(Line::from(vec![
+                                Span::raw("  "),
+                                style_s(c_assistant(), "Grodex"),
+                                streaming,
+                            ]));
+                            assistant_header_rendered = true;
+                        }
+                        if text.is_empty() {
+                            let placeholder = if *done { "·" } else { "▋" };
+                            rows.push(Line::from(vec![
+                                Span::raw("      "),
+                                style_s(c_fg(), placeholder.to_string()),
+                            ]));
+                        } else {
+                            rows.extend(md_to_lines(text, inner_w.max(12), c_fg()));
+                        }
+                        rows.push(Line::from(vec![Span::raw("")]));
+                    }
+
+                    ChatMessage::Tool { name, call_id, args, result: _, is_error, done, has_result, started_at, finished_at } => {
+                        // For completed tools, freeze the duration at the
+                        // moment of completion (finished_at) so the number
+                        // doesn't keep ticking on every render frame.
+                        // For in-flight tools, keep using started_at.elapsed()
+                        // so the live counter advances as expected.
+                        let elapsed = match finished_at {
+                            Some(end) => end.duration_since(*started_at),
+                            None => started_at.elapsed(),
+                        };
+                        // NOTE: completed tools (both ok and error) are
+                        // NO-OPs for inline rendering. Both are reflected
+                        // in the single turn-foot summary line as counts,
+                        // so the transcript stays clean — exactly Claude's
+                        // behaviour where completed tools vanish from the
+                        // "currently executing" sublist and only show in
+                        // the aggregate "N done / M failed" line.
+                        if *has_result && *is_error {
+                            completed_err.push((name.clone(), elapsed));
+                        } else if *has_result && *done {
+                            completed_ok.push((name.clone(), elapsed));
+                        } else {
+                            // In-flight: calling (no args yet) or running
+                            // (has args, agent waiting for result).
+                            let is_running = *done || !args.trim().is_empty();
+                            let short_id = match call_id.as_ref().filter(|s| !s.is_empty()) {
+                                Some(id) => {
+                                    let s: String = id.chars().take(8).collect();
+                                    format!("{name}(#{s})")
+                                }
+                                None => format!("{name}()"),
+                            };
+                            let preview = tool_preview(name, args);
+                            in_flight.push((short_id, elapsed, preview, is_running));
+                        }
+                    }
+
+                    ChatMessage::System { text, is_error } => {
+                        if *is_error {
+                            rows.push(Line::from(vec![
+                                Span::raw("    "),
+                                style_s(c_error(), "✗ Error"),
+                            ]));
+                            for l in wrap_str(text, inner_w.saturating_sub(8)) {
+                                rows.push(Line::from(vec![
+                                    Span::raw("      "),
+                                    style_s(c_error_bg(), format!(" {l} ")),
+                                ]));
+                            }
+                        } else {
+                            let prefix = "• ";
+                            let cont_pad = "  ";
+                            for (idx, raw_line) in text.split('\n').enumerate() {
+                                if idx == 0 {
+                                    rows.push(Line::from(vec![
+                                        Span::raw("    "),
+                                        style_s(c_dim().add_modifier(Modifier::BOLD), prefix),
+                                        style_s(c_muted(), raw_line.to_string()),
+                                    ]));
+                                } else {
+                                    rows.push(Line::from(vec![
+                                        Span::raw("    "),
+                                        style_s(c_dim().add_modifier(Modifier::BOLD), cont_pad),
+                                        style_s(c_muted(), raw_line.to_string()),
+                                    ]));
+                                }
+                            }
+                        }
+                        rows.push(Line::from(vec![Span::raw("")]));
+                    }
+                }
+            }
+
+            // ── Turn-foot tool summary (Claude-style) ────────────────
+            //
+            // Example layout:
+            //   ⏺ Working 29s · 17 done · 1 failed · 3 running
+            //     ⎿ $ cargo check --workspace (12s)
+            //     ⎿ src/main.rs:1080-1095 (4s)
+            //
+            // If everything finished cleanly → single line with no
+            // sub-items. Only IN-FLIGHT tools get the expanded list;
+            // completed tools (both ok AND failed) contribute only to
+            // the aggregate counters — exactly matching Claude where
+            // "currently executing" is a transient-only view.
+
+            let n_ok = completed_ok.len();
+            let n_err = completed_err.len();
+            let n_flying = in_flight.len();
+
+            if n_ok == 0 && n_err == 0 && n_flying == 0 {
+                continue; // turn has no tools, nothing to summarise
+            }
+
+            // ── Guarantee Grodex header renders BEFORE tool summary ─
+            //
+            // The classic "tool summary above Grodex title" race: model
+            // can emit ToolCallStart BEFORE the first TextDelta token.
+            // Without this guard, turn-foot would fire with
+            // `assistant_header_rendered == false`, then the next render
+            // frame (when Assistant text arrives) prints "Grodex" BELOW
+            // the already-flushed summary. Fix: if the turn has ANY tool
+            // activity to report but no header was drawn yet, emit a
+            // transient `Grodex  ⏳ working…` header first. This also
+            // covers the "tools-only turn" edge case where the model
+            // just calls agents without answering.
+            if !assistant_header_rendered {
+                let any_work_left = n_flying > 0;
+                let streaming = if any_work_left {
+                    style_s(c_dim(), "  ⏳ working…")
+                } else {
+                    Span::raw("")
+                };
+                rows.push(Line::from(vec![
+                    Span::raw("  "),
+                    style_s(c_assistant(), "Grodex"),
+                    streaming,
+                ]));
+                rows.push(Line::from(vec![Span::raw("")]));
+                assistant_header_rendered = true;
+            }
+
+            // ── Summary line pieces ────────────────────────────────
+            let mut pieces: Vec<Span> = Vec::with_capacity(8);
+            pieces.push(Span::styled("  ", Style::default()));
+            pieces.push(match n_flying > 0 {
+                true  => style_s(c_thinking_label(), "⏺ "),
+                false => style_s(c_tool_ok(), "⏺ "),
+            });
+
+            // Optional thinking/working label + total time. For thinking
+            // time we pick max(started_at.elapsed) across all in-flight
+            // tools as a rough proxy; completed-only turns just say
+            // "Tools completed in Xs".
+            let now = std::time::Instant::now();
+            let span_total = if !in_flight.is_empty() {
+                in_flight.iter().map(|t| t.1).max().unwrap_or_default()
+            } else if !completed_ok.is_empty() {
+                completed_ok.iter().map(|t| t.1).max().unwrap_or_default()
+            } else {
+                std::time::Duration::ZERO
+            };
+            let _ = now; // keep Instant::now side effects deterministic (we don't use it today)
+            let tag = match n_flying {
+                0 if n_err > 0 => "Done (with errors)",
+                0 => "Tools",
+                _ => "Working",
+            };
+            pieces.push(style_s(c_thinking_label(), format!("{tag} ")));
+            if span_total.as_millis() > 0 {
+                pieces.push(style_s(c_dim(), format!("{} · ", human_duration(span_total))));
+            } else if n_flying > 0 {
+                pieces.push(style_s(c_dim(), "· ".to_string()));
+            }
+
+            if n_ok > 0 {
+                let total_span = completed_ok.iter().map(|t| t.1.as_millis() as u64).sum::<u64>();
+                let sum = std::time::Duration::from_millis(total_span);
+                pieces.push(style_s(c_tool_ok(), format!("{n_ok} done")));
+                // Only print aggregate span if it's noticeable to avoid
+                // 17 tools × <1ms each turning into a wall of "(0ms)"
+                if sum.as_millis() >= 200 {
+                    pieces.push(style_s(c_dim(), format!("({}) ", human_duration(sum))));
+                } else {
+                    pieces.push(Span::raw(" "));
+                }
+            }
+            if n_err > 0 {
+                pieces.push(style_s(c_tool_err(), format!("{n_err} failed")));
+                pieces.push(Span::raw(" "));
+            }
+            if n_flying > 0 {
+                pieces.push(style_s(c_tool_run(), format!("{n_flying} running")));
+            }
+            // Trim trailing space spans (cosmetic)
+            while let Some(last) = pieces.last() {
+                if last.content.chars().all(|c| c == ' ') {
+                    pieces.pop();
+                } else {
+                    break;
+                }
+            }
+            rows.push(Line::from(pieces));
+
+            // ── In-flight detail lines ─────────────────────────────
+            // Ordered by elapsed (oldest first) so long-running work
+            // stays at the top of the list — users can tell what the
+            // bottleneck is at a glance.
+            in_flight.sort_by(|a, b| b.1.cmp(&a.1));
+            for (title, elapsed, preview, _is_running) in in_flight.iter() {
+                let mut line_parts: Vec<Span> = Vec::with_capacity(6);
+                line_parts.push(Span::styled("    ⎿ ", Style::default().fg(c_tool_rail())));
+                line_parts.push(style_s(c_tool_name(), format!("{title} ")));
+                if !preview.is_empty() {
+                    line_parts.push(style_s(c_fg(), preview.clone()));
+                    line_parts.push(Span::raw(" "));
+                }
+                line_parts.push(style_s(c_dim(), format!("({})", human_duration(*elapsed))));
+                rows.push(Line::from(line_parts));
+            }
+            rows.push(Line::from(vec![Span::raw("")]));
         }
     }
     rows.push(Line::from(vec![Span::raw("")]));

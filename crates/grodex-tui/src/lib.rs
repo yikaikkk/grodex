@@ -346,6 +346,53 @@ impl GrodexTui {
                                     self.state.push_log("当前没有可复制的 Grodex 消息".to_string());
                                 }
                             }
+                            TuiAction::CopyInputBuffer => {
+                                // Copy whichever buffer is currently
+                                // active (prompt / command) to the
+                                // system clipboard so users can Cmd-C
+                                // mid-draft on macOS. We deliberately do
+                                // NOT gate on "selection exists" because
+                                // the state struct doesn't track a
+                                // selection rect yet; copying the whole
+                                // draft matches what users of 90% of
+                                // simple textboxes expect.
+                                let is_prompt = matches!(self.state.input_mode, ui::state::InputMode::Prompt);
+                                let (buf, label) = if is_prompt {
+                                    (&self.state.input_buffer, "输入框")
+                                } else {
+                                    (&self.state.command_buffer, "命令栏")
+                                };
+                                if buf.is_empty() {
+                                    self.state.push_log(format!("{label}为空，跳过复制。"));
+                                } else {
+                                    match set_clipboard(buf) {
+                                        Ok(n) => self.state.push_log(format!(
+                                            "已复制{label}内容到剪贴板（{} 字符）。", n
+                                        )),
+                                        Err(e) => self.state.push_log(format!(
+                                            "[clipboard] 写入失败：{e}\n\
+                                             备选方案：选中输入文字+终端菜单复制。"
+                                        )),
+                                    }
+                                }
+                            }
+                            TuiAction::SelectAllInput => {
+                                // Select-all in the active input buffer.
+                                // With no selection rect yet we move the
+                                // cursor to the END so CopyInputBuffer
+                                // (which copies the full buffer) still
+                                // produces the expected result for a
+                                // Cmd-A → Cmd-C sequence; this also
+                                // scrolls buffer visualisation to the
+                                // tail so users can see everything that
+                                // was typed.
+                                let is_prompt = matches!(self.state.input_mode, ui::state::InputMode::Prompt);
+                                if is_prompt {
+                                    self.state.input_cursor = self.state.input_buffer.len();
+                                } else {
+                                    self.state.command_cursor = self.state.command_buffer.len();
+                                }
+                            }
                             TuiAction::PasteText { text } => {
                                 // Two paths reach here:
                                 //   1. CrosstermEvent::Paste(text) — we got
@@ -2711,7 +2758,7 @@ fn export_conversation_md(state: &ui::state::TuiAppState) -> Result<std::path::P
                 }
                 writeln!(f)?;
             }
-            ui::state::ChatMessage::Tool { name, call_id, args, result, is_error, done, has_result } => {
+            ui::state::ChatMessage::Tool { name, call_id, args, result, is_error, done, has_result, started_at: _, finished_at: _ } => {
                 let status = match (*done, *has_result, *is_error) {
                     (_, true, true)  => "Tool ✗",
                     (_, true, false) => "Tool ✓",

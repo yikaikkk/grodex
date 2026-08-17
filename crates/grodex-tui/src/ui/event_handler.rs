@@ -49,6 +49,19 @@ pub enum TuiAction {
     /// position. Used for bracketed-paste events (CrosstermEvent::Paste)
     /// as well as Ctrl-Shift-V fallback.
     PasteText { text: String },
+    /// Copy the active input buffer (or selection, once selection is
+    /// tracked on state) to the system clipboard. Dispatched for
+    /// Cmd-C on macOS (SUPER modifier), so users get the standard
+    /// terminal-app "copy what I'm currently editing" behaviour
+    /// without having to reach for Ctrl-Shift-C (which copies the
+    /// most-recent *assistant* output — a different scoped action).
+    CopyInputBuffer,
+    /// Select-all in the active input buffer. Cmd-A on macOS.
+    /// For now this just places the cursor at the end (no visual
+    /// selection rect yet) so Cmd-A → Cmd-C still captures the
+    /// whole draft; when we add a real selection rectangle the
+    /// meaning will stay semantically correct.
+    SelectAllInput,
 }
 
 pub fn handle_key(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
@@ -83,11 +96,24 @@ fn handle_normal(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
     // reliable way to disambiguate Ctrl-C / Ctrl-Shift-C.
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let super_ = key.modifiers.contains(KeyModifiers::SUPER);
     if let KeyCode::Char(ch) = key.code {
-        match (ctrl, shift, ch) {
-            (true, true, 'c') => return Some(TuiAction::CopyLastAssistant),
-            (true, true, 'v') => return Some(TuiAction::PasteText { text: String::new() }),
-            (true, _, 'c') => {
+        match (ctrl, shift, super_, ch) {
+            (true, true, _, 'c') => return Some(TuiAction::CopyLastAssistant),
+            (true, true, _, 'v') => return Some(TuiAction::PasteText { text: String::new() }),
+            // macOS: Cmd-C without an active input buffer falls back to
+            // copying the last assistant message so "Cmd-C to copy the
+            // thing I'm looking at" still works intuitively even in
+            // Normal mode.
+            (_, _, true, 'c') => {
+                if state.input_buffer.is_empty() {
+                    return Some(TuiAction::CopyLastAssistant);
+                } else {
+                    return Some(TuiAction::CopyInputBuffer);
+                }
+            }
+            (_, _, true, 'v') => return Some(TuiAction::PasteText { text: String::new() }),
+            (true, false, _, 'c') => {
                 if state.is_streaming() {
                     return Some(TuiAction::CancelTurn);
                 } else {
@@ -292,6 +318,23 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
     }
 
     let ret = match key.code {
+        // ——— macOS ⌘ Cmd shortcuts (SUPER modifier) — runs before
+        //    anything else so Ctrl-C can still mean "cancel turn" even
+        //    when Cmd-C does "copy input buffer". These are the
+        //    bindings users intuitively reach for on a Mac.
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::SUPER) => {
+            return Some(TuiAction::CopyInputBuffer);
+        }
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::SUPER) => {
+            return Some(TuiAction::PasteText { text: String::new() });
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::SUPER) => {
+            // Cmd-A: put cursor at END so subsequent Cmd-C captures the
+            // full buffer (CopyInputBuffer copies regardless of cursor
+            // position today; but in future when selection is tracked
+            // this will expand selection to the whole buffer first).
+            return Some(TuiAction::SelectAllInput);
+        }
         KeyCode::Esc => {
             if state.is_streaming() {
                 // Esc while streaming = cancel the turn (don't exit to
@@ -438,10 +481,8 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             state.input_cursor = 0;
             None
         }
-        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.input_buffer.drain(state.input_cursor..);
-            None
-        }
+        // Note: Ctrl-K is bound to scroll-up (see above), not readline
+        // kill-to-end. Use Ctrl-U to clear from start to cursor.
         // ————— Character insert —————————————————————————————————————————
         KeyCode::Char(c) => {
             // Mirror grok's per-char insert gate: the ONLY forbidden chars
@@ -527,6 +568,21 @@ pub(crate) fn try_parse_local_slash(text: &str) -> Option<(SlashLocalKind, Strin
 // ── Command mode — same sanitize as prompt, : prefixed colon —────────────
 
 fn handle_command(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
+    // macOS ⌘ Cmd shortcuts for command buffer copy/paste. Uses the
+    // same CopyInputBuffer / SelectAllInput actions as prompt mode;
+    // the main loop picks the *active* buffer (command vs prompt)
+    // based on input_mode when dispatching.
+    if let KeyCode::Char(ch) = key.code {
+        let super_ = key.modifiers.contains(KeyModifiers::SUPER);
+        if super_ && matches!(ch, 'c' | 'v' | 'a') {
+            return match ch {
+                'c' => Some(TuiAction::CopyInputBuffer),
+                'v' => Some(TuiAction::PasteText { text: String::new() }),
+                'a' => Some(TuiAction::SelectAllInput),
+                _ => None,
+            };
+        }
+    }
     match key.code {
         KeyCode::Esc => {
             state.input_mode = InputMode::Normal;
@@ -850,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_u_and_k_clear_from_cursor() {
+    fn ctrl_u_clears_from_start_to_cursor() {
         let mut s = TuiAppState::new();
         s.input_mode = InputMode::Prompt;
         s.input_buffer = "hello world".into();
@@ -861,14 +917,5 @@ mod tests {
         handle_prompt(ctrl_u, &mut s);
         assert_eq!(s.input_buffer, " world");
         assert_eq!(s.input_cursor, 0);
-
-        // Restore, now test Ctrl-K (to end).
-        s.input_buffer = "hello world".into();
-        s.input_cursor = 5;
-        let ctrl_k = KeyEvent::new(
-            KeyCode::Char('k'), KeyModifiers::CONTROL);
-        handle_prompt(ctrl_k, &mut s);
-        assert_eq!(s.input_buffer, "hello");
-        assert_eq!(s.input_cursor, 5);
     }
 }

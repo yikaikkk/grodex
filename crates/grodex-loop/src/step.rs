@@ -46,7 +46,7 @@ impl StepRunner {
         Self {
             sampler,
             tool_runtimes: HashMap::new(),
-            permission: Mutex::new(PermissionManager::new(PermissionPolicy::permissive())),
+            permission: Mutex::new(PermissionManager::new(PermissionPolicy::new())),
             compaction: CompactionManager::new(128_000),
         }
     }

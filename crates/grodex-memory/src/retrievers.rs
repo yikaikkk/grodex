@@ -536,7 +536,12 @@ pub fn reciprocal_rank_fusion(
         *map.entry(doc.clone()).or_insert(0.0) += 1.0 / (k_rrf + rank);
     }
     let mut entries: Vec<(String, f32)> = map.into_iter().collect();
-    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    // Sort by score descending; break ties alphabetically for determinism.
+    entries.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     entries.into_iter().take(top_k).map(|(d, _)| d).collect()
 }
 

@@ -90,7 +90,7 @@ impl TurnCoordinator {
             rollout: None,
             completed_operations: Arc::new(std::sync::Mutex::new(HashSet::new())),
             permission: Arc::new(Mutex::new(PermissionManager::new(
-                PermissionPolicy::permissive(),
+                PermissionPolicy::new(),
             ))),
             compaction: Arc::new(Mutex::new(CompactionManager::new(128_000))),
             sandbox: Arc::new(grodex_sandbox::SandboxManager::default()),

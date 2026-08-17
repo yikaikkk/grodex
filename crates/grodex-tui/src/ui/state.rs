@@ -46,6 +46,13 @@ pub enum ChatMessage {
         is_error: bool,
         done: bool,       // ToolCallEnd: agent side finished generating call
         has_result: bool, // ToolResult: agent returned output
+        started_at: std::time::Instant,
+        /// When the tool reached a terminal state (has_result or done).
+        /// `None` while in-flight; set to `Some(Instant::now())` the
+        /// moment we flip has_result/done so render can compute a FROZEN
+        /// duration instead of `started_at.elapsed()` which would keep
+        /// ticking every frame.
+        finished_at: Option<std::time::Instant>,
     },
     /// System / error message.
     System { text: String, is_error: bool },
@@ -975,11 +982,14 @@ impl TuiAppState {
             // turns), so a TurnComplete forces them into a terminal UI
             // state to match the "turn is over" contract.
             for m in self.messages.iter_mut().rev() {
-                if let ChatMessage::Tool { done, has_result, .. } = m {
+                if let ChatMessage::Tool { done, has_result, finished_at, .. } = m {
                     if !*done {
                         *done = true;
                         if !*has_result {
                             *has_result = true;
+                        }
+                        if finished_at.is_none() {
+                            *finished_at = Some(std::time::Instant::now());
                         }
                     }
                 }
@@ -1056,11 +1066,53 @@ impl TuiAppState {
             }
 
             SessionEvent::ToolCallStart { call_id, name } => {
-                let idx = self.messages.len();
+                // Insert the new tool badge right after the most recent
+                // in-progress Assistant / Thinking block — not at the very
+                // end of messages. This keeps the interleaving when the
+                // model streams "a bit of answer → call tool → continue"
+                // instead of piling every tool card at the bottom of the
+                // turn. If there's no active block yet (tool call comes
+                // first), we fall back to append.
+                let insert_pos = {
+                    let mut pos = None;
+                    for (i, m) in self.messages.iter().enumerate().rev() {
+                        match m {
+                            ChatMessage::Assistant { done: false, .. }
+                            | ChatMessage::Thinking { done: false, .. } => {
+                                // Insert right after this in-progress block.
+                                pos = Some(i + 1);
+                                break;
+                            }
+                            ChatMessage::Assistant { done: true, .. }
+                            | ChatMessage::Thinking { done: true, .. } => {
+                                // Completed sub-phase — still prefer the
+                                // youngest completed block over tail-append
+                                // so the first tool call groups with it.
+                                pos = pos.or(Some(i + 1));
+                                // keep walking in case a not-yet-done block
+                                // exists earlier in this turn.
+                            }
+                            ChatMessage::User { .. } => {
+                                break; // turn boundary — don't go past User
+                            }
+                            _ => {} // skip existing Tools / System
+                        }
+                    }
+                    pos.unwrap_or(self.messages.len())
+                };
                 if !call_id.is_empty() {
-                    self.call_id_index.insert(call_id.clone(), idx);
+                    // call_id_index points at the insert position; when
+                    // insert_pos is in the middle of messages, entries
+                    // after it shift right — since we store positions for
+                    // *past* tools and this is a brand new call_id, none
+                    // of the existing mappings need adjustment.
+                    self.call_id_index.insert(call_id.clone(), insert_pos);
+                } else {
+                    // If insert_pos reshuffled later calls, we don't need
+                    // to update indices for non-call_id tools, they fall
+                    // back to reverse-scan target selection anyway.
                 }
-                self.messages.push(ChatMessage::Tool {
+                let tool_msg = ChatMessage::Tool {
                     name: name.clone(),
                     call_id: Some(call_id.clone()).filter(|s| !s.is_empty()),
                     args: String::new(),
@@ -1068,7 +1120,23 @@ impl TuiAppState {
                     is_error: false,
                     done: false,
                     has_result: false,
-                });
+                    started_at: std::time::Instant::now(),
+                    finished_at: None,
+                };
+                if insert_pos >= self.messages.len() {
+                    self.messages.push(tool_msg);
+                } else {
+                    self.messages.insert(insert_pos, tool_msg);
+                    // All call_id_index entries that pointed to positions
+                    // >= insert_pos must shift +1 because we displaced
+                    // them. Younger tools (inserted later) typically
+                    // reside at higher indices, so this preserves them.
+                    for v in self.call_id_index.values_mut() {
+                        if *v >= insert_pos {
+                            *v += 1;
+                        }
+                    }
+                }
             }
 
             SessionEvent::ToolCallArgs { call_id, args_delta } => {
@@ -1096,8 +1164,14 @@ impl TuiAppState {
                     Some(m) => Some(m),
                     None => self.messages.iter_mut().rev().find(|m| matches!(m, ChatMessage::Tool { done: false, .. })),
                 };
-                if let Some(ChatMessage::Tool { done: d, .. }) = target {
+                if let Some(ChatMessage::Tool { done: d, finished_at: fa, .. }) = target {
                     *d = true;
+                    // Freeze the timer the first time the tool reaches a
+                    // terminal state so render shows a static duration
+                    // instead of an ever-ticking clock.
+                    if fa.is_none() {
+                        *fa = Some(std::time::Instant::now());
+                    }
                 }
             }
 
@@ -1111,7 +1185,7 @@ impl TuiAppState {
                     Some(m) => Some(m),
                     None => self.messages.iter_mut().rev().find(|m| matches!(m, ChatMessage::Tool { done: false, has_result: false, .. })),
                 };
-                if let Some(ChatMessage::Tool { result: r, is_error: ie, has_result: hr, done: d, .. }) = target {
+                if let Some(ChatMessage::Tool { result: r, is_error: ie, has_result: hr, done: d, finished_at: fa, .. }) = target {
                     *r = Some(content.clone());
                     *ie = *is_error;
                     *hr = true;
@@ -1119,6 +1193,9 @@ impl TuiAppState {
                     // (e.g. exec-style one-shot tools): treat arrival of a
                     // result as implicit end-of-tool so ⏳ streaming clears.
                     *d = true;
+                    if fa.is_none() {
+                        *fa = Some(std::time::Instant::now());
+                    }
                 }
             }
 

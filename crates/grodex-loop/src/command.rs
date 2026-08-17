@@ -75,4 +75,16 @@ pub enum SessionEvent {
         ticket_id: String,
         accepted: bool,
     },
+    /// A new approval ticket needs user attention.
+    ///
+    /// The PermissionManager emits this the moment `policy.evaluate()`
+    /// returns `Ask` and a ticket lands in the broker. The frontend uses
+    /// it to render a pending approval row with timeout countdown.
+    ApprovalRequested {
+        ticket_id: String,
+        tool_name: String,
+        summary: String,
+        risk: String,
+        timeout_remaining_ms: u64,
+    },
 }

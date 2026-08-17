@@ -152,6 +152,23 @@ fn dedup_vec_str(mut v: Vec<String>) -> Vec<String> {
 }
 
 fn intersect_vec_str(a: &[String], b: &[String]) -> Vec<String> {
+    // "/" is a superset of all paths: if one side contains "/", the
+    // intersection is the other side (the stricter set). This matches
+    // the design: rw intersection takes the strictest permissions.
+    let a_has_root = a.iter().any(|s| s == "/");
+    let b_has_root = b.iter().any(|s| s == "/");
+
+    if a_has_root && b_has_root {
+        return vec!["/".into()];
+    }
+    if a_has_root {
+        return b.to_vec();
+    }
+    if b_has_root {
+        return a.to_vec();
+    }
+
+    // No root superset — fall back to exact string intersection.
     let set_a: HashSet<&String> = a.iter().collect();
     let set_b: HashSet<&String> = b.iter().collect();
     set_a
