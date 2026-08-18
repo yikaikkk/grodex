@@ -248,12 +248,40 @@ impl PermissionManager {
             },
             PolicyDecision::Ask => {
                 let risk = Self::assess_risk(tool_name, args);
-                let (ticket, rx) = ApprovalTicket::new(tool_call_id, tool_name, summary, risk);
+                let (ticket, _rx_from_ticket) = ApprovalTicket::new(tool_call_id, tool_name, summary, risk);
                 let ticket_id = ticket.ticket_id.clone();
-                self.broker.submit_ticket(ticket);
+                let tool_name_owned = ticket.tool_name.clone();
+                let summary_owned = ticket.summary.clone();
+                let risk_str = format!("{:?}", ticket.risk_level);
+                let timeout_ms = ticket
+                    .timeout
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                // ── submit_ticket creates the broker-owned oneshot channel
+                // that resolve() will actually send through. The receiver
+                // from ApprovalTicket::new is a DIFFERENT channel that no
+                // one will ever send to — using it was the root cause of
+                // the "approval result never reaches the waiting tool"
+                // main-chain break (the tool hung on a dead receiver).
+                let decision_rx = self.broker.submit_ticket(ticket);
+                // ── Fire the approval bus so the frontend learns a ticket
+                // is pending (Design Doc 16 §10, first half of the round-
+                // trip). Fail-silent: if the bus is closed/disconnected
+                // (no frontend, or shutdown) the ticket still lives in the
+                // broker and expires after its timeout — the tool future
+                // remains correct, just unnotified.
+                if let Some(tx) = self.approval_tx.as_ref() {
+                    let _ = tx.send(ApprovalRequestedEvent {
+                        ticket_id: ticket_id.clone(),
+                        tool_name: tool_name_owned,
+                        summary: summary_owned,
+                        risk: risk_str,
+                        timeout_remaining_ms: timeout_ms,
+                    });
+                }
                 PermissionResult::ApprovalRequired {
                     ticket_id,
-                    decision_rx: rx,
+                    decision_rx,
                 }
             }
         }
@@ -357,5 +385,122 @@ mod tests {
             }
             other => panic!("expected ApprovalRequired, got {other:?}"),
         }
+    }
+
+    /// End-to-end approval main chain (Design Doc 16 §10):
+    ///
+    ///   config rules → policy → check() Ask → ApprovalRequestedEvent
+    ///     → resolve(Allow) → decision_rx wakes the waiting tool.
+    ///
+    /// This is the single most direct "main chain" test: it asserts that
+    /// (a) the approval bus fires when policy says Ask, (b) the ticket id
+    /// in the event matches the one returned from `check`, and (c) calling
+    /// `resolve` actually delivers the decision to the oneshot receiver
+    /// the tool is awaiting on. If any of these three links is broken,
+    /// side-effecting tools hang or run unapproved.
+    #[tokio::test]
+    async fn end_to_end_approval_chain_fires_bus_and_wakes_tool() {
+        // 1. Build a policy that mimics `build_permission_policy` output:
+        //    read_file=allow, everything else=ask.
+        let mut policy = PermissionPolicy::new();
+        policy.add_rule(PolicyRule {
+            tool_pattern: "read_file".into(),
+            arg_patterns: Vec::new(),
+            command: None,
+            resource: None,
+            rule_id: None,
+            network: None,
+            mcp: None,
+            decision: PolicyDecision::Allow,
+            priority: 0,
+        });
+        policy.add_rule(PolicyRule {
+            tool_pattern: "*".into(),
+            arg_patterns: Vec::new(),
+            command: None,
+            resource: None,
+            rule_id: None,
+            network: None,
+            mcp: None,
+            decision: PolicyDecision::Ask,
+            priority: 0,
+        });
+
+        // 2. Wire the approval bus (mirrors TurnCoordinator::wire_approval_bus).
+        let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        let mut mgr = PermissionManager::new(policy).with_approval_bus(approval_tx);
+
+        // 3. check() a side-effecting tool → Ask branch must fire the bus.
+        let result = mgr.check(
+            ToolCallId::new(),
+            "exec",
+            &serde_json::json!({"command": "ls"}),
+            "Run ls",
+        );
+        let PermissionResult::ApprovalRequired {
+            ticket_id,
+            decision_rx,
+        } = result
+        else {
+            panic!("expected ApprovalRequired for exec under Ask policy");
+        };
+
+        // 4. The bus must have delivered an ApprovalRequestedEvent whose
+        //    ticket_id matches the one handed back from check().
+        let ev = approval_rx
+            .recv()
+            .await
+            .expect("ApprovalRequestedEvent must be fired on Ask");
+        assert_eq!(ev.ticket_id, ticket_id);
+        assert_eq!(ev.tool_name, "exec");
+        assert!(ev.timeout_remaining_ms > 0);
+
+        // 5. resolve(Allow) must return true and wake the waiting tool.
+        assert!(mgr.resolve(&ticket_id, PolicyDecision::Allow));
+        let decision = decision_rx
+            .await
+            .expect("decision_rx must be woken after resolve()");
+        assert_eq!(decision, PolicyDecision::Allow);
+    }
+
+    /// End-to-end Deny path: resolve(Deny) must wake the tool with Deny so
+    /// the tool pipeline aborts instead of hanging on a dead receiver.
+    #[tokio::test]
+    async fn end_to_end_approval_deny_wakes_tool_with_deny() {
+        let mut policy = PermissionPolicy::new();
+        policy.add_rule(PolicyRule {
+            tool_pattern: "*".into(),
+            arg_patterns: Vec::new(),
+            command: None,
+            resource: None,
+            rule_id: None,
+            network: None,
+            mcp: None,
+            decision: PolicyDecision::Ask,
+            priority: 0,
+        });
+
+        let (approval_tx, _approval_rx) = mpsc::unbounded_channel();
+        let mut mgr = PermissionManager::new(policy).with_approval_bus(approval_tx);
+
+        let result = mgr.check(
+            ToolCallId::new(),
+            "write_file",
+            &serde_json::json!({"path": "/tmp/x"}),
+            "Write file",
+        );
+        let PermissionResult::ApprovalRequired {
+            ticket_id,
+            decision_rx,
+        } = result
+        else {
+            panic!("expected ApprovalRequired");
+        };
+
+        assert!(mgr.resolve(&ticket_id, PolicyDecision::Deny));
+        let decision = decision_rx
+            .await
+            .expect("decision_rx must be woken after Deny resolve");
+        assert_eq!(decision, PolicyDecision::Deny);
     }
 }

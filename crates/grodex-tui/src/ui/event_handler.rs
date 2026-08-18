@@ -16,7 +16,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::render::display_width;
-use super::state::{BUILTIN_SLASH_COMMANDS, InputMode, SlashLocalKind, TuiAppState};
+use super::state::{BUILTIN_SLASH_COMMANDS, CTRL_C_QUICK_WINDOW_MS, InputMode, SlashLocalKind, TuiAppState};
 use grodex_protocol::acp::ApprovalResolution;
 
 #[derive(Debug)]
@@ -116,17 +116,18 @@ fn handle_normal(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             (true, false, _, 'c') => {
                 if state.is_streaming() {
                     return Some(TuiAction::CancelTurn);
-                } else {
-                    return Some(TuiAction::Quit);
                 }
+                // 两阶段 Ctrl-C 安全退出：第一次不退出，给出 3 秒提示；
+                // 第二次才真正退出。对齐 Grok / zsh 的误触防护。
+                return try_two_stage_ctrl_c_quit(state);
             }
             _ => {}
         }
     }
     match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), _) => {
-            Some(TuiAction::Quit)
-        }
+        // 'q' 单键退出已移除：避免用户在 Normal 模式滚动时误触 q 直接
+        // 退出（Grok / Codex / Claude Code 都没有单字母退出）。
+        // 正确的退出方式是：两次 Ctrl+C 或者 /exit /quit。
         (KeyCode::Char('i'), _) => {
             state.input_mode = InputMode::Prompt;
             state.input_buffer.clear();
@@ -448,11 +449,21 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
                 // Ctrl-C while streaming = cancel the turn (like Grok).
                 // Don't clear the input — user might want to keep editing.
                 Some(TuiAction::CancelTurn)
+            } else if state.input_buffer.is_empty() {
+                // 空输入框 + 非 streaming = 用户意图可能是退出。走两阶段
+                // Ctrl-C 安全退出（与 Normal 模式下一致），对齐 Grok 的
+                // "first Ctrl+C hints, second Ctrl+C quits"。
+                try_two_stage_ctrl_c_quit(state)
             } else {
-                // Not streaming: clear input and go to Normal (same as Esc).
+                // 输入框里有内容时，Ctrl-C 只清空输入（等价 Esc）。这样
+                // 用户写完一大段 prompt 想重写，按 Ctrl-C 就可丢弃，
+                // 不会意外触发退出提示。
                 state.input_mode = InputMode::Normal;
                 state.input_buffer.clear();
                 state.input_cursor = 0;
+                // 丢弃输入也重置 Ctrl-C 退出门，避免"先清空再 Ctrl-C
+                // 退出"的两阶段被之前的 Ctrl-C 半触发。
+                state.ctrl_c_first_press_at = None;
                 Some(TuiAction::ToggleMode(InputMode::Normal))
             }
         }
@@ -661,6 +672,34 @@ fn handle_command(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Two-stage Ctrl-C quit safety gate.
+///
+/// Returns `Some(TuiAction::Quit)` only when the user has pressed Ctrl-C
+/// twice within `CTRL_C_QUICK_WINDOW_MS`; the first press arms the gate
+/// and writes a visible hint to `state.logs` so the turn-status / log
+/// panel tells them what to do next. Pressing Ctrl-C *once* more than
+/// `CTRL_C_QUICK_WINDOW_MS` after the first press arms the gate again
+/// from scratch (fail-safe against stale arming).
+fn try_two_stage_ctrl_c_quit(state: &mut TuiAppState) -> Option<TuiAction> {
+    let now = std::time::Instant::now();
+    match state.ctrl_c_first_press_at {
+        Some(first) if first.elapsed().as_millis() <= CTRL_C_QUICK_WINDOW_MS as u128 => {
+            // Second press within the safety window → real quit.
+            state.ctrl_c_first_press_at = None;
+            Some(TuiAction::Quit)
+        }
+        _ => {
+            // First press, or stale first press → arm the gate and hint.
+            state.ctrl_c_first_press_at = Some(now);
+            state.push_log(format!(
+                "[quit] 再按一次 Ctrl+C 退出 TUI（{} 秒内有效），或使用 /exit /quit 退出",
+                CTRL_C_QUICK_WINDOW_MS / 1000
+            ));
+            None
+        }
+    }
+}
 
 /// Grok-style single-line sanitizer. The ONLY characters it removes are '\r'
 /// (carriage return) and '\n' (line feed). Everything else — tabs, CJK,

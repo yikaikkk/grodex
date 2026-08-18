@@ -23,22 +23,31 @@ use grodex_core::id::{SessionId, StepGeneration, StepId, TurnId};
 use grodex_rollout::event::{RolloutEvent, RolloutEventType, SensitivityLevel};
 use grodex_rollout::store::RolloutStore;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+/// Inner state shared across all [`RolloutWriter`] clones. When
+/// `/resume <old_session_id>` rebinds the writer, every outstanding
+/// clone (supervisor, coordinator, durable sub-agent) sees the new
+/// store/session_id immediately — no stale writes to the ephemeral
+/// "new-session" empty journal.
+#[derive(Clone)]
+struct RolloutWriterInner {
+    store: Arc<dyn RolloutStore>,
+    session_id: SessionId,
+}
 
 /// Manages journal writes with a single monotonic seq counter shared by
 /// every part of the loop. Cloneable — the inner state is behind `Arc`.
 #[derive(Clone)]
 pub struct RolloutWriter {
-    store: Arc<dyn RolloutStore>,
-    session_id: SessionId,
+    inner: Arc<RwLock<RolloutWriterInner>>,
     seq: Arc<AtomicU64>,
 }
 
 impl RolloutWriter {
     pub fn new(store: Arc<dyn RolloutStore>, session_id: SessionId) -> Self {
         Self {
-            store,
-            session_id,
+            inner: Arc::new(RwLock::new(RolloutWriterInner { store, session_id })),
             seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -56,12 +65,42 @@ impl RolloutWriter {
     }
 
     /// Store access (recovery code reads via the same handle).
-    pub fn store(&self) -> &Arc<dyn RolloutStore> {
-        &self.store
+    ///
+    /// Returns a cloned `Arc` because the inner may be swapped by a
+    /// concurrent [`rebind`](Self::rebind) call; returning a borrowed
+    /// reference would outlive the read guard.
+    pub fn store(&self) -> Arc<dyn RolloutStore> {
+        self.inner
+            .read()
+            .expect("RolloutWriter inner poisoned")
+            .store
+            .clone()
     }
 
     pub fn session_id(&self) -> SessionId {
-        self.session_id
+        self.inner
+            .read()
+            .expect("RolloutWriter inner poisoned")
+            .session_id
+    }
+
+    /// Swap the attached rollout store + session id and re-seed the
+    /// monotonic seq counter so subsequent events pick up exactly
+    /// where the journal left off. Every [`Clone`]d handle sees the
+    /// same swap (single shared `Arc<RwLock<Inner>>`).
+    ///
+    /// Used by the `/resume <session_id>` ACP flow: the agent reads
+    /// the old session's journal, replays history to the user, then
+    /// rebinds the supervisor/coordinator writer so future turns of
+    /// the *resumed* conversation continue appending to the *same*
+    /// durable journal (instead of leaking into an ephemeral new
+    /// session directory).
+    pub fn rebind(&self, new_store: Arc<dyn RolloutStore>, new_session_id: SessionId, next_seq: u64) {
+        let mut w = self.inner.write().expect("RolloutWriter inner poisoned");
+        w.store = new_store;
+        w.session_id = new_session_id;
+        drop(w);
+        self.seq.store(next_seq, Ordering::SeqCst);
     }
 
     /// Append one event, returning the assigned seq on success.
@@ -78,10 +117,11 @@ impl RolloutWriter {
         generation: Option<StepGeneration>,
         payload: serde_json::Value,
     ) -> Result<u64, GrodexError> {
+        let store = self.store();
         let event = RolloutEvent {
             schema_version: 2,
             seq: self.next_seq(),
-            session_id: self.session_id,
+            session_id: self.session_id(),
             turn_id,
             step_id,
             generation,
@@ -90,7 +130,7 @@ impl RolloutWriter {
             payload,
             sensitivity: SensitivityLevel::Normal,
         };
-        self.store.append_event(event).await
+        store.append_event(event).await
     }
 
     pub async fn write_state(&self, state: &str) -> Result<u64, GrodexError> {

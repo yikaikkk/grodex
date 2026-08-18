@@ -26,7 +26,7 @@ pub use compiler::{
     CompileResult, PolicyCompiler, PolicyDecisionTrace, PolicyExplainer, PublishedPolicy,
     ReasonCode, SandboxRequirement,
 };
-pub use manager::{PermissionManager, PermissionResult, SandboxValidator};
+pub use manager::{ApprovalRequestedEvent, PermissionManager, PermissionResult, SandboxValidator};
 pub use policy::{
     ArgPattern, CommandMatcher, DnsPolicy, HostMatcher, McpArgumentConstraints, McpMatcher,
     MethodClass, NetworkDirection, NetworkMatcher, NetworkProtocol, PermissionPolicy, PolicyRule,

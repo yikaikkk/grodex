@@ -1,11 +1,13 @@
 //! Session commands and events — the message protocol between the CLI
 //! (or any frontend) and the SessionSupervisor.
 
-use grodex_core::id::TurnId;
+use grodex_core::context::ContextItem;
+use grodex_core::id::{SessionId, TurnId};
 use grodex_core::policy::PolicyDecision;
+use grodex_rollout::store::RolloutStore;
+use std::sync::Arc;
 
 /// Commands sent to the SessionSupervisor from the frontend.
-#[derive(Debug)]
 pub enum SessionCommand {
     /// Start a new Turn with the given user input.
     StartTurn { user_input: String },
@@ -22,12 +24,88 @@ pub enum SessionCommand {
         decision: PolicyDecision,
         narrowed_args: Option<serde_json::Value>,
     },
-    /// Resume a session after a disconnect — the client tells us the
-    /// last seq it processed; we emit a `SnapshotReady` event in response.
+    /// Resume a session after a disconnect.
+    ///
+    /// The supervisor always rebuilds `Session.context + chat_state` from
+    /// the attached rollout store so future turns carry history. For
+    /// `emit_snapshot_to_frontend = true` it also broadcasts a
+    /// `SessionEvent::SnapshotReady` so the UI renders the history — set
+    /// this to `false` when the caller has already delivered a snapshot
+    /// to the frontend (e.g. ACP main.rs reads a different session_id's
+    /// store and writes ServerFrame::Snapshot directly) so we do not
+    /// overwrite the frontend with a second, often empty, snapshot from
+    /// the new session's still-empty journal.
     ResumeSession {
         last_seq: u64,
         idempotency_key: Option<String>,
+        emit_snapshot_to_frontend: bool,
     },
+    /// Rebuild session context from a recovered ContextItem vector.
+    /// Used by the `/resume <id>` flow: the agent reads the old session's
+    /// rollout journal, rebuilds the full context via SessionReducer, then
+    /// sends this command so the supervisor's Session.context carries the
+    /// restored history for future prompt building. The restored items are
+    /// also persisted to the *new* session's journal as ContextRestored so
+    /// a second crash does not lose the recovered history twice.
+    RestoreContext {
+        items: Vec<ContextItem>,
+    },
+    /// Swap the RolloutWriter's attached store + session id AND reseed
+    /// the monotonic seq counter so future journal writes append to the
+    /// *resumed* session's durable journal rather than leaking into the
+    /// ephemeral "boot-new-session" empty directory.
+    ///
+    /// Sent by ACP `/resume <old_session_id>` immediately after
+    /// `ResumeSession` + `RestoreContext`. Every outstanding clone of the
+    /// writer (supervisor, coordinator, durable sub-agent) sees the same
+    /// swap because they share a single `Arc<RwLock<Inner>>`.
+    RebindRolloutWriter {
+        new_store: Arc<dyn RolloutStore>,
+        new_session_id: SessionId,
+        /// Next event seq number to use (= last journal seq + 1). The
+        /// writer's atomic counter is reseeded here, so subsequent
+        /// commits append gap-free after the resumed journal tail.
+        next_seq: u64,
+    },
+}
+
+impl std::fmt::Debug for SessionCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionCommand::StartTurn { user_input } => f
+                .debug_struct("StartTurn")
+                .field("user_input_len", &user_input.len())
+                .finish(),
+            SessionCommand::Steer { user_input } => f
+                .debug_struct("Steer")
+                .field("user_input_len", &user_input.len())
+                .finish(),
+            SessionCommand::CancelTurn => write!(f, "CancelTurn"),
+            SessionCommand::Shutdown => write!(f, "Shutdown"),
+            SessionCommand::ResolveApproval { ticket_id, decision, narrowed_args: _ } => f
+                .debug_struct("ResolveApproval")
+                .field("ticket_id", ticket_id)
+                .field("decision", decision)
+                .finish_non_exhaustive(),
+            SessionCommand::ResumeSession { last_seq, idempotency_key, emit_snapshot_to_frontend } => f
+                .debug_struct("ResumeSession")
+                .field("last_seq", last_seq)
+                .field("idempotency_key", idempotency_key)
+                .field("emit_snapshot_to_frontend", emit_snapshot_to_frontend)
+                .finish(),
+            SessionCommand::RestoreContext { items } => f
+                .debug_struct("RestoreContext")
+                .field("items_count", &items.len())
+                .finish(),
+            // Arc<dyn RolloutStore> is not Debug; skip the opaque store handle.
+            SessionCommand::RebindRolloutWriter { new_session_id, next_seq, new_store: _ } => f
+                .debug_struct("RebindRolloutWriter")
+                .field("new_session_id", new_session_id)
+                .field("next_seq", next_seq)
+                .field("new_store", &"<dyn RolloutStore>")
+                .finish(),
+        }
+    }
 }
 
 /// Events emitted by the SessionSupervisor to the frontend.
@@ -59,6 +137,11 @@ pub enum SessionEvent {
     TurnCompleted { turn_id: TurnId },
     /// An error occurred.
     Error { message: String },
+    /// Informational log (not an error, no UX alerting). Use this for
+    /// success confirmations (resume, export, diagnostics, …) instead of
+    /// abusing `Error` as a generic "toast". The frontend renders Info
+    /// via push_log, not the red "Error" card.
+    Info { message: String },
     /// The session has shut down.
     Shutdown,
     /// A snapshot is ready for the client (in response to `ResumeSession`

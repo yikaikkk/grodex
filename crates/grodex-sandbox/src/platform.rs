@@ -85,6 +85,11 @@ impl std::error::Error for SandboxEnforceError {}
 /// child's exit status. On non-macOS returns `Unsupported`. If `sandbox-exec`
 /// is absent returns `BackendMissing` (the caller can fail-closed or fall
 /// back to un-sandboxed, per its own policy).
+///
+/// stdout/stderr of the sandboxed command are discarded (redirected to
+/// null). Use [`enforce_seatbelt_capturing`] when the caller needs the
+/// command's output (e.g. the `exec` tool routing through the sandbox
+/// runtime).
 pub fn enforce_seatbelt(
     profile: &SandboxProfile,
     cmd: &mut Command,
@@ -106,7 +111,47 @@ pub fn enforce_seatbelt(
             })
             .collect();
         let cwd = cmd.get_current_dir().map(|p| p.to_path_buf());
-        run_under_seatbelt(profile, &program, &argv, &envs, cwd.as_deref())
+        let (status, _out, _err) = run_under_seatbelt(profile, &program, &argv, &envs, cwd.as_deref(), false)?;
+        Ok(status)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (profile, cmd);
+        Err(SandboxEnforceError::Unsupported)
+    }
+}
+
+/// Like [`enforce_seatbelt`] but captures the sandboxed command's stdout and
+/// stderr into byte buffers instead of discarding them.
+///
+/// This is the variant the `exec` tool uses when routing through the sandbox
+/// runtime: it needs both the kernel-enforced deny rules AND the command's
+/// output to return to the model. The non-capturing [`enforce_seatbelt`] is
+/// still used by the external supervisor binary whose own stdout carries the
+/// JSON response (so the child's output must not leak onto its stdout).
+pub fn enforce_seatbelt_capturing(
+    profile: &SandboxProfile,
+    cmd: &mut Command,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), SandboxEnforceError> {
+    #[cfg(target_os = "macos")]
+    {
+        if which_sandbox_exec().is_none() {
+            return Err(SandboxEnforceError::BackendMissing);
+        }
+        let program = cmd.get_program().to_string_lossy().to_string();
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let envs: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| (k.to_string_lossy().to_string(), v.to_string_lossy().to_string()))
+            })
+            .collect();
+        let cwd = cmd.get_current_dir().map(|p| p.to_path_buf());
+        let (status, out, err) = run_under_seatbelt(profile, &program, &argv, &envs, cwd.as_deref(), true)?;
+        Ok((status, out.unwrap_or_default(), err.unwrap_or_default()))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -126,7 +171,8 @@ fn run_under_seatbelt(
     argv: &[String],
     envs: &[(String, String)],
     cwd: Option<&std::path::Path>,
-) -> Result<std::process::ExitStatus, SandboxEnforceError> {
+    capture: bool,
+) -> Result<(std::process::ExitStatus, Option<Vec<u8>>, Option<Vec<u8>>), SandboxEnforceError> {
     use std::io::Write;
     let sb = generate_seatbelt_profile(profile).ok_or(SandboxEnforceError::ProfileUnrepresentable)?;
     let sandbox_exec = which_sandbox_exec().ok_or(SandboxEnforceError::BackendMissing)?;
@@ -154,23 +200,35 @@ fn run_under_seatbelt(
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    // Redirect the sandboxed command's stdout/stderr to null: the exit
-    // status is the only thing the caller needs. Without this, the
-    // sandboxed command's output leaks into the caller's stdout — which
-    // is especially destructive for the external supervisor binary,
-    // whose stdout carries the JSON response.
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
 
-    let result = cmd
-        .spawn()
-        .map_err(|e| SandboxEnforceError::Io(format!("spawn: {e}")))?
-        .wait()
-        .map_err(|e| SandboxEnforceError::Io(format!("wait: {e}")));
-
-    // Clean up the temp profile regardless of outcome.
-    let _ = std::fs::remove_file(&tmp_path);
-    result
+    // Two stdio strategies:
+    //   capture=false → null stdout/stderr (used by the external supervisor
+    //     binary, whose OWN stdout carries the JSON response; the child's
+    //     raw output must never leak onto the supervisor's stdout).
+    //   capture=true  → pipe stdout/stderr so the caller (the `exec` tool
+    //     routing through the in-process runtime) gets the command's output
+    //     to return to the model, in addition to the kernel-enforced deny.
+    if capture {
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let output = cmd
+            .spawn()
+            .map_err(|e| SandboxEnforceError::Io(format!("spawn: {e}")))?
+            .wait_with_output()
+            .map_err(|e| SandboxEnforceError::Io(format!("wait_with_output: {e}")))?;
+        let _ = std::fs::remove_file(&tmp_path);
+        Ok((output.status, Some(output.stdout), Some(output.stderr)))
+    } else {
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let status = cmd
+            .spawn()
+            .map_err(|e| SandboxEnforceError::Io(format!("spawn: {e}")))?
+            .wait()
+            .map_err(|e| SandboxEnforceError::Io(format!("wait: {e}")))?;
+        let _ = std::fs::remove_file(&tmp_path);
+        Ok((status, None, None))
+    }
 }
 
 /// Locate `sandbox-exec` on PATH. It ships with macOS at /usr/bin/sandbox-exec.

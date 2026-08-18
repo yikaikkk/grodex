@@ -816,6 +816,27 @@ pub struct RetrievedUnit {
     pub source: ResultSource,
 }
 
+impl RetrievedUnit {
+    /// Format a slice of retrieved units for injection into the system
+    /// prompt (mirrors `LegacyRetriever::format_for_prompt`).
+    pub fn format_for_prompt(units: &[RetrievedUnit]) -> String {
+        if units.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("## Relevant Memory from Past Sessions\n\n");
+        for unit in units {
+            let label = if unit.path.is_empty() {
+                "memory"
+            } else {
+                unit.path.as_str()
+            };
+            out.push_str(&format!("- **{}**: {}\n", label, unit.content));
+        }
+        out.push('\n');
+        out
+    }
+}
+
 impl MemoryDatabase {
     /// Hybrid RRF 检索主入口（Memory 管道）。
     ///
@@ -1159,5 +1180,78 @@ mod tests {
 
         let with_super = db.fts5_evidence_candidates("cargo", 10, true).unwrap();
         assert_eq!(with_super.len(), 2);
+    }
+
+    /// Fail-open regression: `retrieve_hybrid_memory` with `emb=None` must
+    /// still return FTS results (degrades to pure FTS5), never error. This
+    /// is the project invariant: embedding unavailability must not block
+    /// a turn.
+    #[tokio::test]
+    async fn retrieve_hybrid_memory_degrades_to_fts_when_emb_none() {
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        db.upsert_memory_unit(&make_memory_unit(
+            "mem_rust",
+            "Rust release workflow requires cargo build on stable",
+        ))
+        .unwrap();
+        db.upsert_memory_unit(&make_memory_unit(
+            "mem_release",
+            "Release pipeline publishes crates after tests pass",
+        ))
+        .unwrap();
+
+        // emb=None → vector_ids=[] → RRF over pure FTS results.
+        let results = db
+            .retrieve_hybrid_memory("cargo build", 5, None)
+            .await
+            .expect("fail-open: emb=None must not error");
+        assert!(
+            !results.is_empty(),
+            "FTS should find the cargo-build memory even without embeddings"
+        );
+        assert!(results.iter().any(|r| r.content.contains("cargo build")));
+    }
+
+    /// Fail-open regression: when an embedding model is supplied but the
+    /// vector store has no embeddings table rows (or `embed_texts` would
+    /// fail), the hybrid path still returns FTS results rather than
+    /// erroring or returning empty. Uses a stub model whose `embed_texts`
+    /// returns an empty vector list — the same shape a real backend yields
+    /// on a transient API error.
+    #[tokio::test]
+    async fn retrieve_hybrid_memory_degrades_to_fts_when_embed_returns_empty() {
+        use async_trait::async_trait;
+
+        struct EmptyEmbedding;
+        #[async_trait]
+        impl EmbeddingModel for EmptyEmbedding {
+            fn model_id(&self) -> &str {
+                "stub-empty"
+            }
+            fn dimension(&self) -> usize {
+                1536
+            }
+            async fn embed_texts(
+                &self,
+                _texts: &[String],
+            ) -> Result<Vec<EmbeddingVector>, crate::embedding::EmbeddingError> {
+                Ok(Vec::new()) // simulates "no vectors" / transient failure
+            }
+        }
+
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        db.upsert_memory_unit(&make_memory_unit(
+            "mem_deploy",
+            "deploy step runs cargo build then ships the binary",
+        ))
+        .unwrap();
+
+        let emb: Arc<dyn EmbeddingModel + Send + Sync> = Arc::new(EmptyEmbedding);
+        let results = db
+            .retrieve_hybrid_memory("cargo build", 5, Some(&emb))
+            .await
+            .expect("fail-open: empty embed result must not error");
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.content.contains("cargo build")));
     }
 }

@@ -22,8 +22,8 @@ use grodex_core::id::{CommitSequence, OperationId, StepGeneration, StepId, StepS
 use grodex_core::policy::PolicyDecision;
 use grodex_core::tool::ToolRuntime;
 use grodex_permission::{
-    ApprovalResolution, LiveRevocationFence, PermissionLease, PermissionManager, PermissionPolicy,
-    PermissionResult,
+    ApprovalRequestedEvent, ApprovalResolution, LiveRevocationFence, PermissionLease,
+    PermissionManager, PermissionPolicy, PermissionResult,
 };
 use grodex_subagent::delegation::DelegationEnvelope;
 use grodex_provider::canonical_event::CanonicalResponseItem;
@@ -68,6 +68,16 @@ pub struct TurnCoordinator {
     /// the envelope is the parent-imposed ceiling, the permission manager is
     /// the child's own (stricter-or-equal) policy.
     delegation_envelope: Option<DelegationEnvelope>,
+    /// Approval notification bus drain. The `PermissionManager` holds the
+    /// sender (set via `with_approval_bus`); whenever `check()` returns
+    /// `Ask` it fires an `ApprovalRequestedEvent` here. This receiver is
+    /// drained inside `run()` and forwarded to the stream channel as
+    /// `StreamFragment::ApprovalRequested`, which the supervisor surfaces
+    /// to the frontend as `SessionEvent::ApprovalRequested` (Design Doc 16
+    /// §10, first half of the approval round-trip). Wrapped in
+    /// `Arc<tokio::sync::Mutex<>>` so a cloneable coordinator can share
+    /// one receiver across sequential turns.
+    approval_rx: Arc<Mutex<mpsc::UnboundedReceiver<ApprovalRequestedEvent>>>,
 }
 
 impl TurnCoordinator {
@@ -78,24 +88,79 @@ impl TurnCoordinator {
         self.rollout = Some(writer);
         self
     }
+
+    /// Wire up the approval bus for a freshly-built manager and stash the
+    /// drain receiver. Called by both `new()` and `with_permission()` so
+    /// every construction path produces a manager whose `Ask` decisions
+    /// actually reach the frontend.
+    fn wire_approval_bus(
+        mgr: PermissionManager,
+    ) -> (PermissionManager, Arc<Mutex<mpsc::UnboundedReceiver<ApprovalRequestedEvent>>>) {
+        let (tx, rx) = mpsc::unbounded_channel::<ApprovalRequestedEvent>();
+        let mgr = mgr.with_approval_bus(tx);
+        (mgr, Arc::new(Mutex::new(rx)))
+    }
+
     pub fn new(sampler: SamplingActor, chat_state: ChatStateHandle) -> Self {
         // Unification (audit Phase-3): the CapabilityManager and the
         // CapabilityPublisher share one generation source so a tool bump is
         // visible to the ACP event stream / StepContext.
         let publisher = SharedPublisher::new();
+        let (mgr, approval_rx) = Self::wire_approval_bus(PermissionManager::new(
+            PermissionPolicy::new(),
+        ));
         Self {
             sampler: Arc::new(sampler),
             chat_state,
             capability: Arc::new(Mutex::new(CapabilityManager::with_publisher(10, publisher))),
             rollout: None,
             completed_operations: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            permission: Arc::new(Mutex::new(PermissionManager::new(
-                PermissionPolicy::new(),
-            ))),
+            permission: Arc::new(Mutex::new(mgr)),
             compaction: Arc::new(Mutex::new(CompactionManager::new(128_000))),
             sandbox: Arc::new(grodex_sandbox::SandboxManager::default()),
             delegation_envelope: None,
+            approval_rx,
         }
+    }
+
+    /// Inject a pre-built `PermissionManager` (e.g. one whose policy was
+    /// loaded from config). Re-wires the approval bus to the injected
+    /// manager so `Ask` decisions still reach the frontend — the caller
+    /// must NOT have attached its own bus.
+    pub fn with_permission(self, mgr: PermissionManager) -> Self {
+        let (mgr, approval_rx) = Self::wire_approval_bus(mgr);
+        Self {
+            permission: Arc::new(Mutex::new(mgr)),
+            approval_rx,
+            ..self
+        }
+    }
+
+    /// Inject a pre-built `SandboxManager` (e.g. constructed from a config
+    /// sandbox profile). Overrides the default permissive sandbox.
+    pub fn with_sandbox(self, sandbox: grodex_sandbox::SandboxManager) -> Self {
+        Self {
+            sandbox: Arc::new(sandbox),
+            ..self
+        }
+    }
+
+    /// Inject a pre-built `CapabilityManager` (e.g. one with tools already
+    /// registered or a non-default publisher). Overrides the default.
+    pub fn with_capability(self, capability: CapabilityManager) -> Self {
+        Self {
+            capability: Arc::new(Mutex::new(capability)),
+            ..self
+        }
+    }
+
+    /// Hand out a clone of the shared permission manager so the
+    /// `SessionSupervisor` can call `resolve()` when a `ResolveApproval`
+    /// command arrives from the frontend (Design Doc 16 §10, second half
+    /// of the round-trip). This is the single chokepoint that lets the
+    /// supervisor wake a tool future parked on `decision_rx`.
+    pub fn permission_handle(&self) -> Arc<Mutex<PermissionManager>> {
+        Arc::clone(&self.permission)
     }
 
     /// Attach a DelegationEnvelope for sub-agent authority enforcement.
@@ -134,6 +199,42 @@ impl TurnCoordinator {
         let max_steps = 10;
         let mut steps = Vec::new();
         let mut tools_called = Vec::new();
+
+        // ── Approval notification forwarder ───────────────────────────
+        // Drains `approval_rx` (fed by `PermissionManager::check()` when
+        // policy says `Ask`) and pushes `StreamFragment::ApprovalRequested`
+        // onto the stream so the supervisor surfaces a pending-approval
+        // event to the frontend. This is the first half of the approval
+        // round-trip (Design Doc 16 §10). The forwarder is aborted at
+        // every exit point of `run()` so it never outlives the Turn — a
+        // leaked forwarder would hold a clone of `stream_tx` and delay the
+        // supervisor's stream-handle shutdown.
+        let approval_rx = self.approval_rx.clone();
+        let approval_stream_tx = stream_tx.clone();
+        let approval_cancel = CancellationToken::new();
+        let approval_cancel_clone = approval_cancel.clone();
+        let approval_handle = tokio::spawn(async move {
+            loop {
+                let ev = tokio::select! {
+                    biased;
+                    _ = approval_cancel_clone.cancelled() => break,
+                    ev = async {
+                        let mut rx = approval_rx.lock().await;
+                        rx.recv().await
+                    } => ev,
+                };
+                let Some(ev) = ev else { break };
+                if let Some(tx) = approval_stream_tx.as_ref() {
+                    let _ = tx.send(StreamFragment::ApprovalRequested {
+                        ticket_id: ev.ticket_id,
+                        tool_name: ev.tool_name,
+                        summary: ev.summary,
+                        risk: ev.risk,
+                        timeout_remaining_ms: ev.timeout_remaining_ms,
+                    });
+                }
+            }
+        });
 
         // ── Freeze capabilities at Turn start (invariant #15) ────────
         // The base is the immutable snapshot of all registered capabilities
@@ -518,6 +619,8 @@ impl TurnCoordinator {
                                     tool_calls: Vec::new(),
                                     elapsed_ms,
                                 });
+                                approval_cancel.cancel();
+                                approval_handle.abort();
                                 return TurnOutcome {
                                     steps,
                                     final_text: String::new(),
@@ -574,6 +677,9 @@ impl TurnCoordinator {
             let mut cap = self.capability.lock().await;
             cap.adopt_overlay(overlay);
         }
+
+        approval_cancel.cancel();
+        approval_handle.abort();
 
         TurnOutcome {
             steps,
@@ -756,7 +862,14 @@ async fn execute_single_tool(
             PermissionResult::ApprovalRequired { decision_rx, .. } => {
                 let epoch = perm.revocation_epoch();
                 drop(perm);
-                match tokio::time::timeout(std::time::Duration::from_secs(10), decision_rx).await {
+                // Await the frontend's resolution. The deadline matches the
+                // ticket's own timeout (ApprovalTicket::new → 120s) so the
+                // user sees a consistent countdown and the tool future does
+                // not give up before the broker would expire the ticket.
+                // A Deny (user-rejected, broker-expired, or cancelled)
+                // arrives through the same oneshot and falls into the
+                // error branch — fail-closed.
+                match tokio::time::timeout(std::time::Duration::from_secs(120), decision_rx).await {
                     Ok(Ok(PolicyDecision::Allow)) => PermissionLease::new(
                         call_id,
                         ApprovalResolution::Allow,
@@ -766,7 +879,7 @@ async fn execute_single_tool(
                     _ => {
                         return ContextItem::ToolResult {
                             call_id,
-                            content: "Approval required — not granted".into(),
+                            content: "Approval required — not granted (denied, timed out, or cancelled)".into(),
                             is_error: true,
                         };
                     }

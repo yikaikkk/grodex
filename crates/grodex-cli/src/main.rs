@@ -3,8 +3,10 @@
 //! Phase 2: interactive session loop using the Agent Loop runtime.
 
 mod idempotency;
+mod runtime;
 
 use idempotency::IdempotencyCache;
+use runtime::SessionRuntimeBuilder;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -205,136 +207,20 @@ async fn build_session_parts(
     SessionId,
     Option<Arc<dyn RolloutStore>>,
 )> {
-    let mut config = ConfigResolver::load(&cwd).unwrap_or_else(|_| LoadedConfig::empty());
+    // Unified composition root: the builder assembles Config, Auth,
+    // SamplingActor, PermissionManager (config `[rules]`), SandboxRuntime
+    // (`sandbox_profile`), CapabilityManager (built-in tools), RolloutWriter,
+    // PromptProvider (per-turn in supervisor) and MemoryProvider — all from
+    // one place. ACP `serve_acp` and the CLI REPL both go through here now,
+    // so a new module only needs to be wired once.
+    let runtime = SessionRuntimeBuilder::new(cwd)
+        .with_trusted(true) // ACP serve always trusts the workspace
+        .build()
+        .await?;
 
-    // Apply trusted override: if any Workspace layer is untrusted, force it
-    // trusted and re-merge so workspace-layer config values (provider, model,
-    // endpoint, api_key) flow into `effective`.
-    let needs_remerge = config.raw_layers.iter().any(|l| {
-        matches!(&l.source, grodex_config::ConfigLayerSource::Workspace { trusted } if !*trusted)
-    });
-    if needs_remerge {
-        for layer in &mut config.raw_layers {
-            if let grodex_config::ConfigLayerSource::Workspace { trusted } = &mut layer.source {
-                *trusted = true;
-            }
-        }
-        config.effective = grodex_config::merge::merge_layers(&config.raw_layers)?;
-    }
-
-    let cfg = &config.effective.values;
-    let route_toml = grodex_sampler::route::ModelRouteToml::from_config(cfg, "default");
-    let first_candidate = route_toml.as_ref().and_then(|r| r.candidates.first());
-
-    // Config.toml takes priority, env vars as fallback.
-    let provider_name = cfg.get("provider").and_then(|v| v.as_str()).map(|s| s.to_string())
-        .or_else(|| first_candidate.map(|c| c.provider_id.clone()))
-        .or_else(|| std::env::var("GRODEX_PROVIDER").ok())
-        .unwrap_or_else(|| "openai".to_string());
-    // Migration renames top-level `model` → `model_id` (v1→v2), so look up
-    // the canonical `model_id` first, then fall back to the v1 `model` alias
-    // for configs that haven't been migrated yet.
-    let model_name = cfg.get("model_id").or_else(|| cfg.get("model")).and_then(|v| v.as_str()).map(|s| s.to_string())
-        .or_else(|| first_candidate.map(|c| c.model_id.clone()))
-        .or_else(|| std::env::var("GRODEX_MODEL").ok())
-        .unwrap_or_else(|| "gpt-5".to_string());
-    let wire_str = cfg.get("wire_protocol").and_then(|v| v.as_str())
-        .or_else(|| first_candidate.map(|c| c.wire_protocol.as_str()))
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("GRODEX_WIRE_PROTOCOL").ok());
-    let wire_protocol = match wire_str.as_deref() {
-        Some("chat") | Some("chat_completions") => grodex_provider::descriptor::WireProtocol::ChatCompletions,
-        Some("messages") => grodex_provider::descriptor::WireProtocol::Messages,
-        _ => grodex_provider::descriptor::WireProtocol::Responses,
-    };
-    let endpoint = cfg.get("endpoint").and_then(|v| v.as_str()).map(|s| s.to_string())
-        .or_else(|| first_candidate.map(|c| c.endpoint.clone()))
-        .or_else(|| std::env::var("GRODEX_API_ENDPOINT").ok());
-    let api_key_from_cfg = cfg.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-    let session = Session::new(config);
-    let session_id = session.id;
-
-    let auth = AuthManager::new();
-    let master_key = auth.resolve_for_provider(&provider_name).or(api_key_from_cfg);
-    let audience = endpoint.as_deref().unwrap_or("https://api.openai.com/v1").to_string();
-    let mut broker = master_key
-        .map(|k| {
-            let mut b = grodex_auth::CredentialBroker::empty();
-            b.register_provider(&provider_name, k);
-            b
-        });
-    let api_key: Option<String> = (|| {
-        let b = broker.as_mut()?;
-        let lease = b.issue_lease(&provider_name, &audience)?;
-        b.resolve(&lease, &audience).ok()
-    })();
-
-    let client_config = SamplingClientConfig {
-        api_key,
-        endpoint,
-        ..SamplingClientConfig::default()
-    };
-    let client = SamplingClient::new(client_config).map_err(|e| anyhow!("failed to create sampling client: {e}"))?;
-    let actor = SamplingActor::new(client);
-    let chat_state = ChatStateActor::spawn();
-    let coordinator = TurnCoordinator::new(actor, chat_state.clone());
-
-    coordinator.register_tool("read_file", Arc::new(ReadFileTool::new()), ReadFileTool::new().input_schema()).await;
-    coordinator.register_tool("write_file", Arc::new(WriteFileTool::new()), WriteFileTool::new().input_schema()).await;
-    coordinator.register_tool("edit_file", Arc::new(EditTool::new()), EditTool::new().input_schema()).await;
-    coordinator.register_tool("exec", Arc::new(ExecTool::new()), ExecTool::new().input_schema()).await;
-    coordinator.register_tool("apply_patch", Arc::new(ApplyPatchTool::new()), ApplyPatchTool::new().input_schema()).await;
-
-    let delegate = grodex_loop::delegate_tool::DelegateTool::new(grodex_subagent::supervisor::SubAgentConfig::default());
-    let delegate_schema = delegate.input_schema();
-    coordinator.register_tool("delegate_task", Arc::new(delegate), delegate_schema).await;
-
-    let session_id_str = session.id.to_string();
-    let base_dir = FileRolloutStore::default_dir();
-    let rollout: Option<Arc<dyn RolloutStore>> =
-        FileRolloutStore::new(&base_dir, &session_id_str)
-            .ok()
-            .map(|s| Arc::new(s) as Arc<dyn RolloutStore>);
-    let rollout_clone = rollout.clone();
-
-    let (mut supervisor, handle) = SessionSupervisor::new(
-        session,
-        chat_state,
-        coordinator,
-        rollout,
-        None,
-        Some(grodex_memory::LegacyRetriever::new(grodex_memory::MemoryStore::new())),
-        grodex_loop::supervisor::ModelConfig {
-            provider: provider_name.clone(),
-            model: model_name.clone(),
-            wire_protocol,
-        },
-    );
-
-    let (event_broadcast_tx, event_broadcast_rx) = tokio::sync::mpsc::channel::<LoopSessionEvent>(128);
-
-    let supervisor_task = tokio::spawn(async move {
-        supervisor.run().await;
-    });
-
-    let SessionHandle { cmd_tx, mut event_rx } = handle;
-    tokio::spawn(async move {
-        while let Some(ev) = event_rx.recv().await {
-            if event_broadcast_tx.send(ev).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::channel::<LoopSessionEvent>(1);
-    let cmd_handle = SessionHandle {
-        cmd_tx,
-        event_rx: dummy_rx,
-    };
-    let _ = supervisor_task;
-
-    Ok((cmd_handle, event_broadcast_rx, session_id, rollout_clone))
+    let session_id = SessionId::from_string(&runtime.session_id)
+        .map_err(|e| anyhow!("invalid session id from builder: {e}"))?;
+    Ok((runtime.handle, runtime.event_rx, session_id, runtime.rollout_store))
 }
 
 fn now_ms() -> u64 {
@@ -464,6 +350,11 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
             let env = EventEnvelope::wrap(seq, session_id, content);
             Some(ServerFrame::Event(env))
         }
+        LoopSessionEvent::Info { message } => {
+            let content = UpdateContent::Info { message };
+            let env = EventEnvelope::wrap(seq, session_id, content);
+            Some(ServerFrame::Event(env))
+        }
         LoopSessionEvent::Shutdown => None,
         LoopSessionEvent::SnapshotReady {
             last_seq,
@@ -492,6 +383,27 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
             let env = EventEnvelope::wrap(seq, session_id, content);
             Some(ServerFrame::Event(env))
         }
+        // ── B5: Agent asks client for permission. Forward the ticket
+        // to the frontend so it can render a pending approval row; the
+        // CLI REPL prints a short notice, the TUI shows the full card.
+        LoopSessionEvent::ApprovalRequested {
+            ticket_id,
+            tool_name,
+            summary,
+            risk,
+            timeout_remaining_ms,
+        } => {
+            let payload = grodex_protocol::acp::RequestPermissionPayload {
+                ticket_id,
+                tool_name,
+                summary,
+                risk,
+                arguments_snapshot: None,
+                timeout_remaining_ms,
+            };
+            let env = EventEnvelope::wrap(seq, session_id, UpdateContent::RequestPermission(payload));
+            Some(ServerFrame::Event(env))
+        }
     }
 }
 
@@ -503,7 +415,7 @@ async fn route_command(
     rollout_store: Option<Arc<dyn RolloutStore>>,
     session_id: SessionId,
     seq: &mut u64,
-) -> Option<AckBucket> {
+) -> (Option<AckBucket>, Option<SessionId>) {
     let command_id = match &cmd {
         AcpCommand::Prompt(p) => Some(p.command_id.clone()),
         AcpCommand::Cancel(c) => Some(c.command_id.clone()),
@@ -526,12 +438,13 @@ async fn route_command(
                 format!("idempotency_key already processed: {}", idem_key),
             )
             .await;
-            return None;
+            return (None, None);
         }
         idem_cache.insert(idem_key.to_string(), now);
     }
 
     let mut ack_bucket_out: Option<AckBucket> = None;
+    let mut rebind_session_id: Option<SessionId> = None;
 
     let result: Result<(), String> = match cmd {
         AcpCommand::Prompt(p) => handle
@@ -562,57 +475,327 @@ async fn route_command(
             let mode = rs.resume_from.mode.clone();
             let last_consumed = rs.resume_from.last_consumed_seq;
 
-            let needs_replay = matches!(mode, ReplayMode::CatchUp | ReplayMode::SnapshotThenLive);
+            // ── ResumeSession: 用 rs.session_id 打开 *旧会话* 的 FileRolloutStore ──
+            // 之前的 bug：rollout_store 是 serve_acp 启动时创建的 *新* session
+            // 目录，永远为空，所以 snapshot 空 + context 不注入 → 模型失忆。
+            let base_dir = FileRolloutStore::default_dir();
+            let resume_sid = SessionId::from_string(&rs.session_id)
+                .unwrap_or_else(|_| SessionId::new());
+            let resume_store_res =
+                FileRolloutStore::new(&base_dir, &resume_sid.to_string());
+            let resume_store = match resume_store_res {
+                Ok(s) => s,
+                Err(e) => {
+                    write_protocol_error(
+                        stdout,
+                        command_id.clone(),
+                        "RESUME_IO",
+                        format!("无法打开会话 {} 的 journal：{e}", rs.session_id),
+                    )
+                    .await;
+                    return (ack_bucket_out, None);
+                }
+            };
 
-            if needs_replay {
-                if let Some(ref store) = rollout_store {
-                    match store.replay_from(last_consumed.saturating_add(1)).await {
-                        Ok(journal_events) => {
-                            let mut replay_seq = last_consumed;
-                            let mode_str = match mode {
-                                ReplayMode::CatchUp => "catch_up",
-                                ReplayMode::SnapshotThenLive => "snapshot_then_live",
-                                _ => "live_only",
-                            };
-                            for _ev in &journal_events {
-                                replay_seq += 1;
-                                let content = UpdateContent::TextDelta {
-                                    text: format!(
-                                        "frame_type=resume_replay mode={mode_str} seq={replay_seq}"
-                                    ),
-                                };
-                                let env = EventEnvelope::wrap(replay_seq, session_id, content);
-                                let frame = ServerFrame::Event(env);
-                                write_frame(stdout, &frame).await;
-                            }
-                            *seq = (*seq).max(replay_seq);
-                        }
-                        Err(e) => {
-                            write_protocol_error(
-                                stdout,
-                                command_id.clone(),
-                                "RESUME_IO",
-                                format!("cannot read rollout journal: {e}"),
-                            )
-                            .await;
-                            return ack_bucket_out;
+            // NOTE: SessionReducer.apply enforces strict seq continuity
+            // (last_seq == event.seq, then +=1). It starts at last_seq=0,
+            // so the first event MUST be seq=0. We therefore read from
+            // seq=0 to capture any RuntimeStateChanged / bootstraps that
+            // were written at position 0. Before this fix, we called
+            // replay_from(1) which skipped seq=0 → reducer blew up with
+            // "missing event seq: expected 0, got 1".
+            let dyn_store: &dyn RolloutStore = &resume_store;
+            let full_journal = match dyn_store.replay_from(0).await {
+                Ok(j) => j,
+                Err(e) => {
+                    write_protocol_error(
+                        stdout,
+                        command_id.clone(),
+                        "RESUME_IO",
+                        format!("读取旧会话 rollout journal 失败：{e}"),
+                    )
+                    .await;
+                    return (ack_bucket_out, None);
+                }
+            };
+
+            let mut last_seq = 0u64;
+            let mut snapshot_items: Vec<grodex_protocol::acp::SnapshotItem> = Vec::new();
+            for ev in &full_journal {
+                last_seq = last_seq.max(ev.seq);
+                use grodex_rollout::event::RolloutEventType;
+                match &ev.event_type {
+                    RolloutEventType::UserInputAccepted => {
+                        if let Some(text) = ev.payload.get("text").and_then(|v| v.as_str()) {
+                            snapshot_items.push(grodex_protocol::acp::SnapshotItem {
+                                item_id: format!("u-{}", ev.seq),
+                                item_type: "user".to_string(),
+                                content: text.to_string(),
+                                complete: true,
+                            });
                         }
                     }
+                    RolloutEventType::ModelItemProduced => {
+                        if let Some(reasoning) =
+                            ev.payload.get("reasoning").and_then(|v| v.as_str())
+                        {
+                            if !reasoning.is_empty() {
+                                snapshot_items.push(
+                                    grodex_protocol::acp::SnapshotItem {
+                                        item_id: format!("th-{}", ev.seq),
+                                        item_type: "thinking".to_string(),
+                                        content: reasoning.to_string(),
+                                        complete: true,
+                                    },
+                                );
+                            }
+                        }
+                        if let Some(text) =
+                            ev.payload.get("assistant_text").and_then(|v| v.as_str())
+                        {
+                            if !text.is_empty() {
+                                snapshot_items.push(
+                                    grodex_protocol::acp::SnapshotItem {
+                                        item_id: format!("a-{}", ev.seq),
+                                        item_type: "assistant".to_string(),
+                                        content: text.to_string(),
+                                        complete: true,
+                                    },
+                                );
+                            }
+                        }
+                        if let Some(tool_calls) =
+                            ev.payload.get("tool_calls").and_then(|v| v.as_array())
+                        {
+                            for (i, tc) in tool_calls.iter().enumerate() {
+                                let call_id = tc
+                                    .get("call_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name = tc
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let args = tc
+                                    .get("arguments")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                let merged = serde_json::json!({
+                                    "call_id": call_id,
+                                    "name": name,
+                                    "arguments": args,
+                                });
+                                snapshot_items.push(
+                                    grodex_protocol::acp::SnapshotItem {
+                                        item_id: format!("tc-{}-{}", ev.seq, i),
+                                        item_type: "tool_call".to_string(),
+                                        content: merged.to_string(),
+                                        complete: true,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    RolloutEventType::ToolResultCommitted => {
+                        let call_id = ev
+                            .payload
+                            .get("call_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let content = ev
+                            .payload
+                            .get("content")
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+                        let is_error = ev
+                            .payload
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let merged = serde_json::json!({
+                            "call_id": call_id,
+                            "content": content,
+                            "is_error": is_error,
+                        });
+                        snapshot_items.push(grodex_protocol::acp::SnapshotItem {
+                            item_id: format!("tr-{}", ev.seq),
+                            item_type: "tool_result".to_string(),
+                            content: merged.to_string(),
+                            complete: true,
+                        });
+                    }
+                    _ => {}
                 }
             }
 
+            // 1) Rebuild ContextItem projection via SessionReducer → inject
+            //    into the *current* session (supervisor) so future turns
+            //    carry the resumed history.
+            let mut restored_context = Vec::new();
+            if !full_journal.is_empty() {
+                let pseudo_sid = SessionId::from_string(&rs.session_id)
+                    .unwrap_or_else(|_| SessionId::new());
+                let mut reducer = SessionReducer::new(pseudo_sid);
+                if let Err(e) = reducer.apply_all(&full_journal) {
+                    write_protocol_error(
+                        stdout,
+                        command_id.clone(),
+                        "RESUME_REPLAY",
+                        format!("重建会话上下文失败：{e}"),
+                    )
+                    .await;
+                    return (ack_bucket_out, None);
+                }
+                restored_context = reducer.context().to_vec();
+            }
+
+            // 2) SnapshotThenLive: send Snapshot frame to TUI so chat
+            //    history is replayed to the user (they see old turns).
+            if matches!(mode, ReplayMode::SnapshotThenLive) {
+                let snapshot = ServerFrame::Snapshot(SessionSnapshotPayload {
+                    // Snapshot 展示给用户时用 *旧* session_id，确保前端
+                    // 的 "当前会话号显示" 与 resume 目标一致。
+                    session_id: resume_sid.clone(),
+                    last_seq,
+                    generation: 0,
+                    current_turn_id: None,
+                    items: snapshot_items.clone(),
+                });
+                write_frame(stdout, &snapshot).await;
+            }
+
+            // 3) CatchUp mode: emit real UpdateContent events for clients
+            //    that listen only to the Event stream.
+            let needs_event_replay = matches!(mode, ReplayMode::CatchUp);
+            if needs_event_replay {
+                let mut replay_seq = last_consumed;
+                for ev in full_journal.iter().filter(|e| e.seq > last_consumed) {
+                    replay_seq += 1;
+                    use grodex_rollout::event::RolloutEventType;
+                    let content = match &ev.event_type {
+                        RolloutEventType::UserInputAccepted => ev
+                            .payload
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|t| UpdateContent::TextDelta {
+                                text: t.to_string(),
+                            }),
+                        RolloutEventType::ModelItemProduced => ev
+                            .payload
+                            .get("assistant_text")
+                            .and_then(|v| v.as_str())
+                            .map(|t| UpdateContent::TextDelta {
+                                text: t.to_string(),
+                            }),
+                        RolloutEventType::TurnCompleted => {
+                            Some(UpdateContent::TurnComplete {
+                                turn_id: ev
+                                    .turn_id
+                                    .as_ref()
+                                    .map(|t| t.to_string())
+                                    .unwrap_or_default(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(c) = content {
+                        let env =
+                            EventEnvelope::wrap(replay_seq, resume_sid.clone(), c);
+                        write_frame(stdout, &ServerFrame::Event(env)).await;
+                    }
+                }
+                *seq = (*seq).max(replay_seq);
+            }
+
+            // 4) FlowControl ack for Resume command.
             let flow_ctrl = ServerFrame::FlowControl {
                 inflight_events: 0,
                 requested_pause_ms: None,
             };
             write_frame(stdout, &flow_ctrl).await;
 
-            handle
-                .send(SessionCommand::ResumeSession {
-                    last_seq: rs.resume_from.last_consumed_seq,
-                    idempotency_key: rs.idempotency_key,
+            // 5) CRITICAL — rebind the shared RolloutWriter BEFORE sending
+            //    ResumeSession / RestoreContext so every journal write
+            //    from this point on appends to the OLD session's durable
+            //    directory (instead of the transient new-session empty
+            //    journal). Every outstanding clone (supervisor,
+            //    coordinator, durable sub-agent) sees the same swap
+            //    because the writer inner is `Arc<RwLock<Inner>>`.
+            //
+            //    This is the FIX for: "I resumed <sid>, chatted more, then
+            //    resumed again — the new turns had vanished".
+            let resume_store_arc: Arc<dyn RolloutStore> = Arc::new(resume_store);
+            if let Err(e) = handle
+                .send(SessionCommand::RebindRolloutWriter {
+                    new_store: resume_store_arc,
+                    new_session_id: resume_sid,
+                    next_seq: last_seq + 1,
                 })
                 .await
+            {
+                write_protocol_error(
+                    stdout,
+                    command_id.clone(),
+                    "RESUME_SUPERVISOR",
+                    format!("RebindRolloutWriter 失败：{e}"),
+                )
+                .await;
+                return (ack_bucket_out, None);
+            }
+
+            // 6) Tell supervisor to (a) emit its own SnapshotReady event and
+            //    (b) rebuild the Session.context from the reduced history.
+            //    Order matters: RestoreContext MUST be sent after
+            //    ResumeSession returns so the reducer's context-write path
+            //    doesn't race with a user StartTurn concurrently queued.
+            //    We send both here and let the supervisor's FIFO queue
+            //    serialize them: RebindRolloutWriter → ResumeSession → RestoreContext.
+            if let Err(e) = handle
+                .send(SessionCommand::ResumeSession {
+                    last_seq,
+                    idempotency_key: rs.idempotency_key.clone(),
+                    // main.rs already reads the OLD session id's journal
+                    // and writes ServerFrame::Snapshot directly to the
+                    // TUI. The supervisor is attached to the NEW session
+                    // id whose journal is still empty, so its
+                    // SnapshotReady would only emit an items=0 snapshot
+                    // and clobber the already-rendered 9 history items.
+                    // Suppress that broadcast.
+                    emit_snapshot_to_frontend: false,
+                })
+                .await
+            {
+                write_protocol_error(
+                    stdout,
+                    command_id.clone(),
+                    "RESUME_SUPERVISOR",
+                    format!("通知 supervisor ResumeSession 失败：{e}"),
+                )
+                .await;
+                return (ack_bucket_out, None);
+            }
+            if !restored_context.is_empty() {
+                if let Err(e) = handle
+                    .send(SessionCommand::RestoreContext {
+                        items: restored_context,
+                    })
+                    .await
+                {
+                    write_protocol_error(
+                        stdout,
+                        command_id.clone(),
+                        "RESUME_SUPERVISOR",
+                        format!("RestoreContext 注入 supervisor 失败：{e}"),
+                    )
+                    .await;
+                    return (ack_bucket_out, None);
+                }
+            }
+            rebind_session_id = Some(resume_sid);
+            Ok(())
         }
     };
 
@@ -620,12 +803,12 @@ async fn route_command(
         write_protocol_error(stdout, command_id, "ROUTE_FAILED", e).await;
     }
 
-    ack_bucket_out
+    (ack_bucket_out, rebind_session_id)
 }
 
 async fn serve_acp() -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (handle, mut acp_rx, session_id, rollout_store) = match build_session_parts(cwd).await {
+    let (handle, mut acp_rx, mut session_id, rollout_store) = match build_session_parts(cwd).await {
         Ok(x) => x,
         Err(e) => {
             eprintln!("[serve_acp] init failed: {e}");
@@ -691,7 +874,7 @@ async fn serve_acp() -> Result<()> {
                 };
                 match frame {
                     ClientFrame::Command { inner: cmd } => {
-                        let bucket = route_command(
+                        let (bucket, rebind_sid) = route_command(
                             &handle,
                             cmd,
                             &mut stdout,
@@ -700,6 +883,14 @@ async fn serve_acp() -> Result<()> {
                             session_id,
                             &mut seq,
                         ).await;
+                        if let Some(sid) = rebind_sid {
+                            // /resume <old_session_id> succeeded: the
+                            // writer has been rebound; also align the
+                            // outer session_id so subsequent Event
+                            // envelopes wrap with the RESUMED id (not
+                            // the transient boot-new-session one).
+                            session_id = sid;
+                        }
                         if let Some(ack) = bucket {
                             inflight_cap = ack.max_inflight_events.min(512).max(1);
                             if let Some(ms) = ack.requested_pause_ms {
@@ -956,7 +1147,7 @@ async fn run_interactive_with(
     let endpoint = cfg.get("endpoint").and_then(|v| v.as_str()).map(|s| s.to_string())
         .or_else(|| first_candidate.map(|c| c.endpoint.clone()))
         .or_else(|| std::env::var("GRODEX_API_ENDPOINT").ok());
-    let api_key_from_cfg = cfg.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let _api_key_from_cfg = cfg.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     // Build a ModelRoute if TOML config was found (for future failover use).
     let _model_route = route_toml.as_ref().map(|r| r.to_model_route());
@@ -969,95 +1160,35 @@ async fn run_interactive_with(
     println!("Provider: {provider_name}  Model: {model_name}  Wire: {wire_protocol:?}");
     if let Some(ref ep) = endpoint { println!("Endpoint: {ep}"); }
 
-    // Create session.
-    let session = Session::new(config);
-
-    // Resolve API key: env → config.toml → CredentialBroker.
+    // ── Unified composition root ─────────────────────────────────
+    // SessionRuntimeBuilder assembles Config/Auth/SamplingActor/PermissionManager
+    // (config `[rules]`)/SandboxRuntime (`sandbox_profile`)/CapabilityManager
+    // (built-in tools + delegate_task)/RolloutWriter/PromptProvider(per-turn
+    // in supervisor)/MemoryProvider in ONE place. The CLI REPL and ACP
+    // `serve_acp` both go through it, so the "module implemented but
+    // production entry doesn't use it" gap is closed at the root.
     //
-    // The master key is registered with the CredentialBroker and NEVER handed
-    // to the sampler directly. We mint a single-use lease bound to the
-    // provider's endpoint, then redeem it through the broker's `resolve`
-    // gateway — the only path that materializes a usable Bearer token, and it
-    // consumes the lease in the process (no replay). The broker stays owned
-    // here for the session lifetime; the sampler gets the redeemed token only.
-    let auth = AuthManager::new();
-    let master_key = auth.resolve_for_provider(&provider_name).or(api_key_from_cfg);
-    let audience = endpoint.as_deref().unwrap_or("https://api.openai.com/v1").to_string();
-    let mut broker = master_key
-        .map(|key| {
-            // Register the key under the real provider name so leases
-            // minted for `provider_name` resolve correctly. (Using
-            // `empty()` + `register_provider` instead of `new(key)`
-            // which would store it under "default" and not match.)
-            let mut b = grodex_auth::CredentialBroker::empty();
-            b.register_provider(&provider_name, key);
-            b
-        });
-    let api_key: Option<String> = (|| {
-        let b = broker.as_mut()?;
-        let lease = b.issue_lease(&provider_name, &audience)?;
-        b.resolve(&lease, &audience).ok()
-    })();
-    let has_key = api_key.is_some();
-    if !has_key { println!("Warning: No API key configured. Set OPENAI_API_KEY or add api_key to .grodex/config.toml"); }
-
-    let client_config = SamplingClientConfig {
-        api_key,
-        endpoint,
-        ..SamplingClientConfig::default()
-    };
-    let client = SamplingClient::new(client_config).expect("failed to create sampling client");
-    let actor = SamplingActor::new(client);
-    let chat_state = ChatStateActor::spawn();
-
-    // Resume (断链 #8): recovered context from a prior journal is passed to
-    // the supervisor, which both injects it into the live chat state AND
-    // writes a `ContextRestored` event to the new session's journal so a
-    // second crash does not lose the recovered history.
+    // Resume (断链 #8): recovered context from a prior journal is injected
+    // via the builder; the supervisor writes a `ContextRestored` event to
+    // the new session's journal so a second crash does not lose it.
     if let Some(ref items) = recovered {
         if !items.is_empty() {
             println!("Restoring {} context items into the new session.", items.len());
         }
     }
-
-    let coordinator = TurnCoordinator::new(actor, chat_state.clone());
-
-    // Register built-in tools.
-    coordinator.register_tool("read_file", Arc::new(ReadFileTool::new()), ReadFileTool::new().input_schema()).await;
-    coordinator.register_tool("write_file", Arc::new(WriteFileTool::new()), WriteFileTool::new().input_schema()).await;
-    coordinator.register_tool("edit_file", Arc::new(EditTool::new()), EditTool::new().input_schema()).await;
-    coordinator.register_tool("exec", Arc::new(ExecTool::new()), ExecTool::new().input_schema()).await;
-    coordinator.register_tool("apply_patch", Arc::new(ApplyPatchTool::new()), ApplyPatchTool::new().input_schema()).await;
-    // Register delegate tool for sub-agent spawning.
-    let delegate = grodex_loop::delegate_tool::DelegateTool::new(grodex_subagent::supervisor::SubAgentConfig::default());
-    let delegate_schema = delegate.input_schema();
-    coordinator.register_tool("delegate_task", Arc::new(delegate), delegate_schema).await;
-
-    if has_key {
-        println!("API key found for provider.");
-    } else {
-        println!("Warning: No OPENAI_API_KEY set. Model calls will fail.");
-    }
-
-    // Create rollout store for session persistence.
-    let session_id_str = session.id.to_string();
+    let runtime = SessionRuntimeBuilder::new(cwd.clone())
+        .with_trusted(workspace_trusted)
+        .with_recovered_context(recovered.unwrap_or_default())
+        .build()
+        .await
+        .expect("failed to build session runtime");
+    let handle = runtime.handle;
+    let mut event_rx = runtime.event_rx;
+    let supervisor_task = runtime.supervisor_task;
+    // Keep the rollout path for the startup banner.
+    let session_id_str = runtime.session_id;
     let base_dir = grodex_rollout::store::FileRolloutStore::default_dir();
-    let rollout: Option<Arc<dyn grodex_rollout::store::RolloutStore>> =
-        match grodex_rollout::store::FileRolloutStore::new(&base_dir, &session_id_str) {
-            Ok(store) => {
-                println!("Session persisted to: {}", base_dir.join(&session_id_str).display());
-                Some(Arc::new(store))
-            }
-            Err(_) => None,
-        };
-
-    // Create supervisor and handle.
-    let (mut supervisor, mut handle) = SessionSupervisor::new(session, chat_state, coordinator, rollout, recovered, Some(grodex_memory::LegacyRetriever::new(grodex_memory::MemoryStore::new())), grodex_loop::supervisor::ModelConfig { provider: provider_name.clone(), model: model_name.clone(), wire_protocol });
-
-    // Spawn the supervisor in a background task.
-    let supervisor_task = tokio::spawn(async move {
-        supervisor.run().await;
-    });
+    println!("Session persisted to: {}", base_dir.join(&session_id_str).display());
 
     // Interactive input loop.
     println!("Session ready. Type /quit to exit.\n");
@@ -1102,7 +1233,7 @@ async fn run_interactive_with(
         // Receive and buffer streaming text until TurnCompleted.
         let mut response_buf = String::new();
         loop {
-            match handle.recv().await {
+            match event_rx.recv().await {
                 Some(LoopSessionEvent::TextDelta { text }) => {
                     response_buf.push_str(&text);
                 }
@@ -1123,12 +1254,26 @@ async fn run_interactive_with(
                     eprintln!("\nError: {message}");
                     break;
                 }
+                Some(LoopSessionEvent::Info { message }) => {
+                    // Informational confirmations (resume, export, …).
+                    // Printed to stdout as a one-line banner so the simple
+                    // REPL user sees success feedback instead of a scary
+                    // Error. Never breaks the turn loop — Info is not a
+                    // terminal event.
+                    println!("ℹ {message}");
+                }
                 Some(LoopSessionEvent::Shutdown) => {
                     println!("Session shut down.");
                     break;
                 }
                 Some(LoopSessionEvent::TurnStarted { .. }) => {}
                 Some(LoopSessionEvent::SnapshotReady { .. }) | Some(LoopSessionEvent::ApprovalResolved { .. }) => {}
+                // ── Approval requested: the simple REPL has no interactive
+                // approval UI, so just print a one-line notice and keep
+                // streaming. The TUI renders a full pending-approval card.
+                Some(LoopSessionEvent::ApprovalRequested { ticket_id, tool_name, risk, .. }) => {
+                    println!("\n[approval pending] ticket={ticket_id} tool={tool_name} risk={risk}");
+                }
                 None => break,
             }
         }

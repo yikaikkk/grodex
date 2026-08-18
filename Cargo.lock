@@ -676,12 +676,15 @@ dependencies = [
  "grodex-config",
  "grodex-core",
  "grodex-loop",
+ "grodex-mcp",
  "grodex-memory",
+ "grodex-permission",
  "grodex-prompt",
  "grodex-protocol",
  "grodex-provider",
  "grodex-rollout",
  "grodex-sampler",
+ "grodex-sandbox",
  "grodex-sandbox-types",
  "grodex-subagent",
  "grodex-tools",
@@ -749,6 +752,7 @@ dependencies = [
 name = "grodex-mcp"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "grodex-core",
  "serde",
  "serde_json",

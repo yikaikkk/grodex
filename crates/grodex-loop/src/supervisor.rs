@@ -13,8 +13,9 @@ use crate::step::TurnOutcome;
 use crate::turn::TurnContext;
 use crate::turn_coordinator::TurnCoordinator;
 use grodex_core::context::ContextItem;
+use grodex_core::policy::PolicyDecision;
 use grodex_core::state::SessionState;
-use grodex_rollout::store::RolloutStore;
+use grodex_permission::PermissionManager;
 use grodex_provider::descriptor::WireProtocol;
 use grodex_sampler::StreamFragment;
 
@@ -31,8 +32,9 @@ impl Default for ModelConfig {
         Self { provider: "openai".into(), model: "gpt-5".into(), wire_protocol: WireProtocol::Responses }
     }
 }
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Turn completion message from a spawned turn task.
@@ -64,12 +66,28 @@ pub struct SessionSupervisor {
     recovered_context: Option<Vec<grodex_core::context::ContextItem>>,
     /// Model configuration for Turn creation.
     model_config: ModelConfig,
-    /// Optional memory retriever for context injection.
-    memory: Option<grodex_memory::LegacyRetriever>,
+    /// Optional memory database for RAG context injection (SQLite + FTS5).
+    memory: Option<Arc<grodex_memory::MemoryDatabase>>,
+    /// Optional embedding model for hybrid RAG (FTS5 + vector). If None,
+    /// `retrieve_hybrid_memory` degrades to pure FTS5 (fail-open).
+    embedding: Option<Arc<dyn grodex_memory::EmbeddingModel + Send + Sync>>,
+    /// Working directory for instruction discovery (AGENTS.md / .agent/rules).
+    cwd: PathBuf,
+    /// Whether the workspace is trusted (controls whether untrusted
+    /// AGENTS.md content is included in the prompt — fail-closed).
+    workspace_trusted: bool,
     /// Handle to the currently running turn task (for cancellation).
     current_turn_handle: Option<tokio::task::AbortHandle>,
     /// CancellationToken for the current turn.
     current_turn_cancel: Option<CancellationToken>,
+    /// Shared permission manager — the SAME instance the TurnCoordinator
+    /// holds (extracted via `permission_handle()` at construction). The
+    /// supervisor calls `resolve()` on it when a `ResolveApproval`
+    /// command arrives, completing the approval round-trip the broker
+    /// started when `check()` returned `Ask` (Design Doc 16 §10, second
+    /// half). Without this handle the tool future parked on
+    /// `decision_rx` would time out and the approval would be a no-op.
+    permission: Arc<Mutex<PermissionManager>>,
 }
 
 impl SessionSupervisor {
@@ -77,22 +95,31 @@ impl SessionSupervisor {
         session: Session,
         chat_state: ChatStateHandle,
         mut coordinator: TurnCoordinator,
-        rollout: Option<Arc<dyn RolloutStore>>,
+        writer: Option<RolloutWriter>,
         recovered_context: Option<Vec<grodex_core::context::ContextItem>>,
-        memory: Option<grodex_memory::LegacyRetriever>,
+        memory: Option<Arc<grodex_memory::MemoryDatabase>>,
+        embedding: Option<Arc<dyn grodex_memory::EmbeddingModel + Send + Sync>>,
         model_config: ModelConfig,
+        cwd: PathBuf,
+        workspace_trusted: bool,
     ) -> (Self, SessionHandle) {
-        // If a store was supplied, wrap it in the shared writer and attach
-        // that SAME writer to the coordinator. This is the single chokepoint
-        // that guarantees a coherent seq stream across both layers.
-        let writer = match rollout {
-            Some(store) => {
-                let w = RolloutWriter::new(store, session.id);
+        // Attach the shared writer to the coordinator if one was created
+        // in the builder. This is the single chokepoint that guarantees a
+        // coherent seq stream across both layers.
+        let writer = match writer {
+            Some(w) => {
                 coordinator = coordinator.with_rollout(w.clone());
                 Some(w)
             }
             None => None,
         };
+
+        // Extract the shared permission handle BEFORE the coordinator is
+        // moved into Self. This is the SAME Arc<Mutex<PermissionManager>>
+        // the TurnCoordinator dispatches tool calls through, so a
+        // `resolve()` here wakes the exact tool future parked on the
+        // ticket's oneshot receiver.
+        let permission = coordinator.permission_handle();
 
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(64);
@@ -109,9 +136,13 @@ impl SessionSupervisor {
             writer,
             recovered_context,
             memory,
+            embedding,
             model_config,
+            cwd,
+            workspace_trusted,
             current_turn_handle: None,
             current_turn_cancel: None,
+            permission,
         };
 
         let handle = SessionHandle { cmd_tx, event_rx };
@@ -225,40 +256,162 @@ impl SessionSupervisor {
                 true
             }
             SessionCommand::ResolveApproval { ticket_id, decision, narrowed_args: _ } => {
-                // Design Doc 17 §9 — the frontend resolved an approval ticket.
-                // The actual ApprovalBroker lives inside the turn coordinator's
-                // permission pipeline; the supervisor acknowledges the resolution
-                // here. Full broker integration (threading the broker through
-                // the supervisor) is a separate task — for now we emit the
-                // acknowledgement event so the protocol round-trip is complete.
+                // Design Doc 16 §10 (second half) + Doc 17 §9 — the
+                // frontend resolved an approval ticket. Forward the
+                // decision to the SAME PermissionManager the
+                // TurnCoordinator dispatched the tool through: a
+                // successful `resolve()` completes the oneshot the
+                // broker stored when `check()` returned `Ask`, which
+                // wakes the parked tool future. The coordinator's
+                // `execute_single_tool` is then free to mint its
+                // PermissionLease and run.
+                //
+                // `narrowed_args` is currently consumed by the live
+                // revalidation path inside the tool future (the broker
+                // only carries a flat PolicyDecision); full Narrow
+                // support that re-runs schema/policy on revised args is
+                // a later phase (Doc 16 §10 "Narrow" paragraph).
+                let accepted = matches!(decision, PolicyDecision::Allow);
+                let resolved = self.permission.lock().await.resolve(&ticket_id, decision);
                 let _ = self.event_tx
                     .send(SessionEvent::ApprovalResolved {
                         ticket_id,
-                        accepted: true,
+                        accepted: resolved && accepted,
                     })
                     .await;
-                let _ = decision; // consumed by the broker when wired
                 true
             }
-            SessionCommand::ResumeSession { last_seq, idempotency_key: _ } => {
+            SessionCommand::ResumeSession { last_seq, idempotency_key: _, emit_snapshot_to_frontend } => {
                 // Design Doc 17 §10 — client reconnected and tells us the last
-                // seq it processed. We rebuild a snapshot from the journal and
-                // emit it so the UI can resync without replaying every event.
-                self.handle_resume_session(last_seq).await;
+                // seq it processed. Rebuild a snapshot from the journal, emit
+                // it so the UI can resync without replaying every event, AND
+                // inject the reduced context into Session.context so future
+                // turns carry history (fallback for non-ACP resume paths).
+                //
+                // When `emit_snapshot_to_frontend = false` we *only* perform
+                // the context-inject work and suppress the SnapshotReady
+                // broadcast — used by ACP main.rs which already shipped a
+                // Snapshot frame to the TUI on its own (otherwise the
+                // frontend sees a second, empty, snapshot that clobbers the
+                // already-rendered history).
+                self.handle_resume_session(last_seq, emit_snapshot_to_frontend).await;
+                true
+            }
+            SessionCommand::RestoreContext { items } => {
+                // Restore full conversation context so future turns carry
+                // the resumed history. NOTE: there are TWO context
+                // projections we must sync:
+                //   1. self.session.context  — used by the Session state
+                //      machine for admit_turn / turn bookkeeping.
+                //   2. self.chat_state conversation — used by
+                //      TurnCoordinator to build CanonicalModelRequest for
+                //      the model. (This is what PromptBuilder/StepRunner
+                //      actually read. Missing this write caused "resume
+                //      still thinks this is a brand-new chat".)
+                if !items.is_empty() {
+                    // Merge strategy: keep only bootstraps (System/Developer)
+                    // above restored chat; otherwise replace entirely.
+                    let has_bootstrap_only = self.session.context.iter().all(|c| {
+                        matches!(c, ContextItem::System { .. } | ContextItem::Developer { .. })
+                    });
+                    let merged = if has_bootstrap_only {
+                        let mut m = self.session.context.clone();
+                        m.extend(items.clone());
+                        m
+                    } else {
+                        items.clone()
+                    };
+                    self.session.context = merged.clone();
+                    // ── Critical: replace chat_state conversation ──
+                    // TurnCoordinator pulls `context_items` from chat_state,
+                    // NOT from self.session.context. If we skip this line
+                    // the model receives zero prior turns on every new
+                    // prompt after resume.
+                    self.chat_state
+                        .replace_conversation(merged.clone(), false)
+                        .await;
+                    // Persist ContextRestored to the new session's journal
+                    // so subsequent resumes of the new session id see the
+                    // recovered state without re-cross-reading the old id.
+                    if let Some(w) = &self.writer {
+                        if let Err(e) = w.write_context_restored(&items).await {
+                            let _ = self
+                                .event_tx
+                                .send(SessionEvent::Error {
+                                    message: format!(
+                                        "resume: persist ContextRestored failed: {e}"
+                                    ),
+                                })
+                                .await;
+                        }
+                    }
+                    let _ = self
+                        .event_tx
+                        .send(SessionEvent::Info {
+                            message: format!(
+                                "[resume] 已恢复 {} 条历史消息（session.context + chat_state 双写）",
+                                items.len()
+                            ),
+                        })
+                        .await;
+                }
+                true
+            }
+            SessionCommand::RebindRolloutWriter { new_store, new_session_id, next_seq } => {
+                // Swap the attached rollout store + session id + reseed the
+                // monotonic seq counter so every subsequent journal commit
+                // appends to the RESUMED session's durable file instead of
+                // the ephemeral boot-new-session empty directory. All
+                // writer clones (supervisor, coordinator, durable
+                // sub-agent) see the same swap because the inner state is
+                // behind a single shared `Arc<RwLock<Inner>>`.
+                //
+                // NOTE: ordering matters in main.rs — this command MUST be
+                // sent BEFORE RestoreContext so the ContextRestored event
+                // is persisted to the correct (old) journal.
+                if let Some(w) = &self.writer {
+                    w.rebind(new_store, new_session_id, next_seq);
+                    // Also align the Session struct id so downstream
+                    // readers (chat state, diagnostics) report the
+                    // resumed id rather than the transient new one.
+                    self.session.id = new_session_id;
+                }
+                let _ = self
+                    .event_tx
+                    .send(SessionEvent::Info {
+                        message: format!(
+                            "[resume] rollout_writer rebind → session_id={}, next_seq={}",
+                            new_session_id, next_seq
+                        ),
+                    })
+                    .await;
                 true
             }
             SessionCommand::Shutdown => false,
         }
     }
 
-    /// Build a session snapshot from the journal and emit `SnapshotReady`.
+    /// Build a session snapshot from the journal and optionally emit
+    /// `SnapshotReady` to the frontend.
     ///
     /// The snapshot covers the full session state (not just the delta from
     /// `last_seq`) — a delta-only replay would require the client to stitch
     /// events, which is fragile after a disconnect. The full snapshot is
     /// simpler and correct; incremental deltas can be added later if the
     /// snapshot grows too large.
-    async fn handle_resume_session(&self, last_seq: u64) {
+    ///
+    /// `emit_snapshot_to_frontend` controls whether the SnapshotReady event
+    /// is pushed onto `event_tx`. Set this to `false` when the caller has
+    /// already delivered a snapshot to the frontend on its own (e.g. ACP
+    /// main.rs does so for cross-session-id resumes) — otherwise the
+    /// frontend receives a second, typically empty, snapshot that
+    /// clobbers the already-rendered chat history.
+    ///
+    /// Regardless of this flag, the method **always** writes the reduced
+    /// context items back into `self.session.context + chat_state` so
+    /// subsequent `start_turn()` passes take the resumed history into
+    /// prompt building.
+    async fn handle_resume_session(&mut self, last_seq: u64, emit_snapshot_to_frontend: bool) {
         let writer = match &self.writer {
             Some(w) => w,
             None => {
@@ -284,14 +437,20 @@ impl SessionSupervisor {
         };
 
         if events.is_empty() {
-            let _ = self.event_tx
-                .send(SessionEvent::SnapshotReady {
-                    last_seq: 0,
-                    generation: 0,
-                    current_turn_id: None,
-                    items_json: "[]".into(),
-                })
-                .await;
+            // Even when there are 0 events, honor `emit_snapshot_to_frontend`.
+            // Without this guard, ACP /resume triggers TWO snapshots:
+            //   1. main.rs's hand-built ServerFrame::Snapshot (items=9, correct)
+            //   2. this early-return empty SnapshotReady  →  items=0 clobber
+            if emit_snapshot_to_frontend {
+                let _ = self.event_tx
+                    .send(SessionEvent::SnapshotReady {
+                        last_seq: 0,
+                        generation: 0,
+                        current_turn_id: None,
+                        items_json: "[]".into(),
+                    })
+                    .await;
+            }
             return;
         }
 
@@ -308,6 +467,39 @@ impl SessionSupervisor {
         let context = reducer.context().to_vec();
         let generation = reducer.generation().as_u64();
         let event_count = events.len() as u64;
+
+        // ── Inject context into Session + chat_state ────────────────────
+        // Same merge rule as SessionCommand::RestoreContext: keep existing
+        // System/Developer bootstrap context above restored chat, otherwise
+        // replace. This fallback fires on non-ACP resume paths where the
+        // caller could not send RestoreContext.
+        if !context.is_empty() {
+            let has_bootstrap_only = self.session.context.iter().all(|c| {
+                matches!(c, ContextItem::System { .. } | ContextItem::Developer { .. })
+            });
+            let merged = if has_bootstrap_only {
+                let mut m = self.session.context.clone();
+                m.extend(context.clone());
+                m
+            } else {
+                context.clone()
+            };
+            self.session.context = merged.clone();
+            // Critical double-write: TurnCoordinator pulls context_items
+            // for the model from chat_state, NOT from self.session.context.
+            // Without this call resume + "what did we just talk about?"
+            // still gets the "brand new chat" response.
+            self.chat_state
+                .replace_conversation(merged.clone(), false)
+                .await;
+            // Also persist via write_context_restored so subsequent
+            // re-resumes of the *new* session id immediately see the
+            // recovered context on their next resume (rather than
+            // requiring yet-another cross-id read).
+            if let Some(w) = &self.writer {
+                let _ = w.write_context_restored(&context).await;
+            }
+        }
 
         // Build snapshot items from the context — each ContextItem becomes
         // a SnapshotItem the UI can render.
@@ -345,14 +537,16 @@ impl SessionSupervisor {
 
         let items_json = serde_json::to_string(&snapshot_items).unwrap_or_else(|_| "[]".into());
 
-        let _ = self.event_tx
-            .send(SessionEvent::SnapshotReady {
-                last_seq: event_count.max(last_seq),
-                generation,
-                current_turn_id: None,
-                items_json,
-            })
-            .await;
+        if emit_snapshot_to_frontend {
+            let _ = self.event_tx
+                .send(SessionEvent::SnapshotReady {
+                    last_seq: event_count.max(last_seq),
+                    generation,
+                    current_turn_id: None,
+                    items_json,
+                })
+                .await;
+        }
     }
 
     async fn start_turn(&mut self, user_input: String) {
@@ -396,13 +590,31 @@ impl SessionSupervisor {
             }
         }
 
-        // Build system instructions via PromptBuilder + Memory.
+        // Build system instructions via PromptBuilder + Memory + Discovery.
+        //
+        // Discovery (Design Doc 19 §7) walks three layers:
+        //   1. Fixed roots (~/.agent/AGENTS.md, ~/.agent/rules/*.md)
+        //   2. Workspace chain (root→cwd scanning AGENTS.md + .agent/rules)
+        //   3. Compatibility (.grok/.codex/.claude/.cursor)
+        // Untrusted workspace content is excluded (fail-closed).
+        // Without this call, AGENTS.md / .agent/rules are never injected
+        // into the live prompt — the model cannot see project instructions.
         let mut builder = grodex_prompt::PromptBuilder::new();
-        if let Some(ref mem) = self.memory {
-            let entries = mem.query(&user_input_for_memory);
-            if !entries.is_empty() {
-                let mem_text = grodex_memory::LegacyRetriever::format_for_prompt(&entries);
-                builder.base_instructions.push(mem_text);
+        builder.discover_instructions(&self.cwd, self.workspace_trusted);
+        if let Some(ref db) = self.memory {
+            // Hybrid RRF retrieval (FTS5 + vector, fail-open to pure FTS).
+            // emb=None → vector list empty → RRF degrades to pure FTS5 ranking.
+            // emb=Some → embed query, search vectors, fuse with FTS5 results.
+            match db.retrieve_hybrid_memory(&user_input_for_memory, 5, self.embedding.as_ref()).await {
+                Ok(units) if !units.is_empty() => {
+                    let mem_text = grodex_memory::RetrievedUnit::format_for_prompt(&units);
+                    builder.base_instructions.push(mem_text);
+                }
+                Ok(_) => {} // no results — nothing to inject
+                Err(e) => {
+                    // Fail-open: memory unavailable must not block the turn.
+                    eprintln!("[warn] memory retrieve_hybrid_memory failed: {e}");
+                }
             }
         }
         let manifest = builder.build();
@@ -449,6 +661,19 @@ impl SessionSupervisor {
                         StreamFragment::ToolResult { call_id, content, is_error } => {
                             SessionEvent::ToolResult { call_id, content, is_error }
                         }
+                        StreamFragment::ApprovalRequested {
+                            ticket_id,
+                            tool_name,
+                            summary,
+                            risk,
+                            timeout_remaining_ms,
+                        } => SessionEvent::ApprovalRequested {
+                            ticket_id,
+                            tool_name,
+                            summary,
+                            risk,
+                            timeout_remaining_ms,
+                        },
                     };
                     let _ = event_tx.send(ev).await;
                 }

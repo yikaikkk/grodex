@@ -107,7 +107,9 @@ pub struct SlashCommandDef {
 pub enum SlashLocalKind {
     // ── TUI-local: the TUI process can handle them without round-tripping
     //    to the agent. We implement these fully.
-    /// Exit the TUI (like `q` in Normal mode). Commands: /exit /quit /q.
+    /// Exit the TUI immediately (no two-stage confirmation). Commands:
+    /// /exit /quit /q. The only non-command exit path is two successive
+    /// Ctrl-C presses within a 3-second safety window.
     Exit,
     /// Show the built-in help block. Commands: /help /? /welcome.
     Help,
@@ -301,9 +303,9 @@ pub enum SlashLocalKind {
 //   (sharing/diagnostics) → (Grodex extras) → (hidden).
 pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandDef] = &[
     // ── TUI-local ──────────────────────────────────────────────────────
-    SlashCommandDef { name: "exit",        description: "退出 TUI（同 q）",                                                       local: SlashLocalKind::Exit },
+    SlashCommandDef { name: "exit",        description: "退出 TUI（推荐命令式退出，无二次确认）",                                  local: SlashLocalKind::Exit },
     SlashCommandDef { name: "quit",        description: "退出 TUI（/exit 别名）",                                                 local: SlashLocalKind::Exit },
-    SlashCommandDef { name: "q",           description: "退出 TUI（/exit 短别名，Normal 肌肉记忆）",                               local: SlashLocalKind::Exit },
+    SlashCommandDef { name: "q",           description: "退出 TUI（/exit 短别名）",                                               local: SlashLocalKind::Exit },
     SlashCommandDef { name: "help",        description: "显示内置帮助（键盘 + 命令一览）",                                         local: SlashLocalKind::Help },
     SlashCommandDef { name: "?",           description: "显示帮助（/help 别名）",                                                  local: SlashLocalKind::Help },
     SlashCommandDef { name: "welcome",     description: "显示帮助 + 欢迎界面（/help 别名）",                                       local: SlashLocalKind::Help },
@@ -532,7 +534,19 @@ pub struct TuiAppState {
     /// so the dropdown stays consistent with input.
     pub slash: SlashMenuState,
     next_seq: u64,
+    /// Timestamp of the first Ctrl-C press. Used for the two-Ctrl-C-quit
+    /// safety guard: first Ctrl-C arms the gate, second within
+    /// `CTRL_C_QUICK_WINDOW_MS` actually exits. If the user presses Ctrl-C
+    /// only once, the gate decays after the window so accidental presses
+    /// can't quit the session.
+    pub ctrl_c_first_press_at: Option<std::time::Instant>,
 }
+
+/// Within this many milliseconds, two Ctrl-C presses in a row are treated
+/// as a real quit request. `3000ms` matches Grok / zsh safe-exit windows:
+/// long enough to type a second Ctrl-C if you meant it, short enough that
+/// a stray Ctrl-C yesterday doesn't bite you later.
+pub const CTRL_C_QUICK_WINDOW_MS: u64 = 3000;
 
 impl Default for TuiAppState {
     fn default() -> Self {
@@ -576,6 +590,7 @@ impl TuiAppState {
             call_id_index: std::collections::HashMap::new(),
             slash: SlashMenuState::default(),
             next_seq: 1,
+            ctrl_c_first_press_at: None,
         }
     }
 
@@ -1205,6 +1220,16 @@ impl TuiAppState {
                     is_error: true,
                 });
             }
+            SessionEvent::Info { message } => {
+                // Success / diagnostic confirmations (resume completed,
+                // export, diagnostics, …). Render via push_log, NOT as a
+                // red System is_error card. Before this fix we abused
+                // SessionEvent::Error as a generic toast channel, which
+                // caused "✗ Error   [resume] 已恢复 9 条历史消息…" in the
+                // TUI — a truly terrible UX because the user sees a red
+                // success confirmation.
+                self.push_log(message.clone());
+            }
 
             SessionEvent::ItemStarted { item_type, .. } if item_type == "turn" => {
                 // A new turn started — next TextDelta/ThoughtDelta will begin
@@ -1276,6 +1301,13 @@ impl TuiAppState {
             self.next_seq = seq + 1;
         }
         self.push_event(e);
+    }
+
+    /// Override the expected next event seq. Used by `/resume` to align
+    /// the TUI's monotonic counter with the snapshot's last_seq so live
+    /// events arriving after the snapshot do not get dropped as stale.
+    pub fn set_next_seq(&mut self, next_seq: u64) {
+        self.next_seq = next_seq;
     }
 
     pub fn resolve_ticket(&mut self, ticket_id: &str) {

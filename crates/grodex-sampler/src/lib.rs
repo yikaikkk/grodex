@@ -76,5 +76,18 @@ pub enum StreamFragment {
         content: String,
         is_error: bool,
     },
+    /// A tool call needs user approval. Emitted by the TurnCoordinator
+    /// when `PermissionManager::check()` returns `Ask` and a ticket lands
+    /// in the broker. Maps to `UpdateContent::RequestPermission` /
+    /// `SessionEvent::ApprovalRequested`. This is the FIRST half of the
+    /// approval round-trip (Design Doc 16 §10): ticket created → UI
+    /// notified → user resolves → broker wakes the waiting tool.
+    ApprovalRequested {
+        ticket_id: String,
+        tool_name: String,
+        summary: String,
+        risk: String,
+        timeout_remaining_ms: u64,
+    },
 }
 

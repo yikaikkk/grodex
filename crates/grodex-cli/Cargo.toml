@@ -26,15 +26,18 @@ grodex-protocol.workspace = true
 grodex-config.workspace = true
 grodex-auth-types.workspace = true
 grodex-sandbox-types.workspace = true
+grodex-sandbox.workspace = true
 grodex-loop.workspace = true
 grodex-sampler.workspace = true
 grodex-provider.workspace = true
 grodex-auth.workspace = true
+grodex-permission.workspace = true
 grodex-tools.workspace = true
 grodex-memory.workspace = true
 grodex-subagent.workspace = true
 grodex-prompt.workspace = true
 grodex-tui.workspace = true
+grodex-mcp.workspace = true
 
 [lints]
 workspace = true

@@ -342,6 +342,11 @@ pub enum UpdateContent {
     TurnComplete { turn_id: String },
     /// A non-final error occurred.
     Error { message: String },
+    /// Informational log (success confirmations, diagnostics, resume
+    /// reports, …). Render this as a one-line log entry rather than a
+    /// scary red error card. Clients that do not surface Info can fall
+    /// back to treating it as TextDelta so the user still sees the text.
+    Info { message: String },
 
     // ── Legacy item lifecycle (flat form, kept for backward compat) ─
     ItemStarted { item_id: String, item_type: String },

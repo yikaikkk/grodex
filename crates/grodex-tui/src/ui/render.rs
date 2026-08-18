@@ -48,13 +48,21 @@ fn c_bg() -> Color { Color::Reset }
 fn c_bg_elevated() -> Color { Color::Reset }
 #[allow(dead_code)]
 fn c_bg_panel() -> Color { Color::Reset }
+/// User 消息的淡灰背景，用来与 LLM（Assistant）输出做视觉区分。
+/// Color::DarkGray 由终端配色方案决定（256 色终端的 #8 色），在深色终端
+/// 上偏亮灰、浅色终端上偏暗灰，两套主题都能形成柔和的对比（不刺眼、
+/// 不强制具体色相）。与 "You / Grodex" 文字标签相比，纯背景色区分更接近
+/// Claude Code / Codex 的无标签聊天风格。
+fn c_bg_user() -> Color { Color::DarkGray }
 
 fn c_fg()        -> Style { Style::default().fg(Color::Reset) }
 fn c_dim()       -> Style { Style::default().fg(Color::DarkGray) }
 fn c_muted()     -> Style { Style::default().fg(Color::Gray) }
 
 fn c_accent()    -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) }
+#[allow(dead_code)]
 fn c_user()      -> Style { Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) }
+#[allow(dead_code)]
 fn c_assistant() -> Style { Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD) }
 fn c_prefix()    -> Style { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } // ❯
 fn c_tool_ok()   -> Style { Style::default().fg(Color::Green) }
@@ -769,6 +777,21 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                 None if !state.messages.is_empty() => v.push(0..state.messages.len()),
                 None => {}
             }
+            // Diagnostic guard — messages is non-empty (so we entered this
+            // branch) but no turn ranges were produced. This is logically
+            // impossible given the `None if !messages.is_empty()` fallback
+            // above, but if a future refactor breaks that clause the user
+            // would stare at a fully-blank transcript while `messages.len()`
+            // is > 0 — classic "UI empty but snapshot restored" head-scratcher.
+            // Fall back to a single whole-range turn AND notify so debugging
+            // is instant.
+            if v.is_empty() && !state.messages.is_empty() {
+                state.push_log(format!(
+                    "[render] ⚠ 警告：messages.len()={} 但 turn 切分为空，回退为单 turn 渲染（turn 锚点逻辑可能异常）",
+                    state.messages.len()
+                ));
+                v.push(0..state.messages.len());
+            }
             v
         };
 
@@ -924,16 +947,57 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
             for msg in turn {
                 match msg {
                     ChatMessage::User { text } => {
-                        rows.push(Line::from(vec![
-                            Span::raw("  "),
-                            style_s(c_user(), "You"),
-                            Span::raw("  "),
-                        ]));
+                        // User 消息：整行（含文字后的空白列）铺满淡灰背景，
+                        // 形成"矩形块"视觉效果，完全对齐 Claude Code / Codex。
+                        // 关键：ratatui Span.bg 只覆盖字符宽度，必须在行尾补
+                        // 齐一个"剩余宽度的空格 Span"带相同 bg，才能把空白列
+                        // 也填上颜色。不再输出 "You" 文字标签。
+                        let user_bg = Style::default().bg(c_bg_user());
                         if text.is_empty() {
-                            rows.push(Line::from(vec![Span::raw("      ·")]));
+                            // 空 user 消息占位（·居中），也要全行填色。
+                            let pad = " ".repeat(inner_w.max(6).saturating_sub(6));
+                            rows.push(Line::from(vec![
+                                Span::styled(format!("  · {pad}"), user_bg),
+                            ]));
                         } else {
-                            rows.extend(md_to_lines(text, inner_w.max(12), c_fg()));
+                            let lines = md_to_lines(text, inner_w.max(12), c_fg());
+                            for mut line in lines {
+                                // 先把现有每个 span 的 fg 合并到 user_bg（保留
+                                // 粗体/斜体等 modifier，不丢失 markdown 格式），
+                                // 统一背景色 = c_bg_user。
+                                for span in line.spans.iter_mut() {
+                                    let cur = span.style;
+                                    span.style = user_bg
+                                        .fg(cur.fg.unwrap_or(Color::Reset))
+                                        .add_modifier(cur.add_modifier);
+                                }
+                                let content_width: usize = line
+                                    .spans
+                                    .iter()
+                                    .map(|s| s.width())
+                                    .sum();
+                                // 行首 2 列 padding + 内容 + 行尾 fill 空格 = inner_w
+                                let leading = 2usize;
+                                let trailing = inner_w
+                                    .saturating_sub(leading)
+                                    .saturating_sub(content_width)
+                                    .max(0);
+                                let mut padded_spans: Vec<Span> =
+                                    Vec::with_capacity(line.spans.len() + 2);
+                                padded_spans.push(Span::styled(" ".repeat(leading), user_bg));
+                                padded_spans.extend(line.spans);
+                                if trailing > 0 {
+                                    padded_spans.push(Span::styled(
+                                        " ".repeat(trailing),
+                                        user_bg,
+                                    ));
+                                }
+                                line.spans = padded_spans;
+                                rows.push(line);
+                            }
                         }
+                        // User 消息块下方空行分隔（无背景，避免上下两条 user 粘
+                        // 在一起）。
                         rows.push(Line::from(vec![Span::raw("")]));
                     }
 
@@ -980,27 +1044,31 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                     }
 
                     ChatMessage::Assistant { text, done } => {
-                        if !assistant_header_rendered {
-                            let streaming = if *done {
-                                Span::raw("")
-                            } else {
-                                style_s(c_dim(), "  ⏳ streaming…")
-                            };
-                            rows.push(Line::from(vec![
-                                Span::raw("  "),
-                                style_s(c_assistant(), "Grodex"),
-                                streaming,
-                            ]));
-                            assistant_header_rendered = true;
-                        }
+                        // 不再输出 "Grodex" 文字标签，与 User 一致走无标签风格。
+                        // Assistant 与 User 通过视觉元素隐式区分：User 有淡灰
+                        // 背景，Assistant 使用默认透明背景 + Tool/Thinking 各
+                        // 自有彩色 rail（黄/紫 rail 本身就是「模型侧输出」的
+                        // 视觉锚点），所以即使不带文字标签也能一目了然。
+                        let _ = assistant_header_rendered;
+                        assistant_header_rendered = true; // mark so turn-foot tool summary won't add an extra header line
                         if text.is_empty() {
                             let placeholder = if *done { "·" } else { "▋" };
                             rows.push(Line::from(vec![
-                                Span::raw("      "),
+                                Span::raw("  "),
                                 style_s(c_fg(), placeholder.to_string()),
                             ]));
                         } else {
-                            rows.extend(md_to_lines(text, inner_w.max(12), c_fg()));
+                            // 给正文左侧增加 2 列外边距（与 User 消息的
+                            // 「缩进 2 + 正文」整体视觉对齐），使两行文字都从
+                            // 同一显示列起手，保持版面的对齐整齐。
+                            let mut lines = md_to_lines(text, inner_w.max(12), c_fg());
+                            for line in lines.iter_mut() {
+                                let mut padded: Vec<Span> = Vec::with_capacity(line.spans.len() + 1);
+                                padded.push(Span::raw("  "));
+                                padded.extend(line.spans.iter().cloned());
+                                line.spans = padded;
+                            }
+                            rows.extend(lines);
                         }
                         rows.push(Line::from(vec![Span::raw("")]));
                     }
@@ -1112,18 +1180,19 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
             // covers the "tools-only turn" edge case where the model
             // just calls agents without answering.
             if !assistant_header_rendered {
+                // Tools-only turn (no Assistant text yet) still needs a
+                // visual anchor so the tool summary isn't confused with
+                // the user's input. Instead of the word "Grodex" we emit
+                // only the "⏳ working…" / "⚙ tools…" indicator, matching
+                // the no-label visual style.
                 let any_work_left = n_flying > 0;
-                let streaming = if any_work_left {
-                    style_s(c_dim(), "  ⏳ working…")
-                } else {
-                    Span::raw("")
-                };
-                rows.push(Line::from(vec![
-                    Span::raw("  "),
-                    style_s(c_assistant(), "Grodex"),
-                    streaming,
-                ]));
-                rows.push(Line::from(vec![Span::raw("")]));
+                if any_work_left {
+                    rows.push(Line::from(vec![
+                        Span::raw("  "),
+                        style_s(c_dim(), "⏳ working…"),
+                    ]));
+                    rows.push(Line::from(vec![Span::raw("")]));
+                }
                 assistant_header_rendered = true;
             }
 

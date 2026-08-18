@@ -233,7 +233,24 @@ impl SessionReducer {
     }
 
     /// Apply a batch of events.
+    ///
+    /// Tolerance: if this reducer is brand-new (`last_seq == 0`, never
+    /// applied an event) and the first event in the batch has `seq > 0`,
+    /// we skip the missing prefix by re-baselining `last_seq` to the
+    /// first event's seq. This is required because some resume paths may
+    /// only preserve events starting from position 1 (e.g. missing the
+    /// initial `RuntimeStateChanged` at seq=0) but still expect the
+    /// state machine to continue strictly monotonically from the first
+    /// preserved seq. Without this leniency, users hit the cryptic
+    /// `"missing event seq: expected 0, got 1"` after `/resume`.
     pub fn apply_all(&mut self, events: &[RolloutEvent]) -> Result<(), ReducerError> {
+        if self.last_seq == 0 {
+            if let Some(first) = events.first() {
+                if first.seq > 0 {
+                    self.last_seq = first.seq;
+                }
+            }
+        }
         for event in events {
             self.apply(event)?;
         }

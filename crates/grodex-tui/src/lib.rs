@@ -81,6 +81,12 @@ pub trait TransportAdapter {
     fn take_pending_logs(&mut self) -> Vec<String> {
         Vec::new()
     }
+    /// Session snapshots received from the agent. Used by `/resume` to
+    /// rebuild chat history in the UI (SnapshotThenLive mode). Default
+    /// empty so in-process / unit-test transports don't need to wire it.
+    fn take_snapshots(&mut self) -> Vec<grodex_protocol::acp::SessionSnapshotPayload> {
+        Vec::new()
+    }
 }
 
 pub struct GrodexTui {
@@ -186,6 +192,262 @@ impl GrodexTui {
                     .push_event_with_envelope(content, env.seq, env.generation);
                 if self.state.session_id.is_none() {
                     self.state.session_id = Some(env_sid);
+                }
+            }
+
+            // ── Rebuild chat history from snapshots received from agent.
+            // Triggered by `/resume` (agent sends SnapshotThenLive). Each
+            // snapshot captures the complete terminal state of every
+            // message up to last_seq, so we can rebuild the UI as if the
+            // user is scrolling through an existing conversation — just
+            // like Claude Code / Codex / Aider do on attach.
+            for snap in self.transport.take_snapshots() {
+                // Skip empty snapshots outright. These can arrive as a benign
+                // "initial empty state" heartbeat from a brand-new session
+                // when the agent was started in parallel with the resume
+                // flow. If we processed them, restored would be empty and
+                // we would touch nothing — but an empty snapshot over a
+                // non-empty one is still confusing because it still emits
+                // a transport log line. Early-skip reduces noise and
+                // guarantees items=0 never overwrites restored history.
+                if snap.items.is_empty() {
+                    continue;
+                }
+                // If the snapshot's session id is available, adopt it so
+                // subsequent TurnComplete / TextDelta events still match.
+                if self.state.session_id.is_none() {
+                    self.state.session_id = Some(snap.session_id.to_string());
+                }
+                // Wipe the existing empty turn so the restored messages
+                // sit in their own turns and are not appended to the
+                // current empty turn (the turn separator logic groups by
+                // user→assistant transition).
+                let base = std::time::Instant::now();
+                let mut restored: Vec<crate::ui::state::ChatMessage> =
+                    Vec::with_capacity(snap.items.len());
+                for item in &snap.items {
+                    match item.item_type.as_str() {
+                        "user" => {
+                            restored.push(crate::ui::state::ChatMessage::User {
+                                text: item.content.clone(),
+                            });
+                        }
+                        "assistant" => {
+                            restored.push(crate::ui::state::ChatMessage::Assistant {
+                                text: item.content.clone(),
+                                done: item.complete,
+                            });
+                        }
+                        "thinking" => {
+                            restored.push(crate::ui::state::ChatMessage::Thinking {
+                                text: item.content.clone(),
+                                done: item.complete,
+                            });
+                        }
+                        "tool_call" => {
+                            match serde_json::from_str::<serde_json::Value>(&item.content) {
+                                Ok(v) => {
+                                    let name = v
+                                        .get("name")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let call_id = v
+                                        .get("call_id")
+                                        .and_then(|x| x.as_str())
+                                        .map(|s| s.to_string());
+                                    let args = v
+                                        .get("arguments")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null)
+                                        .to_string();
+                                    restored.push(crate::ui::state::ChatMessage::Tool {
+                                        name,
+                                        call_id,
+                                        args,
+                                        result: None,
+                                        is_error: false,
+                                        done: item.complete,
+                                        has_result: false,
+                                        started_at: base,
+                                        finished_at: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    self.state.push_log(format!(
+                                        "[snapshot] 无法解析 tool_call item {}: {e}",
+                                        item.item_id
+                                    ));
+                                }
+                            }
+                        }
+                        "tool_result" => {
+                            match serde_json::from_str::<serde_json::Value>(&item.content) {
+                                Ok(v) => {
+                                    let call_id =
+                                        v.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
+                                    let content_v =
+                                        v.get("content").cloned().unwrap_or(serde_json::Value::Null);
+                                    // tool result payload is stored as
+                                    // serialized content — strip quotes if
+                                    // it's a JSON-encoded string so humans
+                                    // see plain text.
+                                    let text = match content_v {
+                                        serde_json::Value::String(s) => s,
+                                        other => other.to_string(),
+                                    };
+                                    let is_error = v
+                                        .get("is_error")
+                                        .and_then(|x| x.as_bool())
+                                        .unwrap_or(false);
+                                    // Pair the result with the matching
+                                    // prior tool_call via call_id. Fallback:
+                                    // append a synthetic Tool card with no
+                                    // args but result filled (can happen if
+                                    // journal missed the prepared entry
+                                    // because it was filtered out).
+                                    let paired = restored.iter_mut().rev().find(|m| {
+                                        matches!(m, crate::ui::state::ChatMessage::Tool {
+                                            call_id: Some(c), ..
+                                        } if c == call_id)
+                                    });
+                                    match paired {
+                                        Some(crate::ui::state::ChatMessage::Tool {
+                                            result: slot,
+                                            is_error: err_slot,
+                                            has_result: hr_slot,
+                                            finished_at: fa_slot,
+                                            ..
+                                        }) => {
+                                            *slot = Some(text);
+                                            *err_slot = is_error;
+                                            *hr_slot = true;
+                                            *fa_slot = Some(base);
+                                        }
+                                        _ => {
+                                            restored.push(
+                                                crate::ui::state::ChatMessage::Tool {
+                                                    name: String::new(),
+                                                    call_id: Some(call_id.to_string()),
+                                                    args: String::new(),
+                                                    result: Some(text),
+                                                    is_error,
+                                                    done: true,
+                                                    has_result: true,
+                                                    started_at: base,
+                                                    finished_at: Some(base),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    self.state.push_log(format!(
+                                        "[snapshot] 无法解析 tool_result item {}: {e}",
+                                        item.item_id
+                                    ));
+                                }
+                            }
+                        }
+                        other => {
+                            self.state.push_log(format!(
+                                "[snapshot] 忽略未知 item_type '{other}' id={}",
+                                item.item_id
+                            ));
+                        }
+                    }
+                }
+                // Diagnostics: when item count does not match restored, some
+                // items were dropped via the `other` branch (e.g. a typo in
+                // the item_type string sent by the agent). This log lets the
+                // user immediately see "expected 9, got 0" without guessing
+                // why the chat pane stays empty after a resume.
+                if restored.len() != snap.items.len() {
+                    self.state.push_log(format!(
+                        "[snapshot] 警告：snap.items.len()={}，仅解析出 {} 条 ChatMessage（其余因未知 item_type 被忽略，见上方日志）",
+                        snap.items.len(),
+                        restored.len()
+                    ));
+                }
+                if !restored.is_empty() {
+                    // ── Full state reconciliation (Claude/Codex-style attach) ─
+                    //
+                    // The snapshot represents a complete UI snapshot — not
+                    // just the message list. If we only overwrite
+                    // `messages` but leave stale call_id_index / events /
+                    // pending_approvals the TUI can get confused:
+                    //   • TextDelta / ToolResult routing uses call_id_index
+                    //     → stale indices target the wrong Tool card after
+                    //     resume.
+                    //   • Duplicate-detection uses next_seq → needs to
+                    //     match snap.last_seq + 1 so post-snapshot live
+                    //     events (after ResumeSession ACK) don't get
+                    //     dropped.
+                    //   • turn_id / capability_generation drive the header
+                    //     line + server-side expectations, so sync them
+                    //     too.
+                    //   • Pending approvals are from the PREVIOUS agent
+                    //     session; after a resume the agent's permission
+                    //     broker is re-created from scratch, so any left-
+                    //     -over pending tickets would need to be re-issued.
+                    //     Clearing avoids ghost "approve this tool?" rows.
+                    //
+                    // If the current session already has LOCAL messages
+                    // (e.g. user typed a few lines and THEN ran /resume —
+                    // uncommon but can happen) we keep those in-front of
+                    // the restored history (merge oldest-first) so the
+                    // turn-based renderer still anchors correctly. The
+                    // common case (TUI opened → first action is /resume)
+                    // means local messages.len() == 0, so this degrades
+                    // cleanly to a simple replace.
+                    let mut local_messages: Vec<crate::ui::state::ChatMessage> =
+                        std::mem::take(&mut self.state.messages);
+                    if local_messages.is_empty() {
+                        // Fast path (common): clean attach with no prior
+                        // local state. Since we're replacing the messages
+                        // wholesale we can also safely scrub all the
+                        // sibling state that referenced OLD message indices
+                        // / OLD event seq numbers.
+                        self.state.events.clear();
+                        self.state.call_id_index.clear();
+                        self.state.pending_approvals.clear();
+                        self.state.turn_id = snap.current_turn_id.clone();
+                        self.state.capability_generation = snap.generation;
+                        self.state.messages = restored;
+                    } else {
+                        // Slow path: user typed something before running
+                        // /resume. Keep local (newest) messages AFTER the
+                        // restored (older) history so renders still look
+                        // chronological. We DO NOT clear call_id_index /
+                        // events here because the local messages might be
+                        // mid-turn (in-flight Assistant / Tool).
+                        let mut merged = restored;
+                        merged.append(&mut local_messages);
+                        self.state.messages = merged;
+                        // Even in the merged path, reconcile sequence
+                        // numbers + turn/generation fields — the snapshot
+                        // represents what the SERVER knows, and live
+                        // events coming back after the ACK will use server-
+                        // side seqs.
+                        self.state.turn_id = snap.current_turn_id.clone();
+                        self.state.capability_generation = snap.generation;
+                    }
+                    // Reconcile next_seq with the snapshot so future events
+                    // don't get dropped as duplicates.
+                    self.state.set_next_seq(snap.last_seq + 1);
+                    // /resume 完成后显式锁定到最底部，用户直接看到最后的
+                    // assistant / tool 输出，与 codex attach 体验一致。
+                    self.state.scroll_follow_bottom = true;
+                    self.state.scroll_conversation = u16::MAX;
+                } else {
+                    // Previously silent. If a snapshot *claimed* to have
+                    // items but 0 produced ChatMessages, we yell about it
+                    // so users immediately know the mismatch instead of
+                    // filing a "resume does not show anything" bug.
+                    self.state.push_log(format!(
+                        "[snapshot] 警告：items.len()={}，但 restored=0 → 没有解析出任何可显示的聊天消息，请检查 agent 发送的 item_type",
+                        snap.items.len()
+                    ));
                 }
             }
 
@@ -2578,6 +2840,12 @@ impl TransportAdapter for transport::stdio::StdioClient {
 
     fn take_pending_logs(&mut self) -> Vec<String> {
         transport::stdio::StdioClient::take_pending_logs(self)
+    }
+
+    fn take_snapshots(
+        &mut self,
+    ) -> Vec<grodex_protocol::acp::SessionSnapshotPayload> {
+        transport::stdio::StdioClient::take_snapshots(self)
     }
 }
 

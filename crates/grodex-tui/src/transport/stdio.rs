@@ -16,6 +16,13 @@ pub struct StdioClient {
     stderr_rx: mpsc::Receiver<String>,
     pending_logs: Vec<String>,
     last_snapshot: Option<SessionSnapshotPayload>,
+    /// Queue of snapshots received from the agent — drained by the TUI
+    /// via `take_snapshots()` and translated into `ChatMessage`s so the
+    /// chat history can be visually "replayed" after `/resume` (same UX
+    /// as Claude Code / Codex). We queue them rather than returning them
+    /// inline from `poll_event` because a snapshot isn't an event and
+    /// must be handled on the state-management side.
+    pending_snapshots: Vec<SessionSnapshotPayload>,
     max_inflight_events: u32,
     inflight_events: u32,
     rtt_ms: Option<u64>,
@@ -94,6 +101,7 @@ impl StdioClient {
             stderr_rx,
             pending_logs: Vec::new(),
             last_snapshot: None,
+            pending_snapshots: Vec::new(),
             max_inflight_events: 64,
             inflight_events: 0,
             rtt_ms: None,
@@ -217,17 +225,21 @@ impl StdioClient {
     }
 
     fn handle_server_frame(&mut self, frame: ServerFrame) -> Option<EventEnvelope> {
+        // Each ServerFrame corresponds to exactly one inbound Command (1:1
+        // pairing for ACP). **All** frame kinds decrement inflight:
+        // previously only `Event` subtracted 1, so a ResumeSession command
+        // (whose response is a `Snapshot` + optionally N replay `Event`s
+        // plus a flow control) left inflight stuck at 1 indefinitely, which
+        // caused the classic "背压限制 inflight=1 > max_inflight=1" error
+        // on the very next user prompt after /resume.
+        self.inflight_events = self.inflight_events.saturating_sub(1);
         match frame {
             ServerFrame::Event(env) => {
-                self.inflight_events = self.inflight_events.saturating_sub(1);
                 Some(env)
             }
             ServerFrame::Snapshot(payload) => {
                 self.last_snapshot = Some(payload.clone());
-                self.pending_logs.push(format!(
-                    "[transport] 收到 Snapshot: session_id={}, last_seq={}",
-                    payload.session_id, payload.last_seq
-                ));
+                self.pending_snapshots.push(payload);
                 None
             }
             ServerFrame::FlowControl {
@@ -273,6 +285,13 @@ impl StdioClient {
 
     pub fn last_snapshot(&self) -> Option<&SessionSnapshotPayload> {
         self.last_snapshot.as_ref()
+    }
+
+    /// Drain all snapshots received since the last call. Intended to be
+    /// called from the TUI main loop after `poll_event` so the UI can
+    /// rebuild its chat history (snapshot → ChatMessage vector).
+    pub fn take_snapshots(&mut self) -> Vec<SessionSnapshotPayload> {
+        std::mem::take(&mut self.pending_snapshots)
     }
 
     pub fn take_protocol_errors(&mut self) -> Vec<String> {

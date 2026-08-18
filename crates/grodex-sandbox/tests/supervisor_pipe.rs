@@ -61,6 +61,7 @@ fn supervisor_binary_echo_completes_or_refuses() {
         SandboxRuntimeResponse::Completed {
             operation_id,
             exit_status,
+            ..
         } => {
             assert_eq!(operation_id, "op-direct");
             assert!(exit_status.success(), "echo should succeed");
@@ -174,6 +175,7 @@ fn run_external_through_supervisor_binary() {
         SandboxRuntimeResponse::Completed {
             operation_id,
             exit_status,
+            ..
         } => {
             assert_eq!(operation_id, "op-e2e");
             assert!(exit_status.success());

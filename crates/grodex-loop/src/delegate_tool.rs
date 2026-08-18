@@ -1,7 +1,15 @@
 //! DelegateTool — spawns a sub-agent to handle a delegated task.
 //!
 //! Registered as a built-in tool so the model can spawn sub-agents.
-//! Uses SubAgentSupervisor for lifecycle management.
+//! When a `SamplingActor` is injected (via `with_sampling`), the tool
+//! actually runs the sub-agent turn inline: it constructs a minimal
+//! `CanonicalModelRequest` from the task description, samples the model,
+//! and returns the sub-agent's response. Without an actor it falls back
+//! to the legacy "spawned" placeholder.
+//!
+//! When a `RolloutWriter` is injected (via `with_writer`), the tool uses
+//! `DurableSubAgentSupervisor` so spawn/complete are journaled and
+//! restorable on crash.
 
 use async_trait::async_trait;
 use grodex_core::error::GrodexError;
@@ -9,9 +17,14 @@ use grodex_core::id::OperationId;
 use grodex_core::tool::{ConcurrencyClass, SideEffectClass, ToolMetadata, Tool, ToolRuntime};
 use grodex_subagent::context::ContextFork;
 use grodex_subagent::supervisor::{SubAgentConfig, SubAgentSupervisor};
+use grodex_subagent::task::TaskBudget;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+use crate::durable_subagent::DurableSubAgentSupervisor;
+use crate::rollout_writer::RolloutWriter;
+use crate::supervisor::ModelConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateArgs {
@@ -27,19 +40,52 @@ pub struct DelegateOutput {
     pub message: String,
 }
 
+/// Sub-agent runtime backing the delegate_task tool.
+///
+/// If `writer` is set, tasks are journaled via `DurableSubAgentSupervisor`;
+/// otherwise a plain in-memory `SubAgentSupervisor` is used.
+enum SubAgentRuntime {
+    InMemory(Arc<Mutex<SubAgentSupervisor>>),
+    Durable(Arc<Mutex<DurableSubAgentSupervisor>>),
+}
+
 pub struct DelegateTool {
-    supervisor: Arc<Mutex<SubAgentSupervisor>>,
+    runtime: SubAgentRuntime,
+    /// Injected to actually run sub-agent sampling turns. If None, the
+    /// tool returns a "spawned" placeholder (legacy behavior).
+    actor: Option<Arc<grodex_sampler::SamplingActor>>,
+    /// Model config for constructing the sub-agent's ModelBinding.
+    model_config: Option<ModelConfig>,
 }
 
 impl DelegateTool {
     pub fn new(config: SubAgentConfig) -> Self {
         Self {
-            supervisor: Arc::new(Mutex::new(SubAgentSupervisor::new(config))),
+            runtime: SubAgentRuntime::InMemory(Arc::new(Mutex::new(
+                SubAgentSupervisor::new(config),
+            ))),
+            actor: None,
+            model_config: None,
         }
     }
 
-    pub fn supervisor(&self) -> Arc<Mutex<SubAgentSupervisor>> {
-        self.supervisor.clone()
+    /// Inject a SamplingActor + ModelConfig so the tool can actually
+    /// run sub-agent turns instead of just spawning.
+    pub fn with_sampling(mut self, actor: Arc<grodex_sampler::SamplingActor>, cfg: ModelConfig) -> Self {
+        self.actor = Some(actor);
+        self.model_config = Some(cfg);
+        self
+    }
+
+    /// Inject a RolloutWriter so sub-agent lifecycle is journaled
+    /// (spawn/complete/fail events written to the rollout).
+    pub fn with_writer(self, writer: RolloutWriter, config: SubAgentConfig) -> Self {
+        Self {
+            runtime: SubAgentRuntime::Durable(Arc::new(Mutex::new(
+                DurableSubAgentSupervisor::new(writer, config),
+            ))),
+            ..self
+        }
     }
 }
 
@@ -92,30 +138,135 @@ impl ToolRuntime for DelegateTool {
             .map_err(|e| GrodexError::ToolExecution(format!("invalid delegate args: {e}")))?;
 
         let label = args.label.unwrap_or_else(|| "sub-agent".into());
-        let root_id = {
-            let sup = self.supervisor.lock().await;
-            sup.root_id()
+
+        // ── 1. Spawn the sub-agent task ──────────────────────────
+        let (agent_id, task_id) = match &self.runtime {
+            SubAgentRuntime::InMemory(sup) => {
+                let mut sup = sup.lock().await;
+                let root = sup.root_id();
+                sup.spawn(root, &label, &args.task, ContextFork::None, None)
+                    .map_err(|e| GrodexError::ToolExecution(format!("cannot spawn: {e}")))?
+            }
+            SubAgentRuntime::Durable(sup) => {
+                let mut sup = sup.lock().await;
+                let root = sup.root_id();
+                sup.spawn(root, &label, &args.task, ContextFork::None, None)
+                    .await
+                    .map_err(|e| GrodexError::ToolExecution(format!("cannot spawn: {e}")))?
+            }
         };
 
-        let (agent_id, task_id) = {
-            let mut sup = self.supervisor.lock().await;
-            sup.spawn(
-                root_id,
-                &label,
-                &args.task,
-                ContextFork::None,
-                None,
-            )
-            .map_err(|e| GrodexError::ToolExecution(format!("cannot spawn sub-agent: {e}")))?
+        // ── 2. If a SamplingActor is available, actually run the
+        //    sub-agent turn. Otherwise return a placeholder.
+        let message = if let (Some(actor), Some(cfg)) = (&self.actor, &self.model_config) {
+            let response = run_subagent_turn(actor, cfg, &args.task).await;
+            let response_text = match response {
+                Ok(text) => text,
+                Err(e) => {
+                    // Mark the task as failed in the supervisor.
+                    match &self.runtime {
+                        SubAgentRuntime::InMemory(sup) => {
+                            sup.lock().await.fail_task(&task_id, &e);
+                        }
+                        SubAgentRuntime::Durable(sup) => {
+                            sup.lock().await.fail_task(&task_id, &e).await;
+                        }
+                    }
+                    format!("Sub-agent '{label}' failed: {e}")
+                }
+            };
+
+            // Complete the task with the result.
+            let tokens: u64 = response_text.len() as u64 / 4; // rough estimate
+            match &self.runtime {
+                SubAgentRuntime::InMemory(sup) => {
+                    sup.lock().await.complete_task(&task_id, response_text.clone(), tokens);
+                }
+                SubAgentRuntime::Durable(sup) => {
+                    sup.lock().await.complete_task(&task_id, response_text.clone(), tokens).await;
+                }
+            }
+            response_text
+        } else {
+            format!("Sub-agent '{label}' spawned. It will work on: {}", args.task)
         };
 
         let output = DelegateOutput {
             agent_id: agent_id.to_string(),
             task_id: task_id.to_string(),
-            message: format!("Sub-agent '{label}' spawned. It will work on: {}", args.task),
+            message,
         };
 
         serde_json::to_value(output)
             .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
+    }
+}
+
+/// Run a single sub-agent sampling turn with the task as the user input.
+///
+/// Constructs a minimal `CanonicalModelRequest` with just the task
+/// as a user message — no tools, no multi-turn history, no streaming.
+async fn run_subagent_turn(
+    actor: &grodex_sampler::SamplingActor,
+    cfg: &ModelConfig,
+    task: &str,
+) -> Result<String, String> {
+    use grodex_core::context::ContextItem;
+    use grodex_core::id::{SessionId, StepId, TurnId};
+    use grodex_provider::binding::ModelBinding;
+    use grodex_provider::canonical_request::{
+        CanonicalModelRequest, InstructionBlock, InstructionRole, ToolChoice,
+    };
+
+    let binding = ModelBinding::new(
+        cfg.provider.clone(),
+        1,
+        cfg.model.clone(),
+        1,
+        cfg.wire_protocol,
+    );
+
+    let request = CanonicalModelRequest {
+        request_id: format!("subagent-{}", SessionId::new()),
+        session_id: SessionId::new(),
+        turn_id: TurnId::new(),
+        step_id: StepId::new(),
+        model_binding_id: binding.binding_id.clone(),
+        prompt_snapshot_hash: None,
+        instructions: vec![InstructionBlock {
+            role: InstructionRole::System,
+            content: "You are a sub-agent. Complete the task concisely.".into(),
+            priority: 0,
+        }],
+        context_items: vec![ContextItem::User {
+            content: task.to_string(),
+            message_id: None,
+        }],
+        tool_specs: vec![],
+        tool_choice: ToolChoice::None,
+        parallel_tool_calls: false,
+        reasoning_request: None,
+        response_format: None,
+        max_output_tokens: Some(4096),
+        provider_state_in: None,
+    };
+
+    let outcome = actor.sample(&binding, &request).await;
+    match outcome.response {
+        Some(resp) => {
+            let text = resp.assistant_text().unwrap_or_default().to_string();
+            if text.is_empty() {
+                Err("sub-agent returned empty response".into())
+            } else {
+                Ok(text)
+            }
+        }
+        None => {
+            let err = outcome
+                .error
+                .map(|e| format!("{e}"))
+                .unwrap_or_else(|| "unknown sampling error".into());
+            Err(err)
+        }
     }
 }

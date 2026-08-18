@@ -23,7 +23,7 @@
 use std::io::{self, Read, Write};
 use std::process::Command;
 
-use grodex_sandbox::platform::{enforce_seatbelt, SandboxEnforceError};
+use grodex_sandbox::platform::{enforce_seatbelt_capturing, SandboxEnforceError};
 use grodex_sandbox::runtime::{
     ExitStatusStatus, PreparedOperation, SandboxRuntimeRequest, SandboxRuntimeResponse,
 };
@@ -75,10 +75,17 @@ fn main() {
     }
 
     // ── Enforce the sandbox and run ───────────────────────────────
-    let response = match enforce_seatbelt(&op.profile, &mut cmd) {
-        Ok(status) => SandboxRuntimeResponse::Completed {
+    // Capturing variant: the child's stdout/stderr are piped into buffers
+    // and returned in the JSON response (lossy UTF-8). The supervisor's OWN
+    // stdout carries only the JSON response — the child's raw output never
+    // leaks onto it (the kernel sandbox still enforces deny rules; only the
+    // stdio plumbing differs from the null-redirecting `enforce_seatbelt`).
+    let response = match enforce_seatbelt_capturing(&op.profile, &mut cmd) {
+        Ok((status, out, err)) => SandboxRuntimeResponse::Completed {
             operation_id,
             exit_status: ExitStatusStatus::from(status),
+            stdout: Some(String::from_utf8_lossy(&out).into_owned()),
+            stderr: Some(String::from_utf8_lossy(&err).into_owned()),
         },
         Err(SandboxEnforceError::Unsupported) => SandboxRuntimeResponse::Refused {
             operation_id,
@@ -192,13 +199,17 @@ mod tests {
         let resp = SandboxRuntimeResponse::Completed {
             operation_id: "op-w".into(),
             exit_status: ExitStatusStatus::Code(0),
+            stdout: Some("ok\n".into()),
+            stderr: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: SandboxRuntimeResponse = serde_json::from_str(&json).unwrap();
         match back {
-            SandboxRuntimeResponse::Completed { operation_id, exit_status } => {
+            SandboxRuntimeResponse::Completed { operation_id, exit_status, stdout, stderr } => {
                 assert_eq!(operation_id, "op-w");
                 assert!(exit_status.success());
+                assert_eq!(stdout.as_deref(), Some("ok\n"));
+                assert_eq!(stderr, None);
             }
             _ => panic!("expected Completed"),
         }

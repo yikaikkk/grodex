@@ -24,7 +24,7 @@
 //! *real at the type level* rather than a comment, and lets a fork/supervisor
 //! process be added incrementally.
 
-use crate::platform::{enforce_seatbelt, SandboxEnforceError};
+use crate::platform::{enforce_seatbelt, enforce_seatbelt_capturing, SandboxEnforceError};
 use crate::profile_layers::{AccessLevel, LayeredProfileInput};
 use crate::profile::ProfileStore;
 use grodex_sandbox_types::profile::SandboxProfile;
@@ -124,7 +124,22 @@ pub struct SandboxRuntimeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SandboxRuntimeResponse {
     /// Operation ran to completion under the sandbox.
-    Completed { operation_id: String, exit_status: ExitStatusStatus },
+    ///
+    /// `stdout`/`stderr` carry the sandboxed command's captured output as
+    /// lossy UTF-8 (`String::from_utf8_lossy`). They are `#[serde(default)]`
+    /// so responses from older supervisors that omitted them still parse.
+    /// The external supervisor binary leaves them `None` (its own stdout
+    /// carries the JSON response, so it cannot also stream the child's raw
+    /// output); the in-process `run` fills them so the `exec` tool can
+    /// return output to the model.
+    Completed {
+        operation_id: String,
+        exit_status: ExitStatusStatus,
+        #[serde(default)]
+        stdout: Option<String>,
+        #[serde(default)]
+        stderr: Option<String>,
+    },
     /// The supervisor refused the operation (profile too strict, authority
     /// ceiling exceeded, unsupported platform, etc.).
     Refused { operation_id: String, reason: String },
@@ -262,15 +277,19 @@ impl SandboxRuntimeClient {
             cmd.current_dir(cwd);
         }
 
-        // Delegate to the platform enforcer (sandbox-exec on macOS). On
-        // platforms without enforcement, `enforce_seatbelt` returns
-        // `Unsupported` — surface it as a Refused so the caller can choose
-        // fail-closed vs. fallback explicitly, instead of silently running
-        // unsandboxed.
-        match enforce_seatbelt(&op.profile, &mut cmd) {
-            Ok(status) => SandboxRuntimeResponse::Completed {
+        // Delegate to the platform enforcer (sandbox-exec on macOS). We use
+        // the *capturing* variant so the `exec` tool routing through this
+        // client gets the command's stdout/stderr to return to the model, in
+        // addition to the kernel-enforced deny rules. On platforms without
+        // enforcement, `enforce_seatbelt_capturing` returns `Unsupported` —
+        // surfaced as a Refused so the caller fails closed instead of
+        // silently running unsandboxed.
+        match enforce_seatbelt_capturing(&op.profile, &mut cmd) {
+            Ok((status, out, err)) => SandboxRuntimeResponse::Completed {
                 operation_id: op.operation_id,
                 exit_status: ExitStatusStatus::from(status),
+                stdout: Some(String::from_utf8_lossy(&out).into_owned()),
+                stderr: Some(String::from_utf8_lossy(&err).into_owned()),
             },
             Err(SandboxEnforceError::Unsupported) => SandboxRuntimeResponse::Refused {
                 operation_id: op.operation_id,
@@ -284,6 +303,22 @@ impl SandboxRuntimeClient {
                 operation_id: op.operation_id,
                 reason: format!("{e}"),
             },
+        }
+    }
+
+    /// Run a prepared operation, dispatching to the in-process enforcer or
+    /// the external supervisor binary based on the client's configured
+    /// backend.
+    ///
+    /// This is the single entry point tools (e.g. `exec`) should call: they
+    /// don't need to know whether the session is running sandboxed in-process
+    /// or via an out-of-process supervisor. Fail-closed in both paths — a
+    /// `Refused` is returned for any spawn/IO/serialization error.
+    pub fn run_dispatched(&self, req: SandboxRuntimeRequest) -> SandboxRuntimeResponse {
+        match self.backend {
+            BackendKind::InProcess => self.run(req),
+            #[cfg(target_os = "macos")]
+            BackendKind::External => self.run_external(req, None),
         }
     }
 
@@ -489,6 +524,8 @@ mod tests {
         let completed = SandboxRuntimeResponse::Completed {
             operation_id: "op-rt".into(),
             exit_status: ExitStatusStatus::Code(0),
+            stdout: Some("hello\n".into()),
+            stderr: None,
         };
         let json = serde_json::to_string(&completed).expect("serialize completed");
         let back: SandboxRuntimeResponse =
@@ -497,9 +534,27 @@ mod tests {
             SandboxRuntimeResponse::Completed {
                 operation_id,
                 exit_status,
+                stdout,
+                stderr,
             } => {
                 assert_eq!(operation_id, "op-rt");
                 assert!(exit_status.success());
+                assert_eq!(stdout.as_deref(), Some("hello\n"));
+                assert_eq!(stderr, None);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        // Old supervisor responses without stdout/stderr must still parse
+        // (#[serde(default)] back-compat).
+        let legacy = r#"{"Completed":{"operation_id":"op-legacy","exit_status":{"Code":0}}}"#;
+        let back: SandboxRuntimeResponse =
+            serde_json::from_str(legacy).expect("deserialize legacy completed");
+        match back {
+            SandboxRuntimeResponse::Completed { operation_id, stdout, stderr, .. } => {
+                assert_eq!(operation_id, "op-legacy");
+                assert_eq!(stdout, None);
+                assert_eq!(stderr, None);
             }
             other => panic!("expected Completed, got {other:?}"),
         }

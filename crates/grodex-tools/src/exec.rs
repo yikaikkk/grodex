@@ -13,6 +13,10 @@ use grodex_core::error::GrodexError;
 use grodex_core::id::OperationId;
 use grodex_core::tool::{ConcurrencyClass, SideEffectClass, ToolMetadata};
 use grodex_core::tool::{Tool, ToolRuntime};
+use grodex_sandbox::runtime::{
+    PreparedOperation, SandboxRuntimeClient, SandboxRuntimeRequest, SandboxRuntimeResponse,
+};
+use grodex_sandbox_types::profile::SandboxProfile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -50,6 +54,17 @@ pub struct ExecTool {
     max_output_bytes: usize,
     #[allow(dead_code)]
     default_timeout: Duration,
+    /// Optional sandbox runtime. When set (together with `sandbox_profile`),
+    /// `execute` routes the command through `client.run_dispatched()`
+    /// (in-process sandbox-exec OR external supervisor) instead of a bare
+    /// `tokio::process::Command`. Fail-closed: a `Refused` response is
+    /// surfaced as a tool error — the command is **never** silently run
+    /// unsandboxed.
+    sandbox_runtime: Option<SandboxRuntimeClient>,
+    /// The sandbox profile governing exec operations (cloned from the
+    /// session's `SandboxManager` effective profile). Required together
+    /// with `sandbox_runtime` for the sandboxed path.
+    sandbox_profile: Option<SandboxProfile>,
 }
 
 impl Default for ExecTool {
@@ -63,7 +78,29 @@ impl ExecTool {
         Self {
             max_output_bytes: 100_000,
             default_timeout: Duration::from_secs(120),
+            sandbox_runtime: None,
+            sandbox_profile: None,
         }
+    }
+
+    /// Enable sandbox-enforced execution. When set, `execute` builds a
+    /// `PreparedOperation` (program `sh -c <command>` + the session's
+    /// effective profile) and runs it through the runtime client, so the
+    /// kernel enforces `deny_paths`/network rules. The command's
+    /// stdout/stderr are captured and returned to the model.
+    ///
+    /// Fail-closed: if the platform has no enforcement backend
+    /// (non-macOS, or sandbox-exec missing), `run_dispatched` returns
+    /// `Refused` and the tool returns an error rather than running
+    /// unsandboxed. Callers that want a fallback must NOT set this.
+    pub fn with_sandbox_runtime(
+        mut self,
+        client: SandboxRuntimeClient,
+        profile: SandboxProfile,
+    ) -> Self {
+        self.sandbox_runtime = Some(client);
+        self.sandbox_profile = Some(profile);
+        self
     }
 }
 
@@ -115,13 +152,102 @@ impl ToolRuntime for ExecTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _operation_id: OperationId,
+        operation_id: OperationId,
     ) -> Result<serde_json::Value, GrodexError> {
         let args: ExecArgs =
             serde_json::from_value(args).map_err(|e| GrodexError::ToolExecution(format!("invalid args: {e}")))?;
 
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(120));
+
+        // ── Sandbox-enforced path ──────────────────────────────────
+        // When the session wired a `SandboxRuntimeClient` + effective profile
+        // into the tool, route the command through `run_dispatched()` so the
+        // kernel (sandbox-exec) actually enforces deny/network rules, instead
+        // of the bare `tokio::process::Command` used below. The runtime client
+        // uses blocking `std::process::Command` internally, so offload it to a
+        // blocking thread to avoid stalling the async runtime.
+        //
+        // Fail-closed: a `Refused` (unsupported platform, missing backend,
+        // authority ceiling 0, spawn/IO error) is surfaced as a tool error —
+        // the command is never silently run unsandboxed. This honours the
+        // project invariant that the sandbox runtime fails closed when the
+        // backend is missing or unsupported.
+        if let (Some(client), Some(profile)) = (&self.sandbox_runtime, &self.sandbox_profile) {
+            let mut op = PreparedOperation::new(
+                operation_id.to_string(),
+                "sh",
+                profile.clone(),
+            )
+            .with_arg("-c")
+            .with_arg(&args.command)
+            .with_authority_ceiling(1);
+            if let Some(ref cwd) = args.cwd {
+                op = op.with_cwd(cwd);
+            }
+            let req = SandboxRuntimeRequest { operation: op };
+            let client = client.clone();
+            let join = tokio::task::spawn_blocking(move || client.run_dispatched(req));
+            let outcome = tokio::time::timeout(timeout, join).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            return match outcome {
+                Ok(Ok(SandboxRuntimeResponse::Completed {
+                    exit_status,
+                    stdout,
+                    stderr,
+                    ..
+                })) => {
+                    let stdout_s = stdout.unwrap_or_default();
+                    let stderr_s = stderr.unwrap_or_default();
+                    let (stdout_str, stdout_truncated) =
+                        Self::truncate(&stdout_s, self.max_output_bytes);
+                    let (stderr_str, stderr_truncated) =
+                        Self::truncate(&stderr_s, self.max_output_bytes);
+                    let exit_code = match exit_status {
+                        grodex_sandbox::runtime::ExitStatusStatus::Code(c) => Some(c),
+                        _ => None,
+                    };
+                    let result = ExecOutput {
+                        command: args.command,
+                        process_id: None,
+                        stdout: stdout_str,
+                        stderr: stderr_str,
+                        exit_code,
+                        timed_out: false,
+                        duration_ms,
+                        stdout_truncated,
+                        stderr_truncated,
+                    };
+                    serde_json::to_value(result)
+                        .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
+                }
+                Ok(Ok(SandboxRuntimeResponse::Refused { reason, .. })) => {
+                    Err(GrodexError::ToolExecution(format!(
+                        "sandbox refused exec: {reason}"
+                    )))
+                }
+                Ok(Err(join_e)) => Err(GrodexError::ToolExecution(format!(
+                    "sandbox exec task panicked: {join_e}"
+                ))),
+                Err(_) => {
+                    let result = ExecOutput {
+                        command: args.command,
+                        process_id: None,
+                        stdout: String::new(),
+                        stderr: format!("command timed out after {timeout:?} (sandboxed)"),
+                        exit_code: None,
+                        timed_out: true,
+                        duration_ms,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    };
+                    serde_json::to_value(result)
+                        .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
+                }
+            };
+        }
+
+        // ── Direct-spawn path (no sandbox configured) ───────────────
 
         let mut cmd = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");

@@ -40,6 +40,7 @@ impl Default for SamplingClientConfig {
 ///   - Returning an SSE byte stream
 ///
 /// It does NOT handle retry, auth refresh, or failover (Phase 3).
+#[derive(Clone)]
 pub struct SamplingClient {
     inner: reqwest::Client,
     #[allow(dead_code)]
