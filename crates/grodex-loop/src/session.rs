@@ -97,8 +97,16 @@ impl Session {
     }
 
     /// Cancel the current Turn, recording the cancellation.
+    ///
+    /// Idempotent: if the session is already Idle (e.g. a previous cancel
+    /// already ran, or the turn completed normally), this is a no-op.
+    /// This prevents "invalid state transition: Idle -> Idle" errors when
+    /// the user presses Esc multiple times.
     pub fn cancel_turn(&mut self) -> Result<(), String> {
         self.current_turn = None;
+        if self.state == SessionState::Idle {
+            return Ok(());
+        }
         self.transition_to(SessionState::Idle)?;
         Ok(())
     }

@@ -37,6 +37,15 @@ pub struct ApprovalRequestedEvent {
     pub timeout_remaining_ms: u64,
 }
 
+/// Lightweight snapshot of a pending ticket, returned by
+/// `PermissionManager::pending_ticket_info`. Intentionally small so we
+/// don't leak ticket internals to the supervisor.
+#[derive(Debug, Clone, Default)]
+pub struct PendingTicketInfo {
+    pub call_id: Option<String>,
+    pub tool_name: Option<String>,
+}
+
 /// The result of a permission check — either immediate or requires approval.
 #[derive(Debug)]
 pub enum PermissionResult {
@@ -288,8 +297,18 @@ impl PermissionManager {
     }
 
     /// Resolve a pending approval ticket.
-    pub fn resolve(&mut self, ticket_id: &str, decision: PolicyDecision) -> bool {
-        self.broker.resolve(ticket_id, decision)
+    ///
+    /// `narrowed_args`, when provided, overwrites the ticket's stored
+    /// arguments snapshot so resume rebuilds the narrowed version (see
+    /// [supervisor P0-4 note] where the previous implementation simply
+    /// dropped the user's revised args on the floor).
+    pub fn resolve(
+        &mut self,
+        ticket_id: &str,
+        decision: PolicyDecision,
+        narrowed_args: Option<serde_json::Value>,
+    ) -> bool {
+        self.broker.resolve(ticket_id, decision, narrowed_args)
     }
 
     /// Cancel all pending approvals (session shutdown).
@@ -305,6 +324,17 @@ impl PermissionManager {
     /// Number of pending approval tickets.
     pub fn pending_count(&self) -> usize {
         self.broker.pending_count()
+    }
+
+    /// Return lightweight info about a specific pending ticket (used by
+    /// SessionSupervisor just before resolving, to annotate journal
+    /// events with the ticket's tool_call_id + tool_name). Returns None
+    /// if the ticket id is not pending.
+    pub fn pending_ticket_info(&self, ticket_id: &str) -> Option<PendingTicketInfo> {
+        self.broker.pending_ticket(ticket_id).map(|t| PendingTicketInfo {
+            call_id: Some(t.tool_call_id.to_string()),
+            tool_name: Some(t.tool_name.clone()),
+        })
     }
 
     /// Assess risk level based on tool name and arguments.
@@ -381,7 +411,7 @@ mod tests {
                 decision_rx: _rx,
             } => {
                 assert!(!ticket_id.is_empty());
-                assert!(mgr.resolve(&ticket_id, PolicyDecision::Allow));
+                assert!(mgr.resolve(&ticket_id, PolicyDecision::Allow, None));
             }
             other => panic!("expected ApprovalRequired, got {other:?}"),
         }
@@ -456,7 +486,7 @@ mod tests {
         assert!(ev.timeout_remaining_ms > 0);
 
         // 5. resolve(Allow) must return true and wake the waiting tool.
-        assert!(mgr.resolve(&ticket_id, PolicyDecision::Allow));
+        assert!(mgr.resolve(&ticket_id, PolicyDecision::Allow, None));
         let decision = decision_rx
             .await
             .expect("decision_rx must be woken after resolve()");
@@ -497,7 +527,7 @@ mod tests {
             panic!("expected ApprovalRequired");
         };
 
-        assert!(mgr.resolve(&ticket_id, PolicyDecision::Deny));
+        assert!(mgr.resolve(&ticket_id, PolicyDecision::Deny, None));
         let decision = decision_rx
             .await
             .expect("decision_rx must be woken after Deny resolve");

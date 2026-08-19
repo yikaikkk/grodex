@@ -33,6 +33,20 @@ pub enum GrodexError {
     /// An I/O or infrastructure error that does not fit a more specific variant.
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
+
+    /// The rollout journal on disk contains a line that could not be
+    /// parsed into a valid `RolloutEvent`. Fail-closed: callers must
+    /// NOT silently skip this line and continue; either surface the
+    /// error to the operator (repair the JSONL manually) or start a
+    /// fresh session. Silent data loss is forbidden.
+    #[error(
+        "journal corrupt: path={path} line={line} reason={reason}"
+    )]
+    JournalCorrupt {
+        path: String,
+        line: u64,
+        reason: String,
+    },
 }
 
 impl GrodexError {

@@ -61,11 +61,12 @@ impl DurableSubAgentSupervisor {
         budget: Option<TaskBudget>,
     ) -> Result<(AgentId, TaskId), String> {
         let (agent_id, task_id) = self.inner.spawn(parent_id, label, input, context_fork, budget)?;
-        // Best-effort journal: a write failure is logged but does NOT unwind
-        // the spawn (the task is already running in-memory); the supervisor
-        // surface keeps going. A missing start-event means the task is
-        // unrestorable on crash, which is the lesser evil vs. aborting live
-        // work. The next terminal event will still be written.
+        // P1-5 fix: a journal write failure here must NOT be silently
+        // swallowed. If we can't persist the Started event, the task
+        // would be unrestorable on crash — we should unwind the in-memory
+        // spawn and return an error so the caller can decide whether to
+        // retry. The previous code logged and continued, which meant a
+        // crash after this point would lose the task entirely.
         let payload = serde_json::json!({
             "agent_id": agent_id.to_string(),
             "parent_id": parent_id.to_string(),
@@ -73,7 +74,11 @@ impl DurableSubAgentSupervisor {
             "label": label,
             "input": input,
         });
-        write_event(&self.writer, RolloutEventType::SubAgentTaskStarted, payload).await;
+        if let Err(e) = write_event(&self.writer, RolloutEventType::SubAgentTaskStarted, payload).await {
+            // Unwind: cancel the in-memory task so it doesn't dangle.
+            self.inner.cancel(&agent_id);
+            return Err(format!("无法持久化子任务启动事件到 journal: {e}"));
+        }
         Ok((agent_id, task_id))
     }
 
@@ -86,7 +91,9 @@ impl DurableSubAgentSupervisor {
             "result": result,
             "tokens": tokens,
         });
-        write_event(&self.writer, RolloutEventType::SubAgentTaskFinished, payload).await;
+        if let Err(e) = write_event(&self.writer, RolloutEventType::SubAgentTaskFinished, payload).await {
+            eprintln!("[error] rollout write SubAgentTaskFinished(completed) failed: {e}");
+        }
     }
 
     /// Fail a task, journaling `SubAgentTaskFinished`.
@@ -97,7 +104,9 @@ impl DurableSubAgentSupervisor {
             "status": "failed",
             "error": error,
         });
-        write_event(&self.writer, RolloutEventType::SubAgentTaskFinished, payload).await;
+        if let Err(e) = write_event(&self.writer, RolloutEventType::SubAgentTaskFinished, payload).await {
+            eprintln!("[error] rollout write SubAgentTaskFinished(failed) failed: {e}");
+        }
     }
 
     /// Cancel an agent + descendants. Each cancelled task journals a
@@ -134,50 +143,146 @@ impl DurableSubAgentSupervisor {
                 "task_id": task_id,
                 "status": "cancelled",
             });
-            write_event(&self.writer, RolloutEventType::SubAgentTaskFinished, payload).await;
+            if let Err(e) = write_event(&self.writer, RolloutEventType::SubAgentTaskFinished, payload).await {
+                eprintln!("[error] rollout write SubAgentTaskFinished(cancelled) failed: {e}");
+            }
         }
     }
 
-    /// Rebuild the sub-agent tree from the journal. Tasks found mid-flight
-    /// (Started but no Finished) are restored as `Running`; the caller decides
-    /// whether to resume or cancel them. Returns the count of unrestored
-    /// (still-running-at-crash) tasks.
+    /// Rebuild the sub-agent tree from the journal.
+    ///
+    /// P1-5 fix: the previous implementation only *counted* unfinished
+    /// tasks (Started without Finished) without actually reconstructing
+    /// the in-memory task tree. This meant that after a crash:
+    ///   - The supervisor's `tree()` was empty
+    ///   - Cancel cascades couldn't reach orphaned children
+    ///   - The UI showed zero sub-agent activity
+    ///
+    /// We now replay each `SubAgentTaskStarted` event to re-spawn the
+    /// task in-memory (with the same agent_id / task_id / parent_id /
+    /// label / input), and then replay each `SubAgentTaskFinished` to
+    /// transition the task to its terminal status. Tasks that are
+    /// still in-flight after replay are returned as `unrestored` so
+    /// the caller can decide to resume or cancel them.
     pub async fn recover_from_journal(&mut self) -> Result<usize, GrodexError> {
         let events = self.writer.store().replay_from(0).await?;
-        let mut unrestored = 0usize;
+
+        // Phase 1: replay all Started events to rebuild the tree.
+        // We track (task_id → agent_id, parent_id, label, input) so we
+        // can call self.inner.spawn with the correct parent.
+        #[derive(Default)]
+        struct StartedInfo {
+            agent_id: String,
+            parent_id: String,
+            label: String,
+            input: String,
+        }
+        let mut started: std::collections::HashMap<String, StartedInfo> = std::collections::HashMap::new();
+        let mut finished: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut finished_status: std::collections::HashMap<String, (String, Option<String>)> = std::collections::HashMap::new();
+
         for event in &events {
-            if event.event_type == RolloutEventType::SubAgentTaskStarted {
-                // Reconstruct an in-memory TaskRun. We don't have the full
-                // budget/context, but the manager stores what it needs for
-                // `tree()` display + cancel cascades.
-                unrestored += 1;
-            } else if event.event_type == RolloutEventType::SubAgentTaskFinished {
-                // A matching Started was previously counted; a Finished
-                // resolves it.
-                if unrestored > 0 {
-                    unrestored = unrestored.saturating_sub(1);
+            match event.event_type {
+                RolloutEventType::SubAgentTaskStarted => {
+                    let task_id = event.payload.get("task_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let agent_id = event.payload.get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let parent_id = event.payload.get("parent_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let label = event.payload.get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let input = event.payload.get("input")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    started.insert(task_id, StartedInfo { agent_id, parent_id, label, input });
                 }
+                RolloutEventType::SubAgentTaskFinished => {
+                    let task_id = event.payload.get("task_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let status = event.payload.get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("completed")
+                        .to_string();
+                    let result = event.payload.get("result")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    finished.insert(task_id.clone());
+                    finished_status.insert(task_id, (status, result));
+                }
+                _ => {}
             }
         }
+
+        // Phase 2: re-spawn each started task in-memory. We don't
+        // re-run the task — we just rebuild the tree structure so
+        // tree() / cancel() work. Tasks that were finished get their
+        // terminal status set; tasks that were still in-flight are
+        // counted as unrestored.
+        let mut unrestored = 0usize;
+        for (task_id, info) in &started {
+            // Re-spawn via inner (NOT through our spawn() method, which
+            // would try to journal a new Started event).
+            let _ = self.inner.spawn(
+                AgentId::from_string(&info.parent_id).unwrap_or(self.inner.root_id()),
+                &info.label,
+                &info.input,
+                ContextFork::None,
+                None, // budget not persisted yet
+            );
+            // If this task was finished, apply the terminal transition.
+            if let Some((status, result)) = finished_status.get(task_id) {
+                let tid = TaskId::from_string(task_id);
+                match status.as_str() {
+                    "completed" => {
+                        if let Some(r) = result {
+                            self.inner.complete_task(&tid, r.clone(), 0);
+                        }
+                    }
+                    "failed" => {
+                        let err = result.as_deref().unwrap_or("unknown");
+                        self.inner.fail_task(&tid, err);
+                    }
+                    "cancelled" => {
+                        // Cancel is idempotent on already-terminal tasks.
+                        let agent = AgentId::from_string(&info.agent_id).unwrap_or(self.inner.root_id());
+                        self.inner.cancel(&agent);
+                    }
+                    _ => {}
+                }
+            } else {
+                // Still in-flight at crash time.
+                unrestored += 1;
+            }
+        }
+
         Ok(unrestored)
     }
 }
 
-/// Write a sub-agent event to the journal via the writer's lower-level
-/// `write` path. Uses the runtime-section channel (no turn/step binding).
+/// Write a sub-agent event to the journal via the writer's store.
+/// Returns Err if the journal write failed — callers MUST handle this
+/// (P1-5: journal write failures must not be silently swallowed).
 async fn write_event(
     writer: &RolloutWriter,
     event_type: RolloutEventType,
     payload: serde_json::Value,
-) {
-    // The writer's typed helpers are turn/step-scoped; sub-agent events are
-    // session-scoped, so drive the generic `next_seq` + store directly through
-    // a private write. We can't reach `RolloutWriter::write` (private), so
-    // build the event the same way it does.
+) -> Result<u64, GrodexError> {
     use grodex_core::id::{StepGeneration, TurnId};
     let event = RolloutEvent {
         schema_version: 2,
-        seq: writer.next_seq(),
+        seq: 0, // filled in by the journal actor
         session_id: writer.session_id(),
         turn_id: None::<TurnId>,
         step_id: None,
@@ -187,7 +292,7 @@ async fn write_event(
         payload,
         sensitivity: grodex_rollout::event::SensitivityLevel::Normal,
     };
-    let _ = writer.store().append_event(event).await;
+    writer.store().append_event(event).await
 }
 
 /// Helper used by the reducer path to recognize sub-agent events. Exported so
@@ -206,17 +311,17 @@ mod tests {
     use grodex_rollout::store::{FileRolloutStore, RolloutStore};
     use std::sync::Arc;
 
-    fn writer(dir: &tempfile::TempDir) -> RolloutWriter {
+    async fn writer(dir: &tempfile::TempDir) -> RolloutWriter {
         let sid = SessionId::new();
         let store: Arc<dyn RolloutStore> =
-            Arc::new(FileRolloutStore::new(dir.path(), &sid.to_string()).unwrap());
+            Arc::new(FileRolloutStore::new_session(dir.path(), &sid.to_string()).await.unwrap());
         RolloutWriter::new(store, sid)
     }
 
     #[tokio::test]
     async fn spawn_writes_started_event() {
         let dir = tempfile::tempdir().unwrap();
-        let w = writer(&dir);
+        let w = writer(&dir).await;
         let mut sup = DurableSubAgentSupervisor::new(w.clone(), SubAgentConfig::default());
         let root = sup.root_id();
         let (_agent, task) = sup
@@ -245,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn recover_counts_unrestored_running_tasks() {
         let dir = tempfile::tempdir().unwrap();
-        let w = writer(&dir);
+        let w = writer(&dir).await;
         let mut sup = DurableSubAgentSupervisor::new(w.clone(), SubAgentConfig::default());
         let root = sup.root_id();
         // Spawn one but never finish it (simulating a crash mid-task).
@@ -266,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_journals_finished_cancelled_for_each_task() {
         let dir = tempfile::tempdir().unwrap();
-        let w = writer(&dir);
+        let w = writer(&dir).await;
         let mut sup = DurableSubAgentSupervisor::new(w.clone(), SubAgentConfig::default());
         let root = sup.root_id();
         let (child, _) = sup

@@ -364,16 +364,16 @@ mod tests {
     #[test]
     fn seq_gap_detected() {
         let sid = SessionId::new();
-        let events = vec![make_event(
-            sid,
-            5, // gap — should be 0
-            RolloutEventType::RuntimeStateChanged,
-            serde_json::json!({"state": "idle"}),
-        )];
+        // apply_all adapts to the first event's seq (for resume), so a
+        // gap is only detected BETWEEN events — not at the first event.
+        let events = vec![
+            make_event(sid, 0, RolloutEventType::RuntimeStateChanged, serde_json::json!({"state": "idle"})),
+            make_event(sid, 5, RolloutEventType::UserInputAccepted, serde_json::json!({"text": "gap"})),
+        ];
 
         let mut reducer = SessionReducer::new(sid);
         let err = reducer.apply_all(&events).unwrap_err();
-        assert!(matches!(err, ReducerError::SeqGap { .. }));
+        assert!(matches!(err, ReducerError::SeqGap { expected: 1, got: 5 }));
     }
 
     #[test]

@@ -222,6 +222,25 @@ RUST_BACKTRACE=1 cargo test --workspace
 | `/help` | 显示帮助 |
 | `/compact` | 触发上下文压缩 |
 
+### TUI 快捷键
+
+| 按键 | 模式 | 功能 |
+|---|---|---|
+| `i` | Normal | 进入输入模式 |
+| `:` | Normal | 进入命令模式 |
+| `Enter` | Prompt | 发送提示 |
+| `Alt`+`Enter` / `Shift`+`Enter` | Prompt | 插入换行 |
+| `Esc` | Prompt | 返回 Normal 模式 / 取消生成 |
+| `Ctrl`+`C` | Prompt | 取消当前生成（连按两次退出） |
+| `↑`/`↓` 或 `k`/`j` | Normal | 滚动对话 / 导航审批选项 |
+| `Ctrl`+`J` / `Ctrl`+`K` | Prompt | 对话向下/向上滚动 |
+| `PageUp` / `PageDown` | 两者 | 翻页滚动 |
+| `Ctrl`+`O` | 两者 | 展开/收起 CoT（思考过程）面板 |
+| `Ctrl`+`N` / `Ctrl`+`P` | 两者 | 折叠状态下滚动 CoT 内容 |
+| `↑`/`↓` + `Enter` | Normal | 选择并确认审批选项 |
+
+当有待审批项时，`↑`/`↓` 键导航审批选项，`Enter` 确认选择 —— 无需切换中英文输入法按 `a`/`d`/`c` 字母键。
+
 ---
 
 ## 许可证

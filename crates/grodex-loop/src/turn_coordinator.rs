@@ -21,6 +21,8 @@ use grodex_core::context::ContextItem;
 use grodex_core::id::{CommitSequence, OperationId, StepGeneration, StepId, StepSnapshotId, ToolCallId};
 use grodex_core::policy::PolicyDecision;
 use grodex_core::tool::ToolRuntime;
+use grodex_memory::types::{EvidenceStatus, EvidenceUnit, MemoryScope};
+use sha2::Digest;
 use grodex_permission::{
     ApprovalRequestedEvent, ApprovalResolution, LiveRevocationFence, PermissionLease,
     PermissionManager, PermissionPolicy, PermissionResult,
@@ -78,6 +80,10 @@ pub struct TurnCoordinator {
     /// `Arc<tokio::sync::Mutex<>>` so a cloneable coordinator can share
     /// one receiver across sequential turns.
     approval_rx: Arc<Mutex<mpsc::UnboundedReceiver<ApprovalRequestedEvent>>>,
+    /// Optional memory database for evidence capture. When present,
+    /// non-error tool results are written as EvidenceUnit entries so
+    /// they can be retrieved in future turns (Tool Result → Evidence).
+    memory: Option<Arc<grodex_memory::MemoryDatabase>>,
 }
 
 impl TurnCoordinator {
@@ -86,6 +92,13 @@ impl TurnCoordinator {
     /// seq counter stays coherent.
     pub fn with_rollout(mut self, writer: crate::rollout_writer::RolloutWriter) -> Self {
         self.rollout = Some(writer);
+        self
+    }
+
+    /// Attach a memory database for evidence capture (Tool Result → Evidence).
+    /// When set, non-error tool results are persisted as EvidenceUnit entries.
+    pub fn with_memory(mut self, db: Arc<grodex_memory::MemoryDatabase>) -> Self {
+        self.memory = Some(db);
         self
     }
 
@@ -120,6 +133,7 @@ impl TurnCoordinator {
             sandbox: Arc::new(grodex_sandbox::SandboxManager::default()),
             delegation_envelope: None,
             approval_rx,
+            memory: None,
         }
     }
 
@@ -474,11 +488,49 @@ impl TurnCoordinator {
                         // runtime cannot execute (it would silently no-op or
                         // error generically). Refuse to dispatch rather than
                         // emit a misleading "Unknown tool" result.
-                        debug_assert!(
-                            runtime.is_some(),
-                            "invariant #4: tool call {} has no bound capability revision",
-                            name
-                        );
+                        //
+                        // P1-1 fix: the previous code only had a
+                        // `debug_assert!` here, which is a no-op in release
+                        // builds. When `CapabilityManager::get_runtime`
+                        // returns None (e.g. because the bound generation
+                        // was evicted from the ring buffer), we now:
+                        //   1. Write a `CapabilityCallRejectedStale` event
+                        //      to the journal (durable audit trail).
+                        //   2. Push a ToolResult error into the result
+                        //      channel so the model sees a clear failure
+                        //      instead of a silent no-op.
+                        //   3. `continue` to the next tool call.
+                        if runtime.is_none() {
+                            // Write the rejection to the journal.
+                            if let Some(ref writer) = self.rollout {
+                                let _ = writer
+                                    .write_capability_call_rejected_stale(
+                                        Some(turn_ctx.turn_id),
+                                        Some(step_id),
+                                        Some(StepGeneration::new(step_gen)),
+                                        &name,
+                                        step_gen,
+                                        "stale_or_evicted",
+                                    )
+                                    .await;
+                            }
+                            // Push an error result so the model can react.
+                            let _ = tx.send(ToolExecResult {
+                                call_id,
+                                name: name.clone(),
+                                result: ContextItem::ToolResult {
+                                    call_id,
+                                    content: format!(
+                                        "Capability '{name}' (generation {step_gen}) was evicted \
+                                         from the capability ring buffer. The turn must be retried \
+                                         with a fresh capability snapshot."
+                                    ),
+                                    is_error: true,
+                                },
+                                index: CommitSequence::new(idx as u64),
+                            });
+                            continue;
+                        }
 
                         let perm = self.permission.clone();
                         let sb = self.sandbox.clone();
@@ -489,6 +541,12 @@ impl TurnCoordinator {
                         // is distinct from ToolResultCommitted (which fires
                         // after the result is durable) and lets the reducer
                         // detect orphaned tool calls during crash recovery.
+                        //
+                        // Schema v2: we also accept an operation_id per-call
+                        // for tools that support idempotency keys. The
+                        // coordinator does not yet synthesize one for tools
+                        // that don't declare one — future work to push
+                        // operation_id generation into the Capability lookup.
                         if let Some(ref writer) = self.rollout {
                             if let Err(e) = writer
                                 .write_tool_started(
@@ -496,6 +554,7 @@ impl TurnCoordinator {
                                     step_id,
                                     StepGeneration::new(step_gen),
                                     &call_id.to_string(),
+                                    None, // operation_id: synthesized later
                                     &name,
                                 )
                                 .await
@@ -540,10 +599,17 @@ impl TurnCoordinator {
                     while let Some(tr) = result_rx.recv().await {
                         // Record tool execution finish (ToolExecutionFinished) —
                         // the tool has returned, result is about to be persisted.
-                        let tr_is_error = matches!(
-                            &tr.result,
-                            ContextItem::ToolResult { is_error: true, .. }
-                        );
+                        // We now store content / exit_code / duration_ms here
+                        // too so that a crash between this event and
+                        // ToolResultCommitted does NOT force us to re-run
+                        // the side effect: Finished already captures the
+                        // outcome in full.
+                        let (tr_is_error, tr_content, tr_exit_code) = match &tr.result {
+                            ContextItem::ToolResult { content, is_error, .. } => {
+                                (*is_error, Some(content.clone()), None)
+                            }
+                            _ => (false, None, None),
+                        };
                         if let Some(ref writer) = self.rollout {
                             if let Err(e) = writer
                                 .write_tool_execution_finished(
@@ -551,7 +617,12 @@ impl TurnCoordinator {
                                     step_id,
                                     StepGeneration::new(step_gen),
                                     &tr.call_id.to_string(),
+                                    None, // operation_id
                                     tr_is_error,
+                                    tr_content.as_deref(),
+                                    tr_exit_code,
+                                    None, // duration_ms: measured later
+                                    None, // output_truncated
                                 )
                                 .await
                             {
@@ -598,6 +669,7 @@ impl TurnCoordinator {
                                     step_id,
                                     generation,
                                     &tr.call_id.to_string(),
+                                    None, // operation_id
                                     &content,
                                     is_error,
                                 )
@@ -629,8 +701,46 @@ impl TurnCoordinator {
                             }
                         }
                         self.chat_state
-                            .push_tool_result(tr.call_id, content, is_error)
+                            .push_tool_result(tr.call_id, content.clone(), is_error)
                             .await;
+
+                        // P1-3: Tool Result → Evidence capture.
+                        // Non-error, non-empty tool results are indexed as
+                        // EvidenceUnit entries so future turns can retrieve
+                        // "what happened last time" via hybrid RAG. This is
+                        // fail-open: a DB write error logs a warning but
+                        // does NOT abort the turn — evidence is a bonus,
+                        // not a correctness requirement.
+                        if !is_error && !content.is_empty() {
+                            if let Some(ref db) = self.memory {
+                                let mut hasher = sha2::Sha256::new();
+                                hasher.update(content.as_bytes());
+                                let content_hash = format!("{:x}", hasher.finalize());
+                                let unit = EvidenceUnit {
+                                    id: format!("ev_{}_{}", tr.name, tr.call_id),
+                                    rollout_id: turn_ctx.turn_id.to_string(),
+                                    path: format!("tool:{}", tr.name),
+                                    section: tr.call_id.to_string(),
+                                    scope: MemoryScope::Workspace,
+                                    status: EvidenceStatus::Active,
+                                    content: content.clone(),
+                                    content_hash,
+                                    occurred_at: chrono::Utc::now(),
+                                    created_at: chrono::Utc::now(),
+                                    superseded_by: None,
+                                    superseded_at: None,
+                                    rollout_available: true,
+                                    rollout_expired_at: None,
+                                    subchunk_index: 0,
+                                };
+                                if let Err(e) = db.upsert_evidence_unit(&unit) {
+                                    eprintln!(
+                                        "[warn] evidence capture failed for tool '{}': {e}",
+                                        tr.name
+                                    );
+                                }
+                            }
+                        }
                     }
 
                     steps.push(StepResult {
@@ -694,6 +804,21 @@ impl TurnCoordinator {
             c.plan_compaction(context)
         };
         if let Some(plan) = plan {
+            // P1-4: write CompactionStarted BEFORE we do anything else.
+            // On crash, a Started without Committed/Failed means the
+            // compaction was in-flight and must NOT be installed.
+            let pre_count = context.len();
+            if let Some(ref writer) = self.rollout {
+                if let Err(e) = writer
+                    .write_compaction_started(Some(turn_ctx.turn_id), "token_budget", pre_count)
+                    .await
+                {
+                    eprintln!("[warn] rollout write_compaction_started failed: {e}");
+                    // If we can't even write Started, abort compaction.
+                    return;
+                }
+            }
+
             let (sys, user) = CompactionManager::build_compaction_prompt(&plan);
             let compact_req = CanonicalModelRequest {
                 request_id: format!("compact_{}", StepId::new()),
@@ -730,6 +855,19 @@ impl TurnCoordinator {
                     let rebuilt = CompactionManager::rebuild_context(
                         preserved, &result, &capsule, plan.items_to_keep,
                     );
+
+                    // P1-4: write CompactionCandidateBuilt BEFORE
+                    // attempting the commit.
+                    if let Some(ref writer) = self.rollout {
+                        let _ = writer
+                            .write_compaction_candidate_built(
+                                Some(turn_ctx.turn_id),
+                                rebuilt.len(),
+                                summary,
+                            )
+                            .await;
+                    }
+
                     // Persist CompactionCommitted BEFORE swapping the in-memory
                     // transcript: if the journal write fails we must NOT
                     // replace the projection, or the live context and the
@@ -743,9 +881,15 @@ impl TurnCoordinator {
                             Ok(_) => {}
                             Err(e) => {
                                 // Journal write failed — keep the old context.
-                                // Surface the error via the compaction manager
-                                // result so the caller knows compaction was
-                                // skipped. We do NOT mutate chat_state.
+                                // P1-4: write CompactionFailed so resume
+                                // knows this was an explicit abort, not an
+                                // in-flight crash.
+                                let _ = writer
+                                    .write_compaction_failed(
+                                        Some(turn_ctx.turn_id),
+                                        &format!("journal write failed: {e}"),
+                                    )
+                                    .await;
                                 eprintln!("warn: rollout journal write failed (CompactionCommitted): {e}; keeping pre-compaction context");
                                 abort_compaction = true;
                             }
@@ -754,6 +898,29 @@ impl TurnCoordinator {
                     if !abort_compaction {
                         self.chat_state.replace_conversation(rebuilt, true).await;
                     }
+                } else {
+                    // P1-4: summary was not effective — record as Failed
+                    // so resume knows the compaction cycle terminated
+                    // without installing a candidate.
+                    if let Some(ref writer) = self.rollout {
+                        let _ = writer
+                            .write_compaction_failed(
+                                Some(turn_ctx.turn_id),
+                                "summary_not_effective",
+                            )
+                            .await;
+                    }
+                }
+            } else {
+                // P1-4: model returned no response — record as Failed.
+                let reason = match &outcome.error {
+                    Some(e) => format!("model error: {e}"),
+                    None => "no response".to_string(),
+                };
+                if let Some(ref writer) = self.rollout {
+                    let _ = writer
+                        .write_compaction_failed(Some(turn_ctx.turn_id), &reason)
+                        .await;
                 }
             }
         }

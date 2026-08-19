@@ -36,7 +36,7 @@ use grodex_loop::{Session, SessionHandle, SessionSupervisor, TurnCoordinator};
 use grodex_permission::{PermissionManager, PermissionPolicy, PolicyRule};
 use grodex_provider::descriptor::WireProtocol;
 use grodex_rollout::store::{FileRolloutStore, RolloutStore};
-use grodex_sampler::{SamplingActor, SamplingClient, SamplingClientConfig};
+use grodex_sampler::{ModelRoute, SamplingActor, SamplingClient, SamplingClientConfig};
 use grodex_sandbox::SandboxRuntimeClient;
 use grodex_subagent::supervisor::SubAgentConfig;
 use grodex_tools::{ApplyPatchTool, EditTool, ExecTool, ReadFileTool, WriteFileTool};
@@ -76,6 +76,10 @@ pub struct SessionRuntimeBuilder {
     /// resolved provider/model from CLI flags). When `None`, the builder
     /// derives it from the loaded config (config.toml > env > defaults).
     model_config_override: Option<ModelConfig>,
+    /// Provider failover route built from `[model_routes.default]` TOML.
+    /// When `Some`, the SamplingActor is wired with this route so that
+    /// `RetryDecision::FailoverToNextCandidate` can switch candidates.
+    model_route: Option<ModelRoute>,
 }
 
 impl SessionRuntimeBuilder {
@@ -85,6 +89,7 @@ impl SessionRuntimeBuilder {
             trusted_override: None,
             recovered_context: None,
             model_config_override: None,
+            model_route: None,
         }
     }
 
@@ -111,6 +116,14 @@ impl SessionRuntimeBuilder {
     /// Override the model config (provider/model/wire) from CLI flags.
     pub fn with_model_config(mut self, cfg: ModelConfig) -> Self {
         self.model_config_override = Some(cfg);
+        self
+    }
+
+    /// Inject a provider failover route (from `[model_routes.default]`).
+    /// When set, the SamplingActor will be able to fail over to the next
+    /// candidate on `RetryDecision::FailoverToNextCandidate`.
+    pub fn with_model_route(mut self, route: Option<ModelRoute>) -> Self {
+        self.model_route = route;
         self
     }
 
@@ -183,6 +196,11 @@ impl SessionRuntimeBuilder {
         })();
 
         // ── 3. SamplingActor ───────────────────────────────────────
+        // Resolve the effective ModelRoute: explicit caller override takes
+        // priority; otherwise derive from `[model_routes.default]` config
+        // so both CLI REPL and ACP `serve_acp` get failover support.
+        let model_route = self.model_route.clone()
+            .or_else(|| route_toml.as_ref().map(|r| r.to_model_route()));
         let client_config = SamplingClientConfig {
             api_key,
             endpoint,
@@ -194,8 +212,15 @@ impl SessionRuntimeBuilder {
         // its own sampling turns. reqwest::Client::clone shares the
         // connection pool — cheap.
         let sub_client = client.clone();
-        let actor = SamplingActor::new(client);
-        let sub_actor = Arc::new(SamplingActor::new(sub_client));
+        let mut actor = SamplingActor::new(client);
+        if let Some(route) = model_route.clone() {
+            actor = actor.with_route(route);
+        }
+        let mut sub_actor = SamplingActor::new(sub_client);
+        if let Some(route) = model_route.clone() {
+            sub_actor = sub_actor.with_route(route);
+        }
+        let sub_actor = Arc::new(sub_actor);
         let chat_state = ChatStateActor::spawn();
 
         // ── 4. PermissionManager (policy from config `[rules]`) ────
@@ -318,7 +343,8 @@ impl SessionRuntimeBuilder {
         let session_id = session.id;
         let session_id_str = session_id.to_string();
         let base_dir = FileRolloutStore::default_dir();
-        let rollout: Option<Arc<dyn RolloutStore>> = FileRolloutStore::new(&base_dir, &session_id_str)
+        let rollout: Option<Arc<dyn RolloutStore>> = FileRolloutStore::new_session(&base_dir, &session_id_str)
+            .await
             .ok()
             .map(|s| Arc::new(s) as Arc<dyn RolloutStore>);
         let writer = rollout
@@ -490,6 +516,16 @@ impl SessionRuntimeBuilder {
                 Ok(model) => Some(Arc::new(model) as Arc<dyn grodex_memory::EmbeddingModel + Send + Sync>),
                 Err(_) => None, // not configured — pure FTS5
             }
+        };
+
+        // P1-3: Wire the memory database into the TurnCoordinator so
+        // non-error tool results are captured as EvidenceUnit entries
+        // (Tool Result → Evidence). The supervisor separately uses the
+        // same `memory` Arc for RAG retrieval in the prompt.
+        let coordinator = if let Some(ref db) = memory {
+            coordinator.with_memory(db.clone())
+        } else {
+            coordinator
         };
 
         // ── Supervisor ─────────────────────────────────────────────

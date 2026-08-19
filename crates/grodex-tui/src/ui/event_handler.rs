@@ -16,7 +16,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::render::display_width;
-use super::state::{BUILTIN_SLASH_COMMANDS, CTRL_C_QUICK_WINDOW_MS, InputMode, SlashLocalKind, TuiAppState};
+use super::state::{ApprovalOption, BUILTIN_SLASH_COMMANDS, CTRL_C_QUICK_WINDOW_MS, InputMode, SlashLocalKind, TuiAppState};
 use grodex_protocol::acp::ApprovalResolution;
 
 #[derive(Debug)]
@@ -38,6 +38,11 @@ pub enum TuiAction {
     /// Cancel the currently-streaming turn. Sends `Command::Cancel` to the
     /// agent so it stops generating. No-op when not streaming.
     CancelTurn,
+    /// Toggle the expansion of the most-recent Thinking (CoT) block.
+    /// When expanded, the full CoT text is rendered (scrollable via
+    /// normal conversation scroll). When collapsed, truncated to
+    /// MAX_LINES=12 / MAX_CHARS=1400 with a hint.
+    ToggleThinkingExpansion,
     /// A slash-command was resolved locally. The main loop applies this
     /// immediately (no round-trip through the agent).
     RunSlashLocal { kind: SlashLocalKind, args: String },
@@ -202,6 +207,19 @@ fn handle_normal(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             state.scroll_conversation = u16::MAX;
             Some(TuiAction::ScrollDown)
         }
+        // Ctrl-N / Ctrl-P = scroll the most-recent Thinking (CoT) block
+        // **when collapsed**. When expanded the conversation scroll (j/k,
+        // PageUp/Down) handles navigation instead. These must appear
+        // BEFORE the generic `(Char('n'), _)` arm which handles approval
+        // Narrow — otherwise Ctrl-N would be swallowed by that branch.
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            state.thinking_scroll_down();
+            Some(TuiAction::ScrollDown)
+        }
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            state.thinking_scroll_up();
+            Some(TuiAction::ScrollUp)
+        }
         (KeyCode::Char('a'), _) => {
             if !state.pending_approvals.is_empty() {
                 Some(TuiAction::ResolveApproval {
@@ -251,6 +269,10 @@ fn handle_normal(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
         (KeyCode::PageDown, _) => {
             state.scroll_down(None);
             Some(TuiAction::ScrollDown)
+        }
+        (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+            state.thinking_expanded = !state.thinking_expanded;
+            Some(TuiAction::ToggleThinkingExpansion)
         }
         _ => None,
     }
@@ -318,6 +340,46 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
         _ => {}
     }
 
+    // ── Approval navigation layer (Prompt mode) ────────────────────────
+    // When there are pending approvals, ↑/↓ navigates the option list
+    // and Enter confirms the highlighted option. This mirrors codex's
+    // list-selection approval UX and avoids letter-key shortcuts that
+    // conflict with IME (Chinese input method) text entry.
+    if !state.pending_approvals.is_empty()
+        && key.modifiers == KeyModifiers::NONE
+    {
+        match key.code {
+            KeyCode::Up => {
+                if state.approval_option_idx > 0 {
+                    state.approval_option_idx -= 1;
+                }
+                return None;
+            }
+            KeyCode::Down => {
+                if state.approval_option_idx < ApprovalOption::ALL.len() - 1 {
+                    state.approval_option_idx += 1;
+                }
+                return None;
+            }
+            KeyCode::Enter => {
+                let opt = state.current_approval_option();
+                let res = match opt {
+                    ApprovalOption::Allow => ApprovalResolution::Allow,
+                    ApprovalOption::Deny => ApprovalResolution::Deny,
+                    ApprovalOption::Cancel => ApprovalResolution::Cancel,
+                    ApprovalOption::Narrow => ApprovalResolution::Narrow {
+                        narrowed_args: serde_json::Value::Null,
+                    },
+                };
+                return Some(TuiAction::ResolveApproval {
+                    ticket_idx: state.selected_approval_idx,
+                    resolution: res,
+                });
+            }
+            _ => {}
+        }
+    }
+
     let ret = match key.code {
         // ——— macOS ⌘ Cmd shortcuts (SUPER modifier) — runs before
         //    anything else so Ctrl-C can still mean "cancel turn" even
@@ -338,9 +400,21 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
         }
         KeyCode::Esc => {
             if state.is_streaming() {
-                // Esc while streaming = cancel the turn (don't exit to
-                // Normal, user might want to keep their draft).
-                Some(TuiAction::CancelTurn)
+                // If there are pending approvals, Esc switches to Normal
+                // mode so the user can press a/d/c/n to resolve — NOT
+                // cancel the turn (which would leave the tool blocked).
+                if !state.pending_approvals.is_empty() {
+                    state.input_mode = InputMode::Normal;
+                    Some(TuiAction::ToggleMode(InputMode::Normal))
+                } else if state.cancel_sent {
+                    // Already cancelled — don't send duplicate Cancel
+                    // commands (causes "invalid state transition: Idle -> Idle").
+                    None
+                } else {
+                    // Esc while streaming = cancel the turn (don't exit to
+                    // Normal, user might want to keep their draft).
+                    Some(TuiAction::CancelTurn)
+                }
             } else {
                 state.input_mode = InputMode::Normal;
                 state.input_buffer.clear();
@@ -491,6 +565,25 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             state.input_buffer.drain(0..state.input_cursor);
             state.input_cursor = 0;
             None
+        }
+        // Ctrl-O = toggle Thinking (CoT) expansion. Works in Prompt mode
+        // so the user doesn't have to Esc → Normal just to peek at the
+        // full reasoning trace.
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.thinking_expanded = !state.thinking_expanded;
+            Some(TuiAction::ToggleThinkingExpansion)
+        }
+        // Ctrl-N / Ctrl-P = scroll the collapsed Thinking (CoT) block.
+        // Only active when the slash menu is closed (the slash-menu
+        // capture layer above already handles these when the menu is
+        // open for command navigation).
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.thinking_scroll_down();
+            Some(TuiAction::ScrollDown)
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.thinking_scroll_up();
+            Some(TuiAction::ScrollUp)
         }
         // Note: Ctrl-K is bound to scroll-up (see above), not readline
         // kill-to-end. Use Ctrl-U to clear from start to cursor.

@@ -47,9 +47,9 @@ pub fn approvals_desired_rows(count: usize) -> u16 {
     if count == 0 {
         0
     } else {
-        // 1 header row + 2 rows per approval (headline + summary). Cap at 6 so
-        // a long approval backlog never starves chat + prompt.
-        (1 + count * 2).min(6) as u16
+        // 2 (top+bottom border) + 1 headline + 1 summary + 1 separator
+        // + 4 option rows + 1 hint footer = 10. Cap at 10.
+        10
     }
 }
 
@@ -181,8 +181,8 @@ mod tests {
     #[test]
     fn approvals_rows_scales_and_caps() {
         assert_eq!(approvals_desired_rows(0), 0);
-        assert_eq!(approvals_desired_rows(1), 3); // 1 + 1*2
-        assert_eq!(approvals_desired_rows(100), 6); // cap
+        assert_eq!(approvals_desired_rows(1), 10);
+        assert_eq!(approvals_desired_rows(100), 10); // fixed
     }
 
     #[test]

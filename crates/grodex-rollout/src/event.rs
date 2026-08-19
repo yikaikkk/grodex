@@ -14,13 +14,53 @@ pub enum RolloutEventType {
     /// The model produced one or more content items.
     ModelItemProduced,
     /// A tool call was parsed and validated.
+    ///
+    /// Schema (payload):
+    ///   - call_id: str          — per-invocation correlation key (matching 1:1 with a `ToolCall` object)
+    ///   - operation_id: str?    — idempotency / side-effect key; cross-restart dedup happens on THIS key
+    ///   - name: str             — tool name
+    ///   - args: Value           — the full args JSON as prepared by the model (+ narrow)
+    ///   - args_hash: str?       — SHA-256 of canonical(args); used to detect drift
+    ///   - capability_revision: str?  — generation/snapshot of the capability registry at the time
+    ///   - policy_generation: u64?    — version of the permission policy evaluated to reach Approved
     ToolCallPrepared,
+    /// A prepared tool call was approved (either auto-approved or by a
+    /// human broker response). This is the durable "go ahead" signal
+    /// that the executor consumes immediately before spawning the tool.
+    ///
+    /// Schema: same keys as ToolCallPrepared (call_id + operation_id are
+    /// required).
+    ToolCallApproved,
     /// Execution of a tool started.
+    ///
+    /// Schema: call_id, operation_id?, name
     ToolExecutionStarted,
     /// Execution of a tool finished (success or error).
+    ///
+    /// Schema: call_id, operation_id?, is_error, content?, exit_code?, duration_ms?, output_truncated?
     ToolExecutionFinished,
     /// A tool result was committed to the session transcript.
+    ///
+    /// Schema: call_id, operation_id?, is_error, content
     ToolResultCommitted,
+    /// The system recovered from a crash and cannot determine whether a
+    /// started-but-not-finished side effect actually took place. Any
+    /// execution of the call from this point on MUST first get a
+    /// `ToolOutcomeResolved` event written by the human-resolution
+    /// protocol.
+    ///
+    /// Schema: call_id, operation_id?, name, reason: str
+    ToolOutcomeIndeterminate,
+    /// A human (or external arbiter) resolved an indeterminate tool
+    /// outcome.
+    ///
+    /// Schema:
+    ///   - call_id, operation_id?
+    ///   - resolution: "confirmed_executed" | "confirmed_not_executed" | "terminated"
+    ///   - resolved_content?: str (result of the side-effect if confirmed)
+    ///   - resolver_id?: str
+    ///   - resolved_at: RFC3339 timestamp (redundant with event.timestamp, kept for UI convenience)
+    ToolOutcomeResolved,
     /// Old context items were pruned from the projection.
     ProjectionPruned,
     /// Runtime state changed (e.g. Idle → Running).
@@ -55,6 +95,42 @@ pub enum RolloutEventType {
     /// Written at the start of a new session so a second crash does not lose
     /// the recovered history. The payload is a serialized `Vec<ContextItem>`.
     ContextRestored,
+    /// The supervisor submitted a tool call for human/automated approval.
+    /// Schema:
+    ///   - call_id, operation_id?
+    ///   - ticket_id: str  — stable identifier in the approval broker
+    ///   - tool_name, args
+    ///   - requested_by: "supervisor" | "model" | "human_delegate"
+    ///   - requested_at: RFC3339
+    ApprovalRequested,
+    /// An outstanding approval ticket reached a terminal resolution
+    /// (approved | rejected | expired).
+    /// Schema:
+    ///   - ticket_id
+    ///   - call_id?
+    ///   - resolution: "approved" | "rejected" | "expired" | "narrowed"
+    ///   - resolved_by: str?
+    ///   - narrowed_args?: Value  (only populated for resolution="narrowed")
+    ApprovalResolved,
+    /// The broker issued a one-time lease for a (call_id, ticket_id).
+    /// The lease is valid exactly once; replaying the same lease after
+    /// the session has already consumed it MUST be rejected.
+    /// Schema:
+    ///   - lease_id: str
+    ///   - ticket_id: str
+    ///   - call_id
+    ///   - ttl_secs?: u64
+    ///   - issued_at: RFC3339
+    LeaseIssued,
+    /// A lease was consumed by the executor to actually run the tool.
+    /// Once this event is on disk, reissuance with the same lease_id is
+    /// forbidden — the consumer is expected to verify
+    /// `!is_lease_consumed(lease_id)` before taking the side-effect path.
+    /// Schema: lease_id, call_id, consumed_at: RFC3339
+    LeaseConsumed,
+    /// A lease reached its TTL without a matching LeaseConsumed (or the
+    /// owning ticket expired). Schema: lease_id, reason
+    LeaseExpired,
 }
 
 /// Sensitivity classification for an event.

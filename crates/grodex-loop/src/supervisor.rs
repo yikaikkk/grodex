@@ -16,8 +16,10 @@ use grodex_core::context::ContextItem;
 use grodex_core::policy::PolicyDecision;
 use grodex_core::state::SessionState;
 use grodex_permission::PermissionManager;
+use grodex_prompt::manifest::InstructionNode;
 use grodex_provider::descriptor::WireProtocol;
 use grodex_sampler::StreamFragment;
+use grodex_skills::SkillCatalog;
 
 /// Model configuration for Turn creation.
 #[derive(Debug, Clone)]
@@ -88,6 +90,15 @@ pub struct SessionSupervisor {
     /// half). Without this handle the tool future parked on
     /// `decision_rx` would time out and the approval would be a no-op.
     permission: Arc<Mutex<PermissionManager>>,
+    /// Cached SkillCatalog — discovered once from project + user paths,
+    /// reused across turns so we don't walk the filesystem every prompt.
+    /// P1-2: without this cache, `with_skills()` was never called at all,
+    /// so skills were invisible to the model.
+    skill_catalog: Option<SkillCatalog>,
+    /// Cached instruction discovery nodes (AGENTS.md / .agent/rules).
+    /// Discovered once per session, reused across turns — the filesystem
+    /// walk is the expensive part; `build()` is just string assembly.
+    cached_discovered_nodes: Option<Vec<InstructionNode>>,
 }
 
 impl SessionSupervisor {
@@ -143,6 +154,8 @@ impl SessionSupervisor {
             current_turn_handle: None,
             current_turn_cancel: None,
             permission,
+            skill_catalog: None,
+            cached_discovered_nodes: None,
         };
 
         let handle = SessionHandle { cmd_tx, event_rx };
@@ -255,7 +268,7 @@ impl SessionSupervisor {
                 self.cancel_turn().await;
                 true
             }
-            SessionCommand::ResolveApproval { ticket_id, decision, narrowed_args: _ } => {
+            SessionCommand::ResolveApproval { ticket_id, decision, narrowed_args } => {
                 // Design Doc 16 §10 (second half) + Doc 17 §9 — the
                 // frontend resolved an approval ticket. Forward the
                 // decision to the SAME PermissionManager the
@@ -266,13 +279,76 @@ impl SessionSupervisor {
                 // `execute_single_tool` is then free to mint its
                 // PermissionLease and run.
                 //
-                // `narrowed_args` is currently consumed by the live
-                // revalidation path inside the tool future (the broker
-                // only carries a flat PolicyDecision); full Narrow
-                // support that re-runs schema/policy on revised args is
-                // a later phase (Doc 16 §10 "Narrow" paragraph).
+                // P0-4 FIX: narrowed_args must NOT be silently dropped.
+                // We do three things with it:
+                //   1. Pass `narrowed_args` into permission.resolve so
+                //      the broker overwrites the ticket's stored
+                //      arguments snapshot (persisted in SQLite).
+                //   2. Write an ApprovalResolved rollout event with the
+                //      narrowed_args so replay sees the same resolution
+                //      the live session saw.
+                //   3. Write an EffectiveToolCallRevisionCreated event
+                //      so the tool future / coordinator can look up the
+                //      narrowed args when building the actual invocation.
                 let accepted = matches!(decision, PolicyDecision::Allow);
-                let resolved = self.permission.lock().await.resolve(&ticket_id, decision);
+                let resolution_str = match (&decision, narrowed_args.is_some()) {
+                    (PolicyDecision::Deny, _) => "rejected",
+                    (PolicyDecision::Ask, _)  => "rejected", // Ask should never appear in resolve()
+                    (PolicyDecision::Allow, true) => "narrowed",
+                    (PolicyDecision::Allow, false) => "approved",
+                };
+
+                // Look up the pending ticket's associated tool_call_id /
+                // tool_name now so we can annotate both rollout events.
+                // The in-memory ticket is about to be removed by
+                // resolve() below, so snapshot first.
+                let pending = self.permission.lock().await
+                    .pending_ticket_info(&ticket_id);
+                let call_id = pending.as_ref().and_then(|p| p.call_id.as_deref());
+                let tool_name = pending.as_ref().and_then(|p| p.tool_name.as_deref());
+
+                // (2) Persist ApprovalResolved to journal BEFORE
+                // calling resolve() — if we crash between the broker
+                // accept and the journal write, resume would see a
+                // missing resolution and re-prompt the user.
+                if let Some(ref writer) = self.writer {
+                    let write_res = writer
+                        .write_approval_resolved(
+                            &ticket_id,
+                            call_id,
+                            resolution_str,
+                            None, // resolved_by: UI sets later for audit
+                            narrowed_args.as_ref(),
+                        )
+                        .await;
+                    if let Err(e) = write_res {
+                        eprintln!("[warn] rollout write_approval_resolved failed: {e}");
+                    }
+                }
+
+                // (3) EffectiveToolCallRevisionCreated — durable record
+                // that the tool invocation going forward uses the
+                // narrowed args, NOT the original model-issued ones.
+                // The revision number increments on each narrow.
+                if let (Some(writer), Some(cid), Some(na)) =
+                    (&self.writer, call_id, &narrowed_args)
+                {
+                    let write_res = writer
+                        .write_effective_tool_call_revision(
+                            cid,
+                            tool_name,
+                            1u64, // revision 1 = first narrow
+                            na,
+                        )
+                        .await;
+                    if let Err(e) = write_res {
+                        eprintln!("[warn] rollout write_effective_tool_call_revision failed: {e}");
+                    }
+                }
+
+                // (1) Finally tell the broker to apply the decision +
+                // update arguments_snapshot in SQLite.
+                let resolved = self.permission.lock().await.resolve(&ticket_id, decision, narrowed_args);
                 let _ = self.event_tx
                     .send(SessionEvent::ApprovalResolved {
                         ticket_id,
@@ -592,15 +668,30 @@ impl SessionSupervisor {
 
         // Build system instructions via PromptBuilder + Memory + Discovery.
         //
+        // P1-2: SkillCatalog and instruction discovery are cached across
+        // turns — the filesystem walk is the expensive part, and the
+        // skill set / AGENTS.md content don't change mid-session. Only
+        // memory retrieval runs per-turn (query depends on user input).
+        //
         // Discovery (Design Doc 19 §7) walks three layers:
         //   1. Fixed roots (~/.agent/AGENTS.md, ~/.agent/rules/*.md)
         //   2. Workspace chain (root→cwd scanning AGENTS.md + .agent/rules)
         //   3. Compatibility (.grok/.codex/.claude/.cursor)
         // Untrusted workspace content is excluded (fail-closed).
-        // Without this call, AGENTS.md / .agent/rules are never injected
-        // into the live prompt — the model cannot see project instructions.
-        let mut builder = grodex_prompt::PromptBuilder::new();
-        builder.discover_instructions(&self.cwd, self.workspace_trusted);
+        if self.skill_catalog.is_none() {
+            self.skill_catalog = Some(SkillCatalog::discover(&self.cwd));
+        }
+        if self.cached_discovered_nodes.is_none() {
+            let mut tmp = grodex_prompt::PromptBuilder::new();
+            tmp.discover_instructions(&self.cwd, self.workspace_trusted);
+            self.cached_discovered_nodes = Some(tmp.discovered_nodes().to_vec());
+        }
+
+        let mut builder = grodex_prompt::PromptBuilder::new()
+            .with_skills(self.skill_catalog.clone().unwrap_or_default())
+            .with_discovered_nodes(
+                self.cached_discovered_nodes.clone().unwrap_or_default(),
+            );
         if let Some(ref db) = self.memory {
             // Hybrid RRF retrieval (FTS5 + vector, fail-open to pure FTS).
             // emb=None → vector list empty → RRF degrades to pure FTS5 ranking.
@@ -761,6 +852,9 @@ impl SessionSupervisor {
     }
 
     async fn cancel_turn(&mut self) {
+        let had_turn = self.current_turn_handle.is_some();
+        // Capture turn_id BEFORE session.cancel_turn() clears current_turn.
+        let turn_id = self.session.current_turn.as_ref().map(|t| t.id);
         if let Some(handle) = self.current_turn_handle.take() {
             if let Some(token) = self.current_turn_cancel.take() {
                 token.cancel();
@@ -780,6 +874,16 @@ impl SessionSupervisor {
         );
         if let Err(e) = self.session.cancel_turn() {
             let _ = self.event_tx.send(SessionEvent::Error { message: e }).await;
+        }
+        // Notify the frontend that the turn is over so it stops the
+        // streaming indicator and marks in-flight tool cards as done.
+        // Without this, the TUI shows "⏳ working… 3m09s" forever because
+        // the aborted turn task never reaches handle_turn_completion()
+        // which normally emits TurnCompleted.
+        if had_turn {
+            let _ = self.event_tx.send(SessionEvent::TurnCompleted {
+                turn_id: turn_id.unwrap_or_default(),
+            }).await;
         }
     }
 

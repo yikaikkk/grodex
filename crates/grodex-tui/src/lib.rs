@@ -507,6 +507,8 @@ impl GrodexTui {
                             TuiAction::SubmitPrompt { text } => {
                                 // Show user message in chat view immediately.
                                 self.state.push_user_message(&text);
+                                // Reset cancel flag for the new turn.
+                                self.state.cancel_sent = false;
                                 let sid = self
                                     .state
                                     .session_id
@@ -563,16 +565,6 @@ impl GrodexTui {
                                             "发送 ResolveApproval 失败: {e}"
                                         ));
                                     } else {
-                                        let res_label = match &resolution {
-                                            ApprovalResolution::Allow => "Allow",
-                                            ApprovalResolution::Deny => "Deny",
-                                            ApprovalResolution::Cancel => "Cancel",
-                                            ApprovalResolution::Narrow { .. } => "Narrow",
-                                        };
-                                        self.state.push_log(format!(
-                                            "已提交审批 {}: {}",
-                                            res_label, ticket.ticket_id
-                                        ));
                                         self.state.resolve_ticket(&ticket.ticket_id);
                                     }
                                 }
@@ -580,6 +572,7 @@ impl GrodexTui {
                             TuiAction::ScrollUp | TuiAction::ScrollDown => {}
                             TuiAction::SwitchApprovalSelection(_) => {}
                             TuiAction::ToggleMode(_) => {}
+                            TuiAction::ToggleThinkingExpansion => {}
                             TuiAction::CopyLastAssistant => {
                                 // Walk messages in reverse and grab the
                                 // most-recent Assistant text. If the
@@ -684,6 +677,13 @@ impl GrodexTui {
                                 }
                             }
                             TuiAction::CancelTurn => {
+                                // Idempotent guard: once Cancel has been sent,
+                                // suppress duplicates until TurnComplete resets
+                                // the flag. This prevents the repeated
+                                // "已中断当前生成" log + "invalid state
+                                // transition: Idle -> Idle" errors when the
+                                // user presses Esc multiple times.
+                                if !self.state.cancel_sent {
                                 let sid = self
                                     .state
                                     .session_id
@@ -699,6 +699,7 @@ impl GrodexTui {
                                 if let Err(e) = self.transport.send_command(cmd) {
                                     self.state.push_log(format!("发送 Cancel 失败: {e}"));
                                 } else {
+                                    self.state.cancel_sent = true;
                                     // Mark the latest Assistant message as done
                                     // so the streaming indicator stops,
                                     // even if TurnComplete hasn't arrived yet.
@@ -708,8 +709,12 @@ impl GrodexTui {
                                             break;
                                         }
                                     }
+                                    // Freeze all in-flight tool timers immediately
+                                    // so "⏳ working… 3m09s" stops ticking.
+                                    self.state.finalize_all_inflight_tools();
                                     self.state.push_log("已中断当前生成".to_string());
                                 }
+                                } // end if !cancel_sent
                             }
                             TuiAction::RunSlashLocal { kind, args } => {
                                 // ══════════════════════════════════════════════════════════

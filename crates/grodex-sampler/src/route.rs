@@ -111,6 +111,7 @@ impl ModelCandidate {
 /// Once a candidate succeeds, the route "sticks" to it for the
 /// remainder of the sticky scope. The next scope cycle starts
 /// from the highest priority again.
+#[derive(Clone)]
 pub struct ModelRoute {
     /// Candidates sorted by priority.
     candidates: Vec<ModelCandidate>,

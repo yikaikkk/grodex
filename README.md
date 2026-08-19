@@ -222,6 +222,25 @@ Key test categories:
 | `/help` | Show help |
 | `/compact` | Trigger context compaction |
 
+### TUI Keybindings
+
+| Key | Mode | Action |
+|---|---|---|
+| `i` | Normal | Enter prompt mode |
+| `:` | Normal | Enter command mode |
+| `Enter` | Prompt | Send prompt |
+| `Alt`+`Enter` / `Shift`+`Enter` | Prompt | Insert newline |
+| `Esc` | Prompt | Return to Normal mode / cancel streaming |
+| `Ctrl`+`C` | Prompt | Cancel streaming turn (or quit with double press) |
+| `↑`/`↓` or `k`/`j` | Normal | Scroll conversation / navigate approvals |
+| `Ctrl`+`J` / `Ctrl`+`K` | Prompt | Scroll conversation down/up |
+| `PageUp` / `PageDown` | Both | Page scroll |
+| `Ctrl`+`O` | Both | Toggle CoT (Thinking) panel expand/collapse |
+| `Ctrl`+`N` / `Ctrl`+`P` | Both | Scroll collapsed CoT panel down/up |
+| `↑`/`↓` + `Enter` | Normal | Select and confirm approval option |
+
+When an approval is pending, the `↑`/`↓` keys navigate the approval options and `Enter` confirms the selection — no need to switch input methods for `a`/`d`/`c` letters.
+
 ---
 
 ## License

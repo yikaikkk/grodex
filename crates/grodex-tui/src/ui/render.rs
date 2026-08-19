@@ -36,7 +36,7 @@ use ratatui::widgets::{Block, Borders as B, Paragraph, Wrap, List, ListItem};
 use ratatui::Frame;
 
 use super::layout::AppLayout;
-use super::state::{BUILTIN_SLASH_COMMANDS, ChatMessage, InputMode, TuiAppState};
+use super::state::{ApprovalOption, BUILTIN_SLASH_COMMANDS, ChatMessage, InputMode, TuiAppState};
 
 // ── Palette ───────────────────────────────────────────────────────────
 // 使用终端命名颜色而非硬编码 RGB，让终端自动适配深色/浅色主题。
@@ -662,46 +662,89 @@ fn render_status_bar(f: &mut Frame<'_>, state: &TuiAppState, area: Rect) {
 }
 
 // ── 2. Pending approvals pane ───────────────────────────────────────────
+//
+// Codex-style approval overlay: a bordered card showing the pending
+// approval(s) + a selectable list of decisions (Allow / Deny / Cancel /
+// Narrow). The user navigates with j/k (or ↑/↓) and confirms with Enter.
+// No letter-key shortcuts — this avoids IME (Chinese input) conflicts
+// where pressing 'a'/'d' would otherwise be captured as a command.
 
 fn render_approvals_pane(f: &mut Frame<'_>, state: &TuiAppState, area: Rect) {
     if area.is_empty() { return; }
+    let n = state.pending_approvals.len();
     let title = Line::from(vec![
         Span::raw(" "),
-        style_s(c_warn().add_modifier(Modifier::BOLD), "⚠ Pending approvals"),
+        style_s(c_warn().add_modifier(Modifier::BOLD), "⚠ Pending approval"),
+        Span::raw(" "),
+        style_s(c_dim(), format!("({n})")),
     ]);
     let block = Block::default()
         .title(title)
-        .borders(B::TOP | B::BOTTOM)
-        .border_style(Style::default().fg(c_footer_top()));
+        .borders(B::ALL)
+        .border_style(c_warn());
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.is_empty() || inner.height == 0 { return; }
 
     let max_rows = inner.height as usize;
     let mut rows: Vec<Line> = Vec::with_capacity(max_rows);
-    for (i, r) in state.pending_approvals.iter().enumerate() {
-        if rows.len() >= max_rows { break; }
-        let sel_style = if i == state.selected_approval_idx {
-            c_approval_bg_sel()
-        } else { Style::default() };
-        let headline = Line::from(vec![
-            style_s(sel_style, format!("  #{i} ")),
+
+    // Show the currently selected approval card (headline + summary).
+    if let Some(r) = state.pending_approvals.get(state.selected_approval_idx) {
+        rows.push(Line::from(vec![
+            Span::raw(" "),
             style_s(c_tool_name().add_modifier(Modifier::BOLD), format!("{}()", r.tool_name)),
             Span::raw("  "),
             style_s(c_error(), format!("[{}]", r.risk)),
             Span::raw("  "),
             style_s(c_dim(), format!("~{}s", r.remaining_s)),
-        ]);
-        rows.push(headline);
-        if rows.len() >= max_rows { break; }
-        let sum_w = (inner.width.max(6) as usize).saturating_sub(4);
-        for line in wrap_str(&r.summary, sum_w).into_iter().take(1) {
-            rows.push(Line::from(vec![
-                Span::raw("    "),
-                style_s(c_muted(), line),
-            ]));
+        ]));
+        if rows.len() < max_rows {
+            let sum_w = (inner.width.max(6) as usize).saturating_sub(4);
+            for line in wrap_str(&r.summary, sum_w).into_iter().take(1) {
+                rows.push(Line::from(vec![
+                    Span::raw(" "),
+                    style_s(c_muted(), line),
+                ]));
+            }
+        }
+        // Separator.
+        if rows.len() < max_rows {
+            rows.push(Line::from(vec![Span::raw(" ")]));
         }
     }
+
+    // Option list (codex-style list selection).
+    for (i, opt) in ApprovalOption::ALL.iter().enumerate() {
+        if rows.len() >= max_rows { break; }
+        let is_sel = i == state.approval_option_idx;
+        let marker = if is_sel { "›" } else { " " };
+        let opt_style = if is_sel {
+            c_accent().add_modifier(Modifier::BOLD)
+        } else {
+            c_muted()
+        };
+        rows.push(Line::from(vec![
+            Span::raw(" "),
+            style_s(if is_sel { c_accent() } else { c_dim() }, marker),
+            Span::raw(" "),
+            style_s(opt_style, opt.label()),
+            Span::raw("  "),
+            style_s(c_muted(), opt.desc()),
+        ]));
+    }
+
+    // Hint footer.
+    if rows.len() < max_rows {
+        rows.push(Line::from(vec![
+            Span::raw(" "),
+            style_s(c_dim(), "↑/↓"),
+            style_s(c_muted(), " select  "),
+            style_s(c_dim(), "Enter"),
+            style_s(c_muted(), " confirm"),
+        ]));
+    }
+
     let items: Vec<ListItem> = rows.into_iter().map(ListItem::new).collect();
     f.render_widget(List::new(items), inner);
 }
@@ -930,6 +973,15 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
             format!("{h}h{m:02}m")
         }
 
+        // Read these once before the turns loop so the borrow checker
+        // doesn't complain about reading state fields while `turn` borrows
+        // `state.messages`.
+        let thinking_expanded = state.thinking_expanded;
+        let thinking_scroll_in = state.thinking_scroll;
+        // Will be set by the most-recent Thinking block render pass if
+        // the clamped value differs from the stored one.
+        let mut thinking_scroll_clamp: Option<u16> = None;
+
         for turn_range in turns {
             let turn = &state.messages[turn_range];
 
@@ -1014,29 +1066,60 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                                 style_s(c_thinking_text(), placeholder.to_string()),
                             ]));
                         } else {
-                            const MAX_CHARS: usize = 1400;
-                            const MAX_LINES: usize = 12;
-                            let clamped = if text.chars().count() > MAX_CHARS {
-                                let mut s: String = text.chars().take(MAX_CHARS).collect();
-                                s.push('…');
-                                s
-                            } else {
-                                text.clone()
-                            };
                             let body_w = inner_w.saturating_sub(6).max(20);
-                            for (i, raw) in clamped.split('\n').take(MAX_LINES).enumerate() {
+                            // Wrap ALL lines first — both collapsed and
+                            // expanded paths need the wrapped form.
+                            let mut wrapped: Vec<String> = Vec::new();
+                            for raw in text.split('\n') {
                                 for wl in wrap_str(raw, body_w) {
+                                    wrapped.push(wl);
+                                }
+                            }
+                            let total = wrapped.len();
+
+                            if thinking_expanded {
+                                // ── Expanded: full CoT inline ───────────────
+                                for wl in &wrapped {
                                     rows.push(Line::from(vec![
                                         Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                        style_s(c_thinking_text(), wl),
+                                        style_s(c_thinking_text(), wl.clone()),
                                     ]));
                                 }
-                                if i + 1 == MAX_LINES {
+                                rows.push(Line::from(vec![
+                                    Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                    style_s(c_dim(), "(Ctrl+O collapse)"),
+                                ]));
+                            } else {
+                                // ── Collapsed: fixed-height scrollable window ─
+                                const COLLAPSED_HEIGHT: usize = 12;
+                                let max_scroll = total.saturating_sub(COLLAPSED_HEIGHT);
+                                let scroll = (thinking_scroll_in as usize).min(max_scroll);
+                                // Store clamped value for write-back after loop.
+                                thinking_scroll_clamp = Some(scroll as u16);
+
+                                let end = (scroll + COLLAPSED_HEIGHT).min(total);
+                                for wl in &wrapped[scroll..end] {
                                     rows.push(Line::from(vec![
                                         Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                        style_s(c_dim(), "… (truncated — view /export for full CoT)"),
+                                        style_s(c_thinking_text(), wl.clone()),
                                     ]));
-                                    break;
+                                }
+                                // Hint line
+                                if total > COLLAPSED_HEIGHT {
+                                    let hint = format!(
+                                        "(Ctrl+O expand · Ctrl-N/P scroll · {}/{})",
+                                        scroll + 1,
+                                        total
+                                    );
+                                    rows.push(Line::from(vec![
+                                        Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                        style_s(c_dim(), hint),
+                                    ]));
+                                } else {
+                                    rows.push(Line::from(vec![
+                                        Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                        style_s(c_dim(), "(Ctrl+O expand)"),
+                                    ]));
                                 }
                             }
                         }
@@ -1275,6 +1358,13 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                 rows.push(Line::from(line_parts));
             }
             rows.push(Line::from(vec![Span::raw("")]));
+        }
+        // Write back the clamped Thinking scroll offset so that
+        // `thinking_scroll` never exceeds the actual number of
+        // scrollable lines (prevents the window from going past the
+        // last line).
+        if let Some(clamped) = thinking_scroll_clamp {
+            state.thinking_scroll = clamped;
         }
     }
     rows.push(Line::from(vec![Span::raw("")]));
@@ -1955,21 +2045,29 @@ fn render_shortcuts_bar(f: &mut Frame<'_>, state: &TuiAppState, area: Rect) {
         Hint { kbd: "j/k",     label: "approvals" },
         Hint { kbd: "↑/↓",     label: "scroll" },
         Hint { kbd: "a/d/c",   label: "resolve" },
-        Hint { kbd: "q",       label: "quit" },
+        Hint { kbd: "Ctrl+O",  label: "CoT" },
     ];
     let prompt_hints: &[Hint] = if state.is_streaming() {
-        &[
-            Hint { kbd: "Ctrl-C", label: "stop" },
-            Hint { kbd: "Esc",    label: "stop" },
-            Hint { kbd: "Ctrl-J/K", label: "scroll" },
-            Hint { kbd: "PgUp/Dn", label: "page" },
-        ]
+        if !state.pending_approvals.is_empty() {
+            &[
+                Hint { kbd: "↑/↓",   label: "select" },
+                Hint { kbd: "Enter", label: "confirm" },
+                Hint { kbd: "Esc",   label: "normal" },
+            ]
+        } else {
+            &[
+                Hint { kbd: "Ctrl-C", label: "stop" },
+                Hint { kbd: "Esc",    label: "stop" },
+                Hint { kbd: "Ctrl-J/K", label: "scroll" },
+                Hint { kbd: "Ctrl+O",  label: "CoT" },
+            ]
+        }
     } else {
         &[
             Hint { kbd: "Enter",   label: "send" },
             Hint { kbd: "Alt↵",    label: "newline" },
             Hint { kbd: "Ctrl-J/K", label: "scroll" },
-            Hint { kbd: "PgUp/Dn", label: "page" },
+            Hint { kbd: "Ctrl+O",  label: "CoT" },
             Hint { kbd: "Esc",     label: "normal" },
         ]
     };

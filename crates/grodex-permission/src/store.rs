@@ -226,6 +226,29 @@ impl TicketStore {
         Ok(changes > 0)
     }
 
+    /// Persist a narrowed arguments snapshot for a ticket. Used by
+    /// ResolveApproval when the frontend returns `narrowed_args`, so
+    /// a subsequent session resume rebuilds the ticket with the
+    /// narrowed args instead of the original model-issued ones.
+    pub fn update_arguments_snapshot(
+        &self,
+        ticket_id: &str,
+        args: &serde_json::Value,
+    ) -> StoreResult<bool> {
+        let serialized = serde_json::to_string(args).map_err(|e| {
+            StoreError::InvalidValue(format!("cannot serialize narrowed args: {e}"))
+        })?;
+        let changes = self.conn.execute(
+            r#"
+            UPDATE approval_tickets
+            SET arguments_snapshot = ?1
+            WHERE ticket_id = ?2
+            "#,
+            rusqlite::params![serialized, ticket_id],
+        )?;
+        Ok(changes > 0)
+    }
+
     pub fn delete_ticket(&self, ticket_id: &str) -> StoreResult<bool> {
         let changes = self
             .conn

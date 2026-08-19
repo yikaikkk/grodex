@@ -374,14 +374,14 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
             Some(ServerFrame::Snapshot(snapshot))
         }
         LoopSessionEvent::ApprovalResolved {
-            ticket_id,
-            accepted,
+            ticket_id: _,
+            accepted: _,
         } => {
-            let content = UpdateContent::TextDelta {
-                text: format!("[approval] ticket={} resolved accepted={}", ticket_id, accepted),
-            };
-            let env = EventEnvelope::wrap(seq, session_id, content);
-            Some(ServerFrame::Event(env))
+            // Silently consume — the TUI already resolved the ticket
+            // locally via resolve_ticket() when the user pressed Enter.
+            // Emitting a TextDelta here spams the chat with
+            // "[approval] ticket=… resolved accepted=…" lines.
+            None
         }
         // ── B5: Agent asks client for permission. Forward the ticket
         // to the frontend so it can render a pending approval row; the
@@ -479,33 +479,49 @@ async fn route_command(
             // 之前的 bug：rollout_store 是 serve_acp 启动时创建的 *新* session
             // 目录，永远为空，所以 snapshot 空 + context 不注入 → 模型失忆。
             let base_dir = FileRolloutStore::default_dir();
-            let resume_sid = SessionId::from_string(&rs.session_id)
-                .unwrap_or_else(|_| SessionId::new());
-            let resume_store_res =
-                FileRolloutStore::new(&base_dir, &resume_sid.to_string());
-            let resume_store = match resume_store_res {
+            // FAIL-CLOSED: do NOT silently fall back to `SessionId::new()`.
+            // An invalid or unknown session id must surface an error — the
+            // previous behaviour of fabricating a random new session id
+            // meant "I resumed a known session but all history vanished
+            // and the model has amnesia". See user report in the top-level
+            // priority list.
+            let resume_sid = match SessionId::from_string(&rs.session_id) {
                 Ok(s) => s,
                 Err(e) => {
                     write_protocol_error(
                         stdout,
                         command_id.clone(),
-                        "RESUME_IO",
-                        format!("无法打开会话 {} 的 journal：{e}", rs.session_id),
+                        "RESUME_BAD_ID",
+                        format!("非法的 session_id 格式 `{}`：{e}", rs.session_id),
                     )
                     .await;
                     return (ack_bucket_out, None);
                 }
             };
-
-            // NOTE: SessionReducer.apply enforces strict seq continuity
-            // (last_seq == event.seq, then +=1). It starts at last_seq=0,
-            // so the first event MUST be seq=0. We therefore read from
-            // seq=0 to capture any RuntimeStateChanged / bootstraps that
-            // were written at position 0. Before this fix, we called
-            // replay_from(1) which skipped seq=0 → reducer blew up with
-            // "missing event seq: expected 0, got 1".
-            let dyn_store: &dyn RolloutStore = &resume_store;
-            let full_journal = match dyn_store.replay_from(0).await {
+            // Also verify the directory / journal file actually exists on
+            // disk. If the user passed a syntactically-valid but unknown id
+            // (e.g. a typo), fail immediately instead of opening an empty
+            // directory and pretending the resume "succeeded" with zero
+            // items.
+            let expected_journal = base_dir.join(resume_sid.to_string()).join("rollout.jsonl");
+            if !expected_journal.exists() {
+                write_protocol_error(
+                    stdout,
+                    command_id.clone(),
+                    "RESUME_NOT_FOUND",
+                    format!(
+                        "找不到会话 `{}` 的 rollout journal ({} 不存在)。请确认 session id 拼写。",
+                        rs.session_id,
+                        expected_journal.display()
+                    ),
+                )
+                .await;
+                return (ack_bucket_out, None);
+            }
+            // Step 1: read the existing journal. Use `replay_snapshot` (sync,
+            // no actor spawn) — we only need the event bytes for projection.
+            // Fail-closed on corrupt journal.
+            let full_journal = match FileRolloutStore::replay_snapshot(&base_dir, &resume_sid.to_string(), 0) {
                 Ok(j) => j,
                 Err(e) => {
                     write_protocol_error(
@@ -727,7 +743,32 @@ async fn route_command(
             //
             //    This is the FIX for: "I resumed <sid>, chatted more, then
             //    resumed again — the new turns had vanished".
-            let resume_store_arc: Arc<dyn RolloutStore> = Arc::new(resume_store);
+            //
+            // NOTE: we open a REAL (actor-backed) writable store here,
+            // not `open_readonly`, because the resumed session will
+            // keep appending to the OLD journal file. We seed
+            // next_seq = last_seq + 1 so the actor's counter starts
+            // where the old journal left off (see JournalHandle::start).
+            use grodex_rollout::FsyncPolicy;
+            let writable_store = match FileRolloutStore::new(
+                &base_dir,
+                &resume_sid.to_string(),
+                last_seq.saturating_add(1),
+                FsyncPolicy::default(),
+            ).await {
+                Ok(s) => s,
+                Err(e) => {
+                    write_protocol_error(
+                        stdout,
+                        command_id.clone(),
+                        "RESUME_IO",
+                        format!("无法启动旧会话的 writable rollout store：{e}"),
+                    )
+                    .await;
+                    return (ack_bucket_out, None);
+                }
+            };
+            let resume_store_arc: Arc<dyn RolloutStore> = Arc::new(writable_store);
             if let Err(e) = handle
                 .send(SessionCommand::RebindRolloutWriter {
                     new_store: resume_store_arc,
@@ -1149,9 +1190,11 @@ async fn run_interactive_with(
         .or_else(|| std::env::var("GRODEX_API_ENDPOINT").ok());
     let _api_key_from_cfg = cfg.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    // Build a ModelRoute if TOML config was found (for future failover use).
-    let _model_route = route_toml.as_ref().map(|r| r.to_model_route());
-    if let Some(ref route) = _model_route {
+    // Build a ModelRoute if TOML config was found — wired into the
+    // SamplingActor via SessionRuntimeBuilder so FailoverToNextCandidate
+    // can switch candidates at runtime.
+    let model_route = route_toml.as_ref().map(|r| r.to_model_route());
+    if let Some(ref route) = model_route {
         println!("ModelRoute: {} candidate(s), sticky={:?}{}", route.len(),
             route_toml.as_ref().map(|r| r.sticky_scope.as_str()).unwrap_or("turn"),
             if route.len() > 1 { format!(", failover enabled") } else { String::new() });
@@ -1179,6 +1222,7 @@ async fn run_interactive_with(
     let runtime = SessionRuntimeBuilder::new(cwd.clone())
         .with_trusted(workspace_trusted)
         .with_recovered_context(recovered.unwrap_or_default())
+        .with_model_route(model_route)
         .build()
         .await
         .expect("failed to build session runtime");
@@ -1293,11 +1337,7 @@ async fn resume_session(session_id: &str, cwd: Option<PathBuf>, trusted: bool) {
         eprintln!("Invalid session id: {session_id}");
         std::process::exit(1);
     });
-    let store = match FileRolloutStore::new(&base_dir, session_id) {
-        Ok(s) => s,
-        Err(e) => { eprintln!("Cannot open session: {e}"); std::process::exit(1); }
-    };
-    let events = match store.replay_from(0) {
+    let events = match FileRolloutStore::replay_snapshot(&base_dir, session_id, 0) {
         Ok(e) => e,
         Err(e) => { eprintln!("Cannot replay: {e}"); std::process::exit(1); }
     };
@@ -1331,15 +1371,7 @@ async fn replay_session(session_id: &str) {
         std::process::exit(1);
     });
 
-    let store = match FileRolloutStore::new(&base_dir, session_id) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Cannot open session: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let events = match store.replay_from(0) {
+    let events = match FileRolloutStore::replay_snapshot(&base_dir, session_id, 0) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("Cannot replay: {e}");
@@ -1399,18 +1431,10 @@ async fn inspect_session(session_id: &str) {
     println!("Session: {session_id}");
 
     let base_dir = FileRolloutStore::default_dir();
-    let store = match FileRolloutStore::new(&base_dir, session_id) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Cannot open session: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let events = match store.replay_from(0) {
+    let events = match FileRolloutStore::replay_snapshot(&base_dir, session_id, 0) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("Cannot replay: {e}");
+            eprintln!("Cannot open session: {e}");
             std::process::exit(1);
         }
     };
@@ -1443,18 +1467,10 @@ async fn inspect_session(session_id: &str) {
 /// to stdout for `grodex dump <sid> | jq .` workflows.
 async fn dump_session(session_id: &str) {
     let base_dir = FileRolloutStore::default_dir();
-    let store = match FileRolloutStore::new(&base_dir, session_id) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Cannot open session: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let events = match store.replay_from(0) {
+    let events = match FileRolloutStore::replay_snapshot(&base_dir, session_id, 0) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("Cannot replay: {e}");
+            eprintln!("Cannot open session: {e}");
             std::process::exit(1);
         }
     };
@@ -1480,18 +1496,10 @@ async fn eval_session(
 ) {
     // 1. Read rollout events.
     let base_dir = FileRolloutStore::default_dir();
-    let store = match FileRolloutStore::new(&base_dir, session_id) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Cannot open session: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let events = match store.replay_from(0) {
+    let events = match FileRolloutStore::replay_snapshot(&base_dir, session_id, 0) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("Cannot replay: {e}");
+            eprintln!("Cannot open session: {e}");
             std::process::exit(1);
         }
     };
@@ -1728,6 +1736,47 @@ fn summarize_payload(
         ContextRestored => {
             let n = payload.get("items").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
             format!("restored {n} items")
+        }
+        ToolCallApproved => {
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let call_id = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("approved tool={name} call={call_id}")
+        }
+        ToolOutcomeIndeterminate => {
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let call_id = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("INDETERMINATE tool={name} call={call_id} reason={reason}")
+        }
+        ToolOutcomeResolved => {
+            let call_id = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let resolution = payload.get("resolution").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("RESOLVED call={call_id} resolution={resolution}")
+        }
+        ApprovalRequested => {
+            let ticket = payload.get("ticket_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let tool = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("approval requested ticket={ticket} tool={tool}")
+        }
+        ApprovalResolved => {
+            let ticket = payload.get("ticket_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let resolution = payload.get("resolution").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("approval resolved ticket={ticket} {resolution}")
+        }
+        LeaseIssued => {
+            let lease = payload.get("lease_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let call = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("lease issued id={lease} call={call}")
+        }
+        LeaseConsumed => {
+            let lease = payload.get("lease_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let call = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("lease consumed id={lease} call={call}")
+        }
+        LeaseExpired => {
+            let lease = payload.get("lease_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("lease expired id={lease} reason={reason}")
         }
     }
 }

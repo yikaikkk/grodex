@@ -15,6 +15,13 @@ impl AgentId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Parse from a Uuid string. Returns None if the string is not a
+    /// valid Uuid. Used by the durable sub-agent recovery path to
+    /// rebuild the tree from journal event payloads.
+    pub fn from_string(s: &str) -> Option<Self> {
+        Uuid::parse_str(s).ok().map(Self)
+    }
 }
 
 impl std::fmt::Display for AgentId {

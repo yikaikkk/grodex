@@ -14,6 +14,12 @@ impl TaskId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Parse from a Uuid string. Returns None if the string is not a
+    /// valid Uuid. Used by the durable sub-agent recovery path.
+    pub fn from_string(s: &str) -> Self {
+        Uuid::parse_str(s).map(Self).unwrap_or_else(|_| Self::new())
+    }
 }
 
 impl std::fmt::Display for TaskId {

@@ -190,27 +190,52 @@ impl CapabilityManager {
         self.last_adopted_generation
     }
 
-    /// Look up a tool runtime by generation. If the requested generation
-    /// has been evicted, falls back to the latest available.
+    /// Look up a tool runtime by generation.
+    ///
+    /// **P1-1 fix**: if the requested `generation` has been evicted from
+    /// the ring buffer (i.e. `is_evicted(generation)` returns true),
+    /// this returns `None` instead of silently falling back to the
+    /// latest generation. The previous fallback re-introduced semantic
+    /// drift: a Turn that bound to generation N would suddenly see
+    /// generation N+2's tool specs / runtime behaviour after N was
+    /// evicted, producing model outputs that are inconsistent with the
+    /// journal's recorded capability revision.
+    ///
+    /// Callers that receive `None` should propagate the error and write
+    /// a `CapabilityCallRejectedStale` rollout event so the user /
+    /// auditor can see *why* the call was refused.
     pub fn get_runtime(&self, generation: u64, name: &str) -> Option<Arc<dyn ToolRuntime>> {
-        // Search from newest to oldest.
+        if self.is_evicted(generation) {
+            return None;
+        }
+        // Search from newest to oldest within the retained window.
         for g in self.generations.iter().rev() {
             if g.generation <= generation {
                 return g.get_runtime(name);
             }
         }
-        // Fallback: use latest generation.
-        self.latest().get_runtime(name)
+        // Generation is retained but the tool name is not registered in
+        // any matching generation — this is a "tool not found" (not a
+        // stale-generation drift), so we do NOT fall back to latest
+        // either: the caller should surface a clear error.
+        None
     }
 
     /// Get model specs for a specific generation.
+    ///
+    /// Same P1-1 semantics: returns an empty `Vec` if the generation
+    /// has been evicted, instead of silently returning the latest
+    /// generation's specs.
     pub fn model_specs_for(&self, generation: u64) -> Vec<ToolSpec> {
+        if self.is_evicted(generation) {
+            return Vec::new();
+        }
         for g in self.generations.iter().rev() {
             if g.generation <= generation {
                 return g.model_specs();
             }
         }
-        self.latest().model_specs()
+        Vec::new()
     }
 
     /// Check if a generation has been evicted from the buffer.
@@ -479,8 +504,12 @@ mod tests {
             mgr.register_tool(format!("tool_{i}"), Arc::new(tool), spec);
         }
         assert!(mgr.is_evicted(gen1));
-        // Evicted generation falls back to latest.
-        assert!(mgr.get_runtime(gen1, "tool_4").is_some());
+        // P1-1 fix: evicted generation no longer falls back to latest.
+        // The call MUST be refused so the Turn can be retried with a
+        // fresh capability snapshot (prevents semantic drift).
+        assert!(mgr.get_runtime(gen1, "tool_4").is_none());
+        // The latest generation still works.
+        assert!(mgr.get_runtime(mgr.current_gen(), "tool_4").is_some());
     }
 
     #[test]

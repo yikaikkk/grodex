@@ -17,6 +17,45 @@ pub struct PendingApprovalRow {
     pub remaining_s: u32,
 }
 
+/// Selectable approval decisions shown as a list (codex-style).
+/// The user navigates with j/k (or ↑/↓) and confirms with Enter —
+/// no letter-key shortcuts that would conflict with IME input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalOption {
+    Allow,
+    Deny,
+    Cancel,
+    Narrow,
+}
+
+impl ApprovalOption {
+    /// All options in display order.
+    pub const ALL: [ApprovalOption; 4] = [
+        ApprovalOption::Allow,
+        ApprovalOption::Deny,
+        ApprovalOption::Cancel,
+        ApprovalOption::Narrow,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ApprovalOption::Allow => "Allow",
+            ApprovalOption::Deny => "Deny",
+            ApprovalOption::Cancel => "Cancel",
+            ApprovalOption::Narrow => "Narrow",
+        }
+    }
+
+    pub fn desc(self) -> &'static str {
+        match self {
+            ApprovalOption::Allow => "approve and run the tool",
+            ApprovalOption::Deny => "reject the tool call",
+            ApprovalOption::Cancel => "cancel this turn",
+            ApprovalOption::Narrow => "narrow arguments scope",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -504,12 +543,33 @@ pub struct TuiAppState {
     pub command_buffer: String,
     pub command_cursor: usize,
     pub selected_approval_idx: usize,
+    /// Currently highlighted option within the approval card
+    /// (0=Allow, 1=Deny, 2=Cancel, 3=Narrow). Codex-style list
+    /// selection: j/k navigates, Enter confirms.
+    pub approval_option_idx: usize,
     pub scroll_conversation: u16,
     /// Grok scrollback "follow_mode"：true = 追加内容时自动滚到底部（默认）。
     /// 用户一旦向上滚动（scroll_up）就置 false，保持用户的滚动位置不被
     /// 新消息拉回底部；只有用户再滚动到底部（scroll_conversation 达上限）
     /// 或点 Shift+G / 发送新消息，才重新进入 follow_mode。
     pub scroll_follow_bottom: bool,
+    /// True after CancelTurn has been sent and before the turn completes.
+    /// Prevents duplicate Cancel commands (which cause "Idle -> Idle"
+    /// state transition errors) when the user presses Esc multiple times.
+    pub cancel_sent: bool,
+    /// Whether the most-recent Thinking (CoT) block is expanded.
+    /// Toggle with Ctrl+O. When false (default), the Thinking panel
+    /// shows a fixed-height window of MAX_LINES=12 lines that is
+    /// **internally scrollable** via Ctrl-N / Ctrl-P. When true, the
+    /// full CoT text is rendered inline and the user scrolls the
+    /// conversation to read it all.
+    pub thinking_expanded: bool,
+    /// Scroll offset (in wrapped lines) for the most-recent Thinking
+    /// block when it is **collapsed**. Adjusted by Ctrl-N / Ctrl-P in
+    /// Normal mode. Clamped to `max(0, total_wrapped_lines -
+    /// COLLAPSED_HEIGHT)` during render. Reset to 0 whenever a new
+    /// Thinking block starts or when the panel is expanded.
+    pub thinking_scroll: u16,
     pub logs: Vec<String>,
     /// Model/provider info for header display.
     pub model_label: String,
@@ -572,8 +632,12 @@ impl TuiAppState {
             command_buffer: String::new(),
             command_cursor: 0,
             selected_approval_idx: 0,
+            approval_option_idx: 0,
             scroll_conversation: 0,
             scroll_follow_bottom: true,
+            cancel_sent: false,
+            thinking_expanded: false,
+            thinking_scroll: 0,
             logs: Vec::new(),
             model_label: String::new(),
             provider_label: String::new(),
@@ -962,6 +1026,7 @@ impl TuiAppState {
 
         if let SessionEvent::TurnComplete { turn_id } = &e {
             self.turn_id = Some(turn_id.clone());
+            self.cancel_sent = false;
             // Close the two per-turn open blocks independently.
             //
             // BUG-FIX: previous code iterated .rev() and broke on the
@@ -1073,6 +1138,9 @@ impl TuiAppState {
                     }
                 }
                 if !found {
+                    // New Thinking block — reset scroll so the user starts
+                    // from the top of the new reasoning trace.
+                    self.thinking_scroll = 0;
                     self.messages.push(ChatMessage::Thinking {
                         text: text.clone(),
                         done: false,
@@ -1315,6 +1383,34 @@ impl TuiAppState {
         if self.selected_approval_idx >= self.pending_approvals.len() && !self.pending_approvals.is_empty() {
             self.selected_approval_idx = self.pending_approvals.len() - 1;
         }
+        // Reset option selection for the next approval card.
+        self.approval_option_idx = 0;
+    }
+
+    /// The currently-highlighted `ApprovalOption` for the selected approval.
+    pub fn current_approval_option(&self) -> ApprovalOption {
+        ApprovalOption::ALL
+            .get(self.approval_option_idx)
+            .copied()
+            .unwrap_or(ApprovalOption::Allow)
+    }
+
+    /// Mark every in-flight Tool card (done=false) as finished with a
+    /// frozen timestamp. Called locally when the user cancels a turn so the
+    /// tool timer stops immediately rather than ticking forever.
+    pub fn finalize_all_inflight_tools(&mut self) {
+        let now = std::time::Instant::now();
+        for m in self.messages.iter_mut() {
+            if let ChatMessage::Tool { done, has_result, finished_at, .. } = m {
+                if !*done {
+                    *done = true;
+                    *has_result = true;
+                    if finished_at.is_none() {
+                        *finished_at = Some(now);
+                    }
+                }
+            }
+        }
     }
 
     pub fn scroll_up(&mut self) {
@@ -1341,6 +1437,19 @@ impl TuiAppState {
                 }
             }
         }
+    }
+
+    /// Scroll the most-recent Thinking (CoT) block **down** by one line
+    /// when collapsed. The render pass clamps `thinking_scroll` to the
+    /// actual maximum so this is always safe to call.
+    pub fn thinking_scroll_down(&mut self) {
+        self.thinking_scroll = self.thinking_scroll.saturating_add(1);
+    }
+
+    /// Scroll the most-recent Thinking (CoT) block **up** by one line
+    /// when collapsed.
+    pub fn thinking_scroll_up(&mut self) {
+        self.thinking_scroll = self.thinking_scroll.saturating_sub(1);
     }
 
     pub fn push_log(&mut self, msg: impl Into<String>) {

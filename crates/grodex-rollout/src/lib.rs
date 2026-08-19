@@ -5,6 +5,7 @@
 //! provide the source of truth for recovery, auditing, and replay.
 
 pub mod event;
+pub mod journal_actor;
 pub mod store;
 pub mod fence;
 pub mod gate;
@@ -21,4 +22,5 @@ pub use invariants::{
     ToolCallLifecycleConsistency, StepGenerationMonotonic, CompactionAtomicity,
     NoCommittedBeforePrepared, TurnCompletionClosure, run_all_invariants,
 };
-pub use recovery::{RecoveryCheckpoint, recover_from_journal};
+pub use journal_actor::{FsyncPolicy, JournalHandle, replay_journal_strict};
+pub use recovery::{ApprovalTicketResolution, RecoveryCheckpoint, ToolCallFate, recover_from_journal};

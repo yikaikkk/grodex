@@ -118,7 +118,12 @@ impl ApprovalBroker {
         rx
     }
 
-    pub fn resolve(&mut self, ticket_id: &str, decision: PolicyDecision) -> bool {
+    pub fn resolve(
+        &mut self,
+        ticket_id: &str,
+        decision: PolicyDecision,
+        narrowed_args: Option<serde_json::Value>,
+    ) -> bool {
         let Some(mut ticket) = self.tickets.remove(ticket_id) else {
             return false;
         };
@@ -130,9 +135,24 @@ impl ApprovalBroker {
         ticket.status = status;
         ticket.policy_decision = Some(decision);
 
+        // P0-4 fix: narrowed arguments from the frontend must overwrite
+        // the original arguments_snapshot in the ticket. A future
+        // consumer that reads back this ticket (on resume, on lease
+        // mint, etc.) will see the narrowed version, not the original
+        // model-issued one.
+        if let Some(narrowed) = narrowed_args {
+            ticket.arguments_snapshot = Some(narrowed);
+        }
+
         if let Some(store) = &self.store {
             let granted_by: Option<&str> = None;
             let _ = store.update_status(ticket_id, status, Some(decision), granted_by);
+            // Persist narrowed_args too if present, so resume doesn't
+            // lose the narrow (the in-memory ticket is being dropped by
+            // the remove() above).
+            if let Some(args) = &ticket.arguments_snapshot {
+                let _ = store.update_arguments_snapshot(ticket_id, args);
+            }
         }
 
         if let Some(tx) = ticket.take_tx() {
@@ -189,6 +209,13 @@ impl ApprovalBroker {
     pub fn pending_tickets(&self) -> Vec<&str> {
         self.tickets.keys().map(|s| s.as_str()).collect()
     }
+
+    /// Borrow a pending ticket by id (if still pending). Used by the
+    /// supervisor just before resolve() to snapshot metadata for journal
+    /// annotation.
+    pub fn pending_ticket(&self, ticket_id: &str) -> Option<&ApprovalTicket> {
+        self.tickets.get(ticket_id)
+    }
 }
 
 #[cfg(test)]
@@ -211,7 +238,7 @@ mod tests {
         assert_eq!(broker.pending_count(), 1);
 
         let ticket_id = broker.pending_tickets()[0].to_string();
-        assert!(broker.resolve(&ticket_id, PolicyDecision::Allow));
+        assert!(broker.resolve(&ticket_id, PolicyDecision::Allow, None));
         assert_eq!(broker.pending_count(), 0);
 
         let decision = rx.try_recv().unwrap();
@@ -238,7 +265,7 @@ mod tests {
     #[test]
     fn resolve_unknown_ticket() {
         let mut broker = ApprovalBroker::new(Duration::from_secs(60));
-        assert!(!broker.resolve("nonexistent", PolicyDecision::Allow));
+        assert!(!broker.resolve("nonexistent", PolicyDecision::Allow, None));
     }
 
     #[test]
