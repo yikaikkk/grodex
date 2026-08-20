@@ -225,8 +225,9 @@ impl SessionRuntimeBuilder {
 
         // ── 4. PermissionManager (policy from config `[rules]`) ────
         let policy = build_permission_policy(cfg);
-        let permission_mgr = PermissionManager::new(policy);
-
+        // The SQLite-backed broker is created AFTER the session directory
+        // exists (below, after session creation). For now just build the
+        // policy; the manager is constructed at step 6.5.
         // ── 5. SandboxRuntime (from `sandbox_profile`) ─────────────
         // Apply 7-layer intersection: Default layer = the config profile,
         // UserBinding layer = the same (user explicitly chose it). The
@@ -351,6 +352,15 @@ impl SessionRuntimeBuilder {
             .as_ref()
             .map(|s| RolloutWriter::new(s.clone(), session.id));
 
+        // ── 6.5. PermissionManager (SQLite-backed if session dir exists) ──
+        // Place the approval ticket DB alongside the rollout journal so
+        // pending approvals survive crashes and can be restored on resume.
+        // Fail-open to in-memory if the directory is unavailable.
+        let approval_db_path = std::path::Path::new(&base_dir)
+            .join(&session_id_str)
+            .join("approvals.db");
+        let permission_mgr = PermissionManager::new_with_db(policy, &approval_db_path);
+
         let model_config = self.model_config_override.unwrap_or(ModelConfig {
             provider: provider_name,
             model: model_name,
@@ -436,8 +446,9 @@ impl SessionRuntimeBuilder {
                                     );
                                     let schema = adapter.input_schema();
                                     let name = adapter.full_name().to_string();
+                                    let metadata = adapter.metadata();
                                     coordinator
-                                        .register_tool(&name, Arc::new(adapter), schema)
+                                        .register_tool_with_metadata(&name, Arc::new(adapter), schema, metadata)
                                         .await;
                                 }
                             }

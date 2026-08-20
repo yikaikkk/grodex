@@ -185,7 +185,7 @@ impl StepRunner {
             }
             PermissionResult::ApprovalRequired { decision_rx, .. } => {
                 match tokio::time::timeout(std::time::Duration::from_secs(5), decision_rx).await {
-                    Ok(Ok(decision)) if decision.is_immediate() => {}
+                    Ok(Ok(decision)) if decision.permits_execution() => {}
                     _ => {
                         return ContextItem::ToolResult {
                             call_id: cid,

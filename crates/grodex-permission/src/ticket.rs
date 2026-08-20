@@ -6,6 +6,7 @@
 
 use grodex_core::id::ToolCallId;
 use grodex_core::policy::PolicyDecision;
+use crate::resolution::ApprovalResolution;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -79,7 +80,7 @@ pub struct ApprovalTicket {
     pub summary: String,
     pub risk_level: RiskLevel,
     pub status: TicketStatus,
-    pub decision_tx: Option<oneshot::Sender<PolicyDecision>>,
+    pub decision_tx: Option<oneshot::Sender<ApprovalResolution>>,
     pub policy_decision: Option<PolicyDecision>,
     pub created_at: Instant,
     pub timeout: Duration,
@@ -97,7 +98,7 @@ impl ApprovalTicket {
         tool_name: impl Into<String>,
         summary: impl Into<String>,
         risk_level: RiskLevel,
-    ) -> (Self, oneshot::Receiver<PolicyDecision>) {
+    ) -> (Self, oneshot::Receiver<ApprovalResolution>) {
         let (tx, rx) = oneshot::channel();
         let ticket = Self {
             ticket_id: format!("ticket_{}", uuid::Uuid::new_v4()),
@@ -120,7 +121,7 @@ impl ApprovalTicket {
         (ticket, rx)
     }
 
-    pub fn take_tx(&mut self) -> Option<oneshot::Sender<PolicyDecision>> {
+    pub fn take_tx(&mut self) -> Option<oneshot::Sender<ApprovalResolution>> {
         self.decision_tx.take()
     }
 

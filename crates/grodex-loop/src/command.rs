@@ -7,6 +7,20 @@ use grodex_core::policy::PolicyDecision;
 use grodex_rollout::store::RolloutStore;
 use std::sync::Arc;
 
+/// Human adjudication for an Indeterminate tool call.
+#[derive(Debug, Clone)]
+pub enum IndeterminateResolution {
+    /// The user confirmed the side effect completed successfully.
+    /// The provided content (if any) is recorded as the tool result.
+    Succeeded,
+    /// The user confirmed the side effect failed or was partial.
+    /// The provided content (if any) is recorded as the error reason.
+    Failed,
+    /// Discard the indeterminate call — the model will re-issue it
+    /// in a future Turn. No `ToolOutcomeResolved` event is written.
+    Retry,
+}
+
 /// Commands sent to the SessionSupervisor from the frontend.
 pub enum SessionCommand {
     /// Start a new Turn with the given user input.
@@ -23,6 +37,26 @@ pub enum SessionCommand {
         ticket_id: String,
         decision: PolicyDecision,
         narrowed_args: Option<serde_json::Value>,
+    },
+    /// Resolve an Indeterminate tool call discovered during crash recovery.
+    ///
+    /// When the journal replay finds a `ToolExecutionStarted` without a
+    /// matching `ToolExecutionFinished`/`ToolResultCommitted`, the tool's
+    /// side effect is in an unknown state. The supervisor writes a
+    /// `ToolOutcomeIndeterminate` event and surfaces it to the frontend.
+    /// The user then inspects the real-world state and sends this command
+    /// to record the human adjudication:
+    ///
+    /// - `Succeeded` → the side effect completed successfully; write
+    ///   `ToolOutcomeResolved` with the user-supplied content.
+    /// - `Failed` → the side effect failed or was partial; write
+    ///   `ToolOutcomeResolved` with an error note.
+    /// - `Retry` → discard the indeterminate call; the model will re-issue
+    ///   it in a future Turn (no `ToolOutcomeResolved` is written).
+    ResolveIndeterminate {
+        call_id: String,
+        resolution: IndeterminateResolution,
+        content: Option<String>,
     },
     /// Resume a session after a disconnect.
     ///
@@ -87,6 +121,12 @@ impl std::fmt::Debug for SessionCommand {
                 .field("ticket_id", ticket_id)
                 .field("decision", decision)
                 .finish_non_exhaustive(),
+            SessionCommand::ResolveIndeterminate { call_id, resolution, content } => f
+                .debug_struct("ResolveIndeterminate")
+                .field("call_id", call_id)
+                .field("resolution", resolution)
+                .field("content_len", &content.as_ref().map(|c| c.len()).unwrap_or(0))
+                .finish(),
             SessionCommand::ResumeSession { last_seq, idempotency_key, emit_snapshot_to_frontend } => f
                 .debug_struct("ResumeSession")
                 .field("last_seq", last_seq)
@@ -131,6 +171,12 @@ pub enum SessionEvent {
     /// A tool has finished executing and produced output — maps to
     /// ACP ToolResult.
     ToolResult { call_id: String, content: String, is_error: bool },
+    /// An Indeterminate tool call was discovered during crash recovery.
+    /// The tool's `ToolExecutionStarted` event has no matching
+    /// `ToolExecutionFinished`/`ToolResultCommitted` — the side effect
+    /// is in an unknown state. The user must inspect the real-world
+    /// state and send `ResolveIndeterminate` to adjudicate.
+    IndeterminateToolCall { call_id: String, tool_name: String, message: String },
     /// A Step completed.
     StepCompleted { turn_id: TurnId, text: String },
     /// A Turn reached a terminal state.

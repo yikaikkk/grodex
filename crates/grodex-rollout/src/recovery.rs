@@ -51,6 +51,11 @@ pub struct RecoveryCheckpoint {
     /// ask the user twice on resume — the durable answer is in the
     /// journal).
     pub resolved_tickets: BTreeMap<String, ApprovalTicketResolution>,
+    /// All approval tickets that were requested (ApprovalRequested
+    /// observed) — used together with `resolved_tickets` to compute
+    /// the set of *pending* (unresolved) tickets that must be
+    /// re-surfaced to the frontend on resume.
+    pub requested_tickets: BTreeMap<String, RequestedTicketInfo>,
 }
 
 /// Terminal state of an approval ticket, reconstructed from the journal.
@@ -60,6 +65,17 @@ pub struct ApprovalTicketResolution {
     pub narrowed_args: Option<serde_json::Value>,
     pub call_id: Option<String>,
     pub resolved_by: Option<String>,
+}
+
+/// Info about an approval ticket that was requested (ApprovalRequested
+/// event observed) — used to re-surface unresolved tickets to the
+/// frontend during resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestedTicketInfo {
+    pub ticket_id: String,
+    pub tool_name: String,
+    pub call_id: Option<String>,
+    pub args: Option<serde_json::Value>,
 }
 
 /// Field accessors — unified schema v2.
@@ -170,6 +186,29 @@ pub fn recover_from_journal(events: &[RolloutEvent]) -> RecoveryCheckpoint {
                     cp.consumed_leases.insert(lease_id.to_string());
                 }
             }
+            RolloutEventType::ApprovalRequested => {
+                if let Some(ticket_id) = ev.payload.get("ticket_id").and_then(|v| v.as_str()) {
+                    let tool_name = ev.payload
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let call_id = ev.payload
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let args = ev.payload.get("args").cloned();
+                    cp.requested_tickets.insert(
+                        ticket_id.to_string(),
+                        RequestedTicketInfo {
+                            ticket_id: ticket_id.to_string(),
+                            tool_name,
+                            call_id,
+                            args,
+                        },
+                    );
+                }
+            }
             RolloutEventType::ApprovalResolved => {
                 if let Some(ticket_id) = ev.payload.get("ticket_id").and_then(|v| v.as_str()) {
                     let resolution = ev.payload
@@ -241,6 +280,16 @@ impl RecoveryCheckpoint {
             .iter()
             .filter(|(_, f)| **f == ToolCallFate::Indeterminate)
             .map(|(c, _)| c.clone())
+            .collect()
+    }
+    /// Approval tickets that were requested but never resolved — these
+    /// must be re-surfaced to the frontend on resume so the user can
+    /// adjudicate them.
+    pub fn pending_approval_tickets(&self) -> Vec<&RequestedTicketInfo> {
+        self.requested_tickets
+            .iter()
+            .filter(|(tid, _)| !self.resolved_tickets.contains_key(tid.as_str()))
+            .map(|(_, info)| info)
             .collect()
     }
 }

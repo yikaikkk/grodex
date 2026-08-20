@@ -29,6 +29,9 @@ pub struct CapabilityGeneration {
     pub tool_specs: HashMap<String, ToolSpec>,
     /// Runtime handles for execution (shared via Arc).
     pub tool_runtimes: HashMap<String, Arc<dyn ToolRuntime>>,
+    /// Tool metadata (concurrency class, side-effect class) for
+    /// scheduler and recovery decisions (Design Doc 10 §16).
+    pub tool_metadata: HashMap<String, grodex_core::tool::ToolMetadata>,
 }
 
 impl CapabilityGeneration {
@@ -38,6 +41,7 @@ impl CapabilityGeneration {
             generation,
             tool_specs: HashMap::new(),
             tool_runtimes: HashMap::new(),
+            tool_metadata: HashMap::new(),
         }
     }
 
@@ -52,6 +56,13 @@ impl CapabilityGeneration {
     /// Look up a tool runtime by name.
     pub fn get_runtime(&self, name: &str) -> Option<Arc<dyn ToolRuntime>> {
         self.tool_runtimes.get(name).cloned()
+    }
+
+    /// Look up tool metadata by name. Used by the scheduler to
+    /// determine concurrency class and by crash recovery to decide
+    /// retry strategy (Design Doc 10 §16).
+    pub fn get_metadata(&self, name: &str) -> Option<&grodex_core::tool::ToolMetadata> {
+        self.tool_metadata.get(name)
     }
 }
 
@@ -126,6 +137,19 @@ impl CapabilityManager {
         runtime: Arc<dyn ToolRuntime>,
         tool_spec: ToolSpec,
     ) -> u64 {
+        self.register_tool_with_metadata(name, runtime, tool_spec, None)
+    }
+
+    /// Register a tool with explicit metadata (concurrency class,
+    /// side-effect class). The metadata is stored in the generation so
+    /// the scheduler and crash recovery can use it (Design Doc 10 §16).
+    pub fn register_tool_with_metadata(
+        &mut self,
+        name: String,
+        runtime: Arc<dyn ToolRuntime>,
+        tool_spec: ToolSpec,
+        metadata: Option<grodex_core::tool::ToolMetadata>,
+    ) -> u64 {
         self.current_gen += 1;
 
         // Clone the previous generation as a starting point.
@@ -133,7 +157,10 @@ impl CapabilityManager {
         let mut new_gen = prev.clone();
         new_gen.generation = self.current_gen;
         new_gen.tool_specs.insert(name.clone(), tool_spec);
-        new_gen.tool_runtimes.insert(name, runtime);
+        new_gen.tool_runtimes.insert(name.clone(), runtime);
+        if let Some(m) = metadata {
+            new_gen.tool_metadata.insert(name, m);
+        }
 
         // Evict oldest if at capacity.
         while self.generations.len() >= self.max_retained {
@@ -159,6 +186,7 @@ impl CapabilityManager {
         new_gen.generation = self.current_gen;
         new_gen.tool_specs.remove(name);
         new_gen.tool_runtimes.remove(name);
+        new_gen.tool_metadata.remove(name);
 
         while self.generations.len() >= self.max_retained {
             self.generations.pop_front();

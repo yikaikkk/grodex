@@ -95,6 +95,14 @@ pub struct SessionSupervisor {
     /// P1-2: without this cache, `with_skills()` was never called at all,
     /// so skills were invisible to the model.
     skill_catalog: Option<SkillCatalog>,
+    /// Previous Turn's skill snapshot for change detection (Design Doc 08 §6).
+    /// On the next Turn, skills are re-discovered and hashes compared.
+    /// If any changed, `skill_generation` is bumped so the model sees
+    /// the updated content.
+    prev_skill_snapshot: Option<Vec<grodex_skills::SkillSnapshot>>,
+    /// Monotonic skill generation counter — bumped when skill content
+    /// changes are detected between Turns.
+    skill_generation: u64,
     /// Cached instruction discovery nodes (AGENTS.md / .agent/rules).
     /// Discovered once per session, reused across turns — the filesystem
     /// walk is the expensive part; `build()` is just string assembly.
@@ -155,6 +163,8 @@ impl SessionSupervisor {
             current_turn_cancel: None,
             permission,
             skill_catalog: None,
+            prev_skill_snapshot: None,
+            skill_generation: 1,
             cached_discovered_nodes: None,
         };
 
@@ -464,6 +474,65 @@ impl SessionSupervisor {
                 true
             }
             SessionCommand::Shutdown => false,
+            SessionCommand::ResolveIndeterminate { call_id, resolution, content } => {
+                // Human adjudication for an Indeterminate tool call.
+                // Write the durable ToolOutcomeResolved event so the
+                // journal records the user's decision for future resumes.
+                match resolution {
+                    crate::command::IndeterminateResolution::Succeeded => {
+                        if let Some(ref writer) = self.writer {
+                            let _ = writer
+                                .write_tool_outcome_resolved(
+                                    &call_id,
+                                    None, // operation_id
+                                    "succeeded",
+                                    content.as_deref(),
+                                    Some("user"),
+                                )
+                                .await;
+                        }
+                        let _ = self.event_tx
+                            .send(SessionEvent::Info {
+                                message: format!(
+                                    "Indeterminate call {call_id} resolved as Succeeded",
+                                ),
+                            })
+                            .await;
+                    }
+                    crate::command::IndeterminateResolution::Failed => {
+                        if let Some(ref writer) = self.writer {
+                            let _ = writer
+                                .write_tool_outcome_resolved(
+                                    &call_id,
+                                    None, // operation_id
+                                    "failed",
+                                    content.as_deref(),
+                                    Some("user"),
+                                )
+                                .await;
+                        }
+                        let _ = self.event_tx
+                            .send(SessionEvent::Info {
+                                message: format!(
+                                    "Indeterminate call {call_id} resolved as Failed",
+                                ),
+                            })
+                            .await;
+                    }
+                    crate::command::IndeterminateResolution::Retry => {
+                        // No ToolOutcomeResolved — the model will re-issue
+                        // the call in a future Turn. Just inform the frontend.
+                        let _ = self.event_tx
+                            .send(SessionEvent::Info {
+                                message: format!(
+                                    "Indeterminate call {call_id} discarded — model will retry",
+                                ),
+                            })
+                            .await;
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -623,6 +692,72 @@ impl SessionSupervisor {
                 })
                 .await;
         }
+
+        // ── Indeterminate tool call detection ───────────────────────
+        // After replay, check for tool calls that started but never
+        // finished (ToolExecutionStarted without matching
+        // ToolExecutionFinished/ToolResultCommitted). These represent
+        // side effects in an unknown state — the user must adjudicate.
+        let checkpoint = grodex_rollout::recovery::recover_from_journal(&events);
+        for (call_id, fate) in &checkpoint.call_fate {
+            if matches!(fate, grodex_rollout::recovery::ToolCallFate::Indeterminate) {
+                // Look up the tool name from the journal events.
+                let tool_name = events
+                    .iter()
+                    .find(|ev| {
+                        ev.payload.get("call_id").and_then(|v| v.as_str()) == Some(call_id.as_str())
+                            && ev.event_type == grodex_rollout::event::RolloutEventType::ToolExecutionStarted
+                    })
+                    .and_then(|ev| ev.payload.get("name").and_then(|v| v.as_str()))
+                    .unwrap_or("unknown")
+                    .to_string();
+                // Write the durable indeterminate marker so future
+                // resumes don't re-report the same call.
+                if let Some(w) = &self.writer {
+                    let _ = w
+                        .write_tool_outcome_indeterminate(
+                            call_id,
+                            None,
+                            &tool_name,
+                            "crash_recovery: started without finished",
+                        )
+                        .await;
+                }
+                // Surface to frontend so the user can adjudicate.
+                let _ = self.event_tx
+                    .send(SessionEvent::IndeterminateToolCall {
+                        call_id: call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        message: format!(
+                            "Tool '{}' (call_id={}) was executing when the session crashed. \
+                             The side effect state is unknown — inspect the real-world result \
+                             and resolve as Succeeded, Failed, or Retry.",
+                            tool_name, call_id,
+                        ),
+                    })
+                    .await;
+            }
+        }
+
+        // ── Pending approval restoration ────────────────────────────
+        // Re-surface approval tickets that were requested but never
+        // resolved before the crash. The user needs to adjudicate them
+        // so the corresponding tool calls can proceed (or be denied).
+        for ticket in checkpoint.pending_approval_tickets() {
+            let _ = self.event_tx
+                .send(SessionEvent::ApprovalRequested {
+                    ticket_id: ticket.ticket_id.clone(),
+                    tool_name: ticket.tool_name.clone(),
+                    summary: format!(
+                        "[recovered-pending] Tool '{}' approval was requested \
+                         before the session disconnected. Please resolve.",
+                        ticket.tool_name,
+                    ),
+                    risk: "recovered".into(),
+                    timeout_remaining_ms: 120_000,
+                })
+                .await;
+        }
     }
 
     async fn start_turn(&mut self, user_input: String) {
@@ -668,19 +803,34 @@ impl SessionSupervisor {
 
         // Build system instructions via PromptBuilder + Memory + Discovery.
         //
-        // P1-2: SkillCatalog and instruction discovery are cached across
-        // turns — the filesystem walk is the expensive part, and the
-        // skill set / AGENTS.md content don't change mid-session. Only
-        // memory retrieval runs per-turn (query depends on user input).
-        //
-        // Discovery (Design Doc 19 §7) walks three layers:
-        //   1. Fixed roots (~/.agent/AGENTS.md, ~/.agent/rules/*.md)
-        //   2. Workspace chain (root→cwd scanning AGENTS.md + .agent/rules)
-        //   3. Compatibility (.grok/.codex/.claude/.cursor)
-        // Untrusted workspace content is excluded (fail-closed).
-        if self.skill_catalog.is_none() {
-            self.skill_catalog = Some(SkillCatalog::discover(&self.cwd));
+        // Skill discovery + change detection (Design Doc 08 §6):
+        //   - Re-discover skills every Turn (cheap filesystem walk)
+        //   - Compare content_hash against previous Turn's snapshot
+        //   - If changed, bump skill_generation so the model sees updates
+        //   - Freeze a Turn-level snapshot (immutable mid-Turn)
+        //   - Write SkillSnapshotRecorded to journal for version auditing
+        let new_catalog = SkillCatalog::discover(&self.cwd);
+        if let Some(prev) = &self.prev_skill_snapshot {
+            if new_catalog.has_changed_since(prev) {
+                self.skill_generation = self.skill_generation.wrapping_add(1);
+            }
         }
+        let snapshot = new_catalog.snapshot();
+        if let Some(ref writer) = self.writer {
+            let skills_json: Vec<serde_json::Value> = snapshot.iter().map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "source": format!("{:?}", s.source),
+                    "path": s.path.to_string_lossy(),
+                    "content_hash": s.content_hash,
+                })
+            }).collect();
+            let _ = writer
+                .write_skill_snapshot(turn_id, &skills_json, self.skill_generation)
+                .await;
+        }
+        self.prev_skill_snapshot = Some(snapshot);
+        self.skill_catalog = Some(new_catalog);
         if self.cached_discovered_nodes.is_none() {
             let mut tmp = grodex_prompt::PromptBuilder::new();
             tmp.discover_instructions(&self.cwd, self.workspace_trusted);

@@ -10,6 +10,7 @@
 
 use crate::store::{StoreError, TicketStore};
 use crate::ticket::{ApprovalTicket, TicketStatus};
+use crate::resolution::ApprovalResolution;
 use grodex_core::policy::PolicyDecision;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -72,7 +73,7 @@ impl ApprovalBroker {
         let Some(store) = &self.store else { return };
         let Ok(pending) = store.get_pending_tickets() else { return };
         for mut ticket in pending {
-            let (tx, _rx) = oneshot::channel::<PolicyDecision>();
+            let (tx, _rx) = oneshot::channel::<ApprovalResolution>();
             ticket.decision_tx = Some(tx);
             if ticket.summary.is_empty() {
                 ticket.summary = "recovered-pending".to_string();
@@ -84,11 +85,11 @@ impl ApprovalBroker {
         }
     }
 
-    pub fn submit(&mut self, ticket: ApprovalTicket) -> oneshot::Receiver<PolicyDecision> {
+    pub fn submit(&mut self, ticket: ApprovalTicket) -> oneshot::Receiver<ApprovalResolution> {
         self.submit_ticket(ticket)
     }
 
-    pub fn submit_ticket(&mut self, ticket: ApprovalTicket) -> oneshot::Receiver<PolicyDecision> {
+    pub fn submit_ticket(&mut self, ticket: ApprovalTicket) -> oneshot::Receiver<ApprovalResolution> {
         let (tx, rx) = oneshot::channel();
         let ticket_id = ticket.ticket_id.clone();
         let ticket_with_tx = ApprovalTicket {
@@ -141,7 +142,7 @@ impl ApprovalBroker {
         // mint, etc.) will see the narrowed version, not the original
         // model-issued one.
         if let Some(narrowed) = narrowed_args {
-            ticket.arguments_snapshot = Some(narrowed);
+            ticket.arguments_snapshot = Some(narrowed.clone());
         }
 
         if let Some(store) = &self.store {
@@ -155,8 +156,26 @@ impl ApprovalBroker {
             }
         }
 
+        // Build the ApprovalResolution to send through the channel.
+        // This is where Narrow actually starts to work: the narrowed_args
+        // are bundled into the resolution so the waiting tool future can
+        // REPLACE its execution args with the narrowed subset.
+        let resolution = match decision {
+            PolicyDecision::Allow => {
+                if let Some(narrowed) = &ticket.arguments_snapshot {
+                    // The user approved with narrowed_args — construct
+                    // a Narrow resolution that carries them.
+                    ApprovalResolution::Narrow { narrowed_args: narrowed.clone() }
+                } else {
+                    ApprovalResolution::Allow
+                }
+            }
+            PolicyDecision::Deny => ApprovalResolution::Deny,
+            PolicyDecision::Ask => ApprovalResolution::Cancel,
+        };
+
         if let Some(tx) = ticket.take_tx() {
-            let _ = tx.send(decision);
+            let _ = tx.send(resolution);
         }
         true
     }
@@ -169,7 +188,7 @@ impl ApprovalBroker {
             ticket.status = TicketStatus::Cancelled;
             ticket.policy_decision = Some(PolicyDecision::Deny);
             if let Some(tx) = ticket.take_tx() {
-                let _ = tx.send(PolicyDecision::Deny);
+                let _ = tx.send(ApprovalResolution::Cancel);
             }
         }
     }
@@ -195,7 +214,7 @@ impl ApprovalBroker {
                     );
                 }
                 if let Some(tx) = ticket.take_tx() {
-                    let _ = tx.send(PolicyDecision::Deny);
+                    let _ = tx.send(ApprovalResolution::Deny);
                 }
             }
         }
@@ -242,7 +261,7 @@ mod tests {
         assert_eq!(broker.pending_count(), 0);
 
         let decision = rx.try_recv().unwrap();
-        assert_eq!(decision, PolicyDecision::Allow);
+        assert_eq!(decision, ApprovalResolution::Allow);
     }
 
     #[test]
@@ -259,7 +278,7 @@ mod tests {
         broker.cancel_all();
 
         let decision = rx.try_recv().unwrap();
-        assert_eq!(decision, PolicyDecision::Deny);
+        assert_eq!(decision, ApprovalResolution::Cancel);
     }
 
     #[test]

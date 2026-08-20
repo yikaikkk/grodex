@@ -3,17 +3,35 @@
 //! Provides listing, lookup, and prompt formatting for system prompt assembly.
 
 use crate::discovery::SkillDiscovery;
-use crate::skill::Skill;
-use std::path::Path;
+use crate::lint::{lint_catalog, LintReport};
+use crate::skill::{Skill, SkillSource};
+use std::path::{Path, PathBuf};
 
 /// A collection of all discovered skills.
 #[derive(Debug, Clone, Default)]
 pub struct SkillCatalog {
     skills: Vec<Skill>,
+    /// Lint reports from the last discovery run. Skills with error-level
+    /// findings are excluded from the catalog entirely.
+    lint_reports: Vec<LintReport>,
+}
+
+/// A frozen snapshot of a single skill at Turn-start time.
+/// Once a Turn begins, the skill content cannot change mid-Turn even
+/// if the underlying file is modified on disk (Design Doc 08 §6).
+#[derive(Debug, Clone)]
+pub struct SkillSnapshot {
+    pub name: String,
+    pub source: SkillSource,
+    pub path: PathBuf,
+    pub content_hash: String,
+    pub content: String,
 }
 
 impl SkillCatalog {
     /// Discover all skills from standard locations.
+    /// Runs lint during discovery: skills with error-level findings
+    /// are excluded from the catalog (Design Doc 08 §7: "Lint 接入").
     pub fn discover(cwd: &Path) -> Self {
         let mut skills = Vec::new();
         // Project first (higher priority), then user.
@@ -23,7 +41,20 @@ impl SkillCatalog {
         let mut seen = std::collections::HashSet::new();
         skills.retain(|s| seen.insert(s.name.clone()));
         skills.sort_by(|a, b| a.name.cmp(&b.name));
-        Self { skills }
+
+        // Run lint and filter out error-level skills.
+        let reports = lint_catalog(&skills);
+        let error_names: std::collections::HashSet<&str> = reports
+            .iter()
+            .filter(|r| !r.is_indexable())
+            .map(|r| r.skill_name.as_str())
+            .collect();
+        skills.retain(|s| !error_names.contains(s.name.as_str()));
+
+        Self {
+            skills,
+            lint_reports: reports,
+        }
     }
 
     /// List all skill references.
@@ -47,6 +78,8 @@ impl SkillCatalog {
     }
 
     /// Format all skills as a compact prompt listing.
+    /// Includes the full skill content so the model can actually
+    /// follow the instructions (Design Doc 08 §6: "正文加载").
     pub fn format_for_prompt(&self) -> String {
         if self.skills.is_empty() {
             return String::new();
@@ -54,9 +87,11 @@ impl SkillCatalog {
 
         let mut out = String::from("## Available Skills\n\n");
         for skill in &self.skills {
-            out.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
+            out.push_str(&format!(
+                "### {}\n**Description**: {}\n\n{}\n\n",
+                skill.name, skill.description, skill.content
+            ));
         }
-        out.push('\n');
         out
     }
 
@@ -67,6 +102,46 @@ impl SkillCatalog {
             out.push_str(&format!("## Skill: {}\n{}\n\n", skill.name, skill.content));
         }
         out
+    }
+
+    /// Freeze a Turn-level snapshot of all skills (Design Doc 08 §6).
+    /// Once a Turn starts, the snapshot is immutable — mid-Turn file
+    /// changes cannot affect the in-progress Turn.
+    pub fn snapshot(&self) -> Vec<SkillSnapshot> {
+        self.skills
+            .iter()
+            .map(|s| SkillSnapshot {
+                name: s.name.clone(),
+                source: s.source,
+                path: s.path.clone(),
+                content_hash: s.content_hash.clone().unwrap_or_default(),
+                content: s.content.clone(),
+            })
+            .collect()
+    }
+
+    /// Return the lint reports from the last discovery run.
+    pub fn lint_reports(&self) -> &[LintReport] {
+        &self.lint_reports
+    }
+
+    /// Detect whether any skill content has changed since a prior
+    /// snapshot set (Design Doc 08 §6: "变更检测"). Returns true if
+    /// any hash differs or the set of skill names changed.
+    pub fn has_changed_since(&self, prev: &[SkillSnapshot]) -> bool {
+        if self.skills.len() != prev.len() {
+            return true;
+        }
+        for skill in &self.skills {
+            let Some(prev_skill) = prev.iter().find(|p| p.name == skill.name) else {
+                return true;
+            };
+            let current_hash = skill.content_hash.as_deref().unwrap_or("");
+            if current_hash != prev_skill.content_hash {
+                return true;
+            }
+        }
+        false
     }
 }
 

@@ -131,6 +131,14 @@ pub enum RolloutEventType {
     /// A lease reached its TTL without a matching LeaseConsumed (or the
     /// owning ticket expired). Schema: lease_id, reason
     LeaseExpired,
+    /// A Turn-level skill snapshot was frozen at Turn start.
+    /// Records the skill name, source, path, and content_hash for
+    /// each skill active during the Turn — enables version auditing
+    /// and replay reproducibility (Design Doc 08 §6).
+    /// Schema:
+    ///   - skills: [{ name, source, path, content_hash }]
+    ///   - skill_generation: u64
+    SkillSnapshotRecorded,
 }
 
 /// Sensitivity classification for an event.

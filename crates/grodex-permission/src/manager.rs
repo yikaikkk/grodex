@@ -56,7 +56,7 @@ pub enum PermissionResult {
     /// Operation requires user approval. Await the receiver for the decision.
     ApprovalRequired {
         ticket_id: String,
-        decision_rx: oneshot::Receiver<PolicyDecision>,
+        decision_rx: oneshot::Receiver<crate::resolution::ApprovalResolution>,
     },
 }
 
@@ -126,6 +126,32 @@ impl PermissionManager {
             sandbox_validator: None,
             revocation_epoch: 0,
             approval_tx: None,
+        }
+    }
+
+    /// Create a new manager with SQLite-backed approval broker for crash
+    /// recovery. Pending tickets survive a crash and are restored on
+    /// the next session start via `recover_pending_from_store()`.
+    ///
+    /// Fail-closed: if the SQLite store cannot be opened, falls back to
+    /// in-memory mode (logging to stderr) so the session can still run —
+    /// the persistence layer is a durability enhancement, not a gate.
+    pub fn new_with_db<P: Into<std::path::PathBuf>>(
+        policy: PermissionPolicy,
+        db_path: P,
+    ) -> Self {
+        match ApprovalBroker::try_new_with_db(Duration::from_secs(120), db_path) {
+            Ok(broker) => Self {
+                broker,
+                policy,
+                sandbox_validator: None,
+                revocation_epoch: 0,
+                approval_tx: None,
+            },
+            Err(e) => {
+                eprintln!("[warn] approval SQLite store unavailable, using in-memory: {e}");
+                Self::new(policy)
+            }
         }
     }
 
@@ -337,6 +363,18 @@ impl PermissionManager {
         })
     }
 
+    /// Return all pending tickets as lightweight info — used during
+    /// resume to re-emit `ApprovalRequested` events to the frontend for
+    /// tickets that were created but never resolved before the crash.
+    pub fn all_pending_tickets(&self) -> Vec<PendingTicketInfo> {
+        self.broker.pending_tickets().iter().filter_map(|tid| {
+            self.broker.pending_ticket(tid).map(|t| PendingTicketInfo {
+                call_id: Some(t.tool_call_id.to_string()),
+                tool_name: Some(t.tool_name.clone()),
+            })
+        }).collect()
+    }
+
     /// Assess risk level based on tool name and arguments.
     fn assess_risk(tool_name: &str, args: &serde_json::Value) -> RiskLevel {
         match tool_name {
@@ -371,7 +409,7 @@ impl Default for PermissionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::resolution::ApprovalResolution;
     #[test]
     fn permissive_policy_allows_immediately() {
         let mut mgr = PermissionManager::new(PermissionPolicy::permissive());
@@ -490,7 +528,7 @@ mod tests {
         let decision = decision_rx
             .await
             .expect("decision_rx must be woken after resolve()");
-        assert_eq!(decision, PolicyDecision::Allow);
+        assert_eq!(decision, ApprovalResolution::Allow);
     }
 
     /// End-to-end Deny path: resolve(Deny) must wake the tool with Deny so
@@ -531,6 +569,6 @@ mod tests {
         let decision = decision_rx
             .await
             .expect("decision_rx must be woken after Deny resolve");
-        assert_eq!(decision, PolicyDecision::Deny);
+        assert_eq!(decision, ApprovalResolution::Deny);
     }
 }

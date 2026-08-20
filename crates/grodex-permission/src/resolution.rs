@@ -21,7 +21,7 @@ use grodex_core::policy::PolicyDecision;
 use std::time::{Duration, Instant};
 
 /// The outcome of resolving an approval ticket.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ApprovalResolution {
     /// Approved — execute the full requested scope.
     Allow,

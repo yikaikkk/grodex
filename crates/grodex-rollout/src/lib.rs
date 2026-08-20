@@ -23,4 +23,4 @@ pub use invariants::{
     NoCommittedBeforePrepared, TurnCompletionClosure, run_all_invariants,
 };
 pub use journal_actor::{FsyncPolicy, JournalHandle, replay_journal_strict};
-pub use recovery::{ApprovalTicketResolution, RecoveryCheckpoint, ToolCallFate, recover_from_journal};
+pub use recovery::{ApprovalTicketResolution, RecoveryCheckpoint, RequestedTicketInfo, ToolCallFate, recover_from_journal};

@@ -605,6 +605,31 @@ impl RolloutWriter {
         self.write(RolloutEventType::LeaseExpired, None, None, None, payload, true).await
     }
 
+    /// Record a Turn-level skill snapshot (Design Doc 08 §6).
+    /// Writes the skill name, source, path, and content_hash for each
+    /// skill active during the Turn, plus the skill_generation counter.
+    /// This enables version auditing: replay can determine exactly
+    /// which version of each skill the model saw.
+    pub async fn write_skill_snapshot(
+        &self,
+        turn_id: TurnId,
+        skills: &[serde_json::Value],
+        skill_generation: u64,
+    ) -> Result<u64, GrodexError> {
+        let payload = serde_json::json!({
+            "skills": skills,
+            "skill_generation": skill_generation,
+        });
+        self.write(
+            RolloutEventType::SkillSnapshotRecorded,
+            Some(turn_id),
+            None,
+            None,
+            payload,
+            true,
+        ).await
+    }
+
     /// Durable record of a tool-call parameter revision created by a
     /// user Narrow operation. Subsequent lookups (tool executor on
     /// resume, rollout replay) should prefer this revision's args over

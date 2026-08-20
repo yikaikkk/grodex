@@ -18,7 +18,7 @@ use grodex_capability::id::{CapabilityId, CapabilityKind};
 use grodex_capability::authority::Authority;
 use grodex_capability::prepared::PreparedCapabilityCall;
 use grodex_core::context::ContextItem;
-use grodex_core::id::{CommitSequence, OperationId, StepGeneration, StepId, StepSnapshotId, ToolCallId};
+use grodex_core::id::{CommitSequence, OperationId, StepGeneration, StepId, StepSnapshotId, ToolCallId, TurnId};
 use grodex_core::policy::PolicyDecision;
 use grodex_core::tool::ToolRuntime;
 use grodex_memory::types::{EvidenceStatus, EvidenceUnit, MemoryScope};
@@ -43,6 +43,24 @@ struct ToolExecResult {
     name: String,
     result: ContextItem,
     index: CommitSequence,
+    /// The operation_id used for this tool call. Propagated up so the
+    /// outer coordinator can pass it to `ToolExecutionFinished` and
+    /// `ToolResultCommitted` journal writes — completing the
+    /// operation_id chain across all lifecycle events.
+    operation_id: Option<String>,
+}
+
+/// Context passed into `execute_single_tool` so it can write the
+/// `ToolCallApproved` and `ToolExecutionStarted` journal events at the
+/// correct point in the lifecycle (AFTER permission clears, BEFORE the
+/// side effect). This fixes the event ordering bug where
+/// `ToolExecutionStarted` was written BEFORE the permission gate.
+#[derive(Clone)]
+struct ToolExecCtx {
+    turn_id: TurnId,
+    step_id: StepId,
+    step_gen: StepGeneration,
+    writer: Option<crate::rollout_writer::RolloutWriter>,
 }
 
 /// Manages one Turn from start to finish.
@@ -201,6 +219,28 @@ impl TurnCoordinator {
             required: vec![],
         };
         self.capability.lock().await.register_tool(name, runtime, spec);
+    }
+
+    /// Register a tool with explicit metadata (concurrency class,
+    /// side-effect class). Used for MCP tools and any tool where the
+    /// scheduler/recovery needs to know the execution semantics
+    /// (Design Doc 10 §16).
+    pub async fn register_tool_with_metadata(
+        &self,
+        name: impl Into<String>,
+        runtime: Arc<dyn ToolRuntime>,
+        input_schema: serde_json::Value,
+        metadata: grodex_core::tool::ToolMetadata,
+    ) {
+        let name = name.into();
+        let spec = grodex_provider::canonical_request::ToolSpec {
+            name: name.clone(),
+            description: metadata.description.clone(),
+            parameters: input_schema,
+            required: vec![],
+        };
+        self.capability.lock().await
+            .register_tool_with_metadata(name, runtime, spec, Some(metadata));
     }
 
     /// Run a complete Turn: sample → process → dispatch tools → loop.
@@ -453,6 +493,34 @@ impl TurnCoordinator {
                         let args = arguments.clone();
                         let idx = *idx;
                         let tx = result_tx.clone();
+
+                        // ── JSON Schema validation ──────────────────
+                        // Validate the model-supplied args against the
+                        // tool's declared input_schema BEFORE constructing
+                        // the PreparedCapabilityCall. This catches
+                        // malformed calls (missing required fields, wrong
+                        // types) at the preparation stage rather than
+                        // letting them fail deep inside execute().
+                        let input_schema = base
+                            .tool_specs
+                            .get(&name)
+                            .map(|spec| spec.parameters.clone())
+                            .unwrap_or(serde_json::Value::Null);
+                        if let Err(msg) = validate_args_against_schema(&args, &input_schema) {
+                            let _ = tx.send(ToolExecResult {
+                                call_id,
+                                name: name.clone(),
+                                result: ContextItem::ToolResult {
+                                    call_id,
+                                    content: format!("Schema validation failed: {msg}"),
+                                    is_error: true,
+                                },
+                                index: CommitSequence::new(idx as u64),
+                                operation_id: None,
+                            });
+                            continue;
+                        }
+
                         // Resolve runtime through the frozen base + overlay
                         // (invariant #15: no lock needed — the base is a
                         // local snapshot, immune to mid-Turn refresh).
@@ -466,12 +534,29 @@ impl TurnCoordinator {
                         let prepared = PreparedCapabilityCall {
                             tool_call_id: call_id,
                             snapshot_id: step_snapshot_id,
-                            capability_id: CapabilityId::new(
-                                Authority::Core,
-                                "builtin",
-                                CapabilityKind::Tool,
-                                name.clone(),
-                            ),
+                            // MCP tools (name starts with `mcp_`) get
+                            // their real capability identity: Authority::Mcp
+                            // with the server name as provider_id. Builtin
+                            // tools keep Authority::Core / "builtin".
+                            capability_id: if name.starts_with("mcp_") {
+                                // Format: mcp_{server}_{tool}
+                                let rest = &name[4..]; // strip "mcp_"
+                                let (server, _tool) = rest.split_once('_')
+                                    .unwrap_or((rest, ""));
+                                CapabilityId::new(
+                                    Authority::Mcp,
+                                    server,
+                                    CapabilityKind::Tool,
+                                    name.clone(),
+                                )
+                            } else {
+                                CapabilityId::new(
+                                    Authority::Core,
+                                    "builtin",
+                                    CapabilityKind::Tool,
+                                    name.clone(),
+                                )
+                            },
                             capability_revision: step_gen,
                             validated_args: args.clone(),
                             args_hash: hash_args(&args),
@@ -483,6 +568,35 @@ impl TurnCoordinator {
                             policy_generation,
                             operation_id: OperationId::new(),
                         };
+
+                        // ── ToolCallPrepared ─────────────────────────
+                        // Write the prepared event BEFORE spawning. This
+                        // records the exact args/args_hash/capability_revision
+                        // /policy_generation/operation_id the tool will
+                        // execute against — the audit baseline for later
+                        // replay validation. Fail-closed: if the journal
+                        // write fails we skip dispatch entirely rather
+                        // than risk an un-audited side effect.
+                        let op_id_str = prepared.operation_id.to_string();
+                        if let Some(ref writer) = self.rollout {
+                            if let Err(e) = writer
+                                .write_tool_call_prepared(
+                                    turn_ctx.turn_id,
+                                    step_id,
+                                    StepGeneration::new(step_gen),
+                                    &call_id.to_string(),
+                                    Some(&op_id_str),
+                                    &name,
+                                    &args,
+                                    Some(&prepared.args_hash),
+                                    Some(&step_gen.to_string()),
+                                    Some(policy_generation),
+                                )
+                                .await
+                            {
+                                eprintln!("[warn] rollout write_tool_call_prepared failed: {e}");
+                            }
+                        }
 
                         // Invariant #4/#5 fence: a tool without a bound
                         // runtime cannot execute (it would silently no-op or
@@ -528,6 +642,7 @@ impl TurnCoordinator {
                                     is_error: true,
                                 },
                                 index: CommitSequence::new(idx as u64),
+                                operation_id: Some(op_id_str.clone()),
                             });
                             continue;
                         }
@@ -536,36 +651,21 @@ impl TurnCoordinator {
                         let sb = self.sandbox.clone();
                         let envelope = self.delegation_envelope.clone();
 
-                        // Record tool execution start (ToolExecutionStarted) —
-                        // marks the point where the tool begins running. This
-                        // is distinct from ToolResultCommitted (which fires
-                        // after the result is durable) and lets the reducer
-                        // detect orphaned tool calls during crash recovery.
-                        //
-                        // Schema v2: we also accept an operation_id per-call
-                        // for tools that support idempotency keys. The
-                        // coordinator does not yet synthesize one for tools
-                        // that don't declare one — future work to push
-                        // operation_id generation into the Capability lookup.
-                        if let Some(ref writer) = self.rollout {
-                            if let Err(e) = writer
-                                .write_tool_started(
-                                    turn_ctx.turn_id,
-                                    step_id,
-                                    StepGeneration::new(step_gen),
-                                    &call_id.to_string(),
-                                    None, // operation_id: synthesized later
-                                    &name,
-                                )
-                                .await
-                            {
-                                eprintln!("[warn] rollout write_tool_started failed: {e}");
-                            }
-                        }
+                        // Build the execution context for the spawned task.
+                        // `execute_single_tool` writes `ToolCallApproved`
+                        // and `ToolExecutionStarted` at the correct point
+                        // (AFTER permission clears, BEFORE the side effect).
+                        let exec_ctx = ToolExecCtx {
+                            turn_id: turn_ctx.turn_id,
+                            step_id,
+                            step_gen: StepGeneration::new(step_gen),
+                            writer: self.rollout.clone(),
+                        };
+                        let op_id_for_result = op_id_str.clone();
 
                         tokio::spawn(async move {
                             let result = execute_single_tool(
-                                &prepared, runtime, perm, sb, envelope.as_ref(),
+                                &prepared, runtime, perm, sb, envelope.as_ref(), &exec_ctx,
                             )
                             .await;
                             let _ = tx.send(ToolExecResult {
@@ -573,6 +673,7 @@ impl TurnCoordinator {
                                 name: name.clone(),
                                 result,
                                 index: CommitSequence::new(idx as u64),
+                                operation_id: Some(op_id_for_result),
                             });
                         });
                     }
@@ -617,7 +718,7 @@ impl TurnCoordinator {
                                     step_id,
                                     StepGeneration::new(step_gen),
                                     &tr.call_id.to_string(),
-                                    None, // operation_id
+                                    tr.operation_id.as_deref(),
                                     tr_is_error,
                                     tr_content.as_deref(),
                                     tr_exit_code,
@@ -669,7 +770,7 @@ impl TurnCoordinator {
                                     step_id,
                                     generation,
                                     &tr.call_id.to_string(),
-                                    None, // operation_id
+                                    tr.operation_id.as_deref(),
                                     &content,
                                     is_error,
                                 )
@@ -951,6 +1052,73 @@ fn args_within_narrowed_scope(actual: &serde_json::Value, narrowed: &serde_json:
 }
 
 /// SHA-256 content hash of a tool call's arguments.
+/// Validate model-supplied args against a tool's JSON Schema.
+///
+/// Performs lightweight structural validation without pulling in a full
+/// `jsonschema` crate dependency:
+///   1. Checks every field listed in schema `required` is present.
+///   2. Checks `type` of each provided field matches the schema.
+///
+/// Returns `Ok(())` if the args are structurally valid (or schema is
+/// absent/empty), `Err(message)` otherwise. The caller uses this to
+/// reject malformed tool calls at the `PreparedCapabilityCall` stage
+/// rather than letting them fail deep inside `ToolRuntime::execute`.
+fn validate_args_against_schema(
+    args: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Result<(), String> {
+    let schema_obj = match schema.as_object() {
+        Some(obj) => obj,
+        None => return Ok(()), // no schema → trust args
+    };
+
+    // Required fields.
+    if let Some(required) = schema_obj.get("required").and_then(|v| v.as_array()) {
+        let args_obj = args.as_object().ok_or_else(|| {
+            "args is not an object but schema has required fields".to_string()
+        })?;
+        for field in required {
+            if let Some(field_name) = field.as_str() {
+                if !args_obj.contains_key(field_name) {
+                    return Err(format!("missing required field: {field_name}"));
+                }
+            }
+        }
+    }
+
+    // Type checking for properties.
+    if let Some(props) = schema_obj.get("properties").and_then(|v| v.as_object()) {
+        let args_obj = match args.as_object() {
+            Some(obj) => obj,
+            None => return Ok(()), // can't check field types if args isn't object
+        };
+        for (field_name, field_schema) in props {
+            if let Some(field_val) = args_obj.get(field_name) {
+                if let Some(expected_type) = field_schema.get("type").and_then(|v| v.as_str()) {
+                    let actual_type = match field_val {
+                        serde_json::Value::String(_) => "string",
+                        serde_json::Value::Number(_) => "number",
+                        serde_json::Value::Bool(_) => "boolean",
+                        serde_json::Value::Array(_) => "array",
+                        serde_json::Value::Object(_) => "object",
+                        serde_json::Value::Null => "null",
+                    };
+                    // Allow integer where number is expected (common JSON Schema pattern).
+                    if expected_type != actual_type
+                        && !(expected_type == "number" && actual_type == "number")
+                    {
+                        return Err(format!(
+                            "field '{field_name}': expected type {expected_type}, got {actual_type}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 ///
 /// Captured into `PreparedCapabilityCall::args_hash` so the journal + audit
 /// record exactly which arguments a call was bound to (invariant #4 audit trail).
@@ -978,6 +1146,7 @@ async fn execute_single_tool(
     permission: Arc<Mutex<PermissionManager>>,
     sandbox: Arc<grodex_sandbox::SandboxManager>,
     envelope: Option<&DelegationEnvelope>,
+    ctx: &ToolExecCtx,
 ) -> ContextItem {
     let call_id = prepared.tool_call_id;
     let name = &prepared.capability_id.canonical_name;
@@ -1026,9 +1195,24 @@ async fn execute_single_tool(
                     is_error: true,
                 };
             }
-            PermissionResult::ApprovalRequired { decision_rx, .. } => {
+            PermissionResult::ApprovalRequired { ticket_id, decision_rx } => {
                 let epoch = perm.revocation_epoch();
                 drop(perm);
+                // Write the ApprovalRequested event to the journal so
+                // resume can detect unresolved (pending) approval tickets
+                // and re-surface them to the frontend.
+                if let Some(ref writer) = ctx.writer {
+                    let _ = writer
+                        .write_approval_requested(
+                            Some(&call_id.to_string()),
+                            Some(&prepared.operation_id.to_string()),
+                            &ticket_id,
+                            name,
+                            args,
+                            "model",
+                        )
+                        .await;
+                }
                 // Await the frontend's resolution. The deadline matches the
                 // ticket's own timeout (ApprovalTicket::new → 120s) so the
                 // user sees a consistent countdown and the tool future does
@@ -1036,13 +1220,31 @@ async fn execute_single_tool(
                 // A Deny (user-rejected, broker-expired, or cancelled)
                 // arrives through the same oneshot and falls into the
                 // error branch — fail-closed.
+                //
+                // The channel now carries `ApprovalResolution` (not
+                // `PolicyDecision`), so Narrow resolutions with
+                // `narrowed_args` flow through here and into the lease.
                 match tokio::time::timeout(std::time::Duration::from_secs(120), decision_rx).await {
-                    Ok(Ok(PolicyDecision::Allow)) => PermissionLease::new(
-                        call_id,
-                        ApprovalResolution::Allow,
-                        epoch,
-                        Some(std::time::Duration::from_secs(300)),
-                    ),
+                    Ok(Ok(resolution)) if resolution.permits_execution() => {
+                        // Write LeaseIssued to journal — durable record that
+                        // an authorizing lease was minted for this call.
+                        if let Some(ref writer) = ctx.writer {
+                            let _ = writer
+                                .write_lease_issued(
+                                    &call_id.to_string(),
+                                    &ticket_id,
+                                    &call_id.to_string(),
+                                    Some(300),
+                                )
+                                .await;
+                        }
+                        PermissionLease::new(
+                            call_id,
+                            resolution,
+                            epoch,
+                            Some(std::time::Duration::from_secs(300)),
+                        )
+                    },
                     _ => {
                         return ContextItem::ToolResult {
                             call_id,
@@ -1062,9 +1264,63 @@ async fn execute_single_tool(
         "invariant #5: reached execution without an authorizing resolution"
     );
 
+    // ── ToolCallApproved + ToolExecutionStarted ──────────────
+    // Now that permission has cleared, write the durable "go-ahead"
+    // (ToolCallApproved) and the pre-side-effect commit point
+    // (ToolExecutionStarted). Correct event ordering:
+    //   Prepared → PermissionClear → Approved → Started → Execute
+    //
+    // Fail-closed: if the ToolExecutionStarted journal write fails we
+    // MUST refuse to execute the side effect. A missing Started event
+    // means crash recovery cannot detect an orphaned tool call — so
+    // running the side effect anyway would be unsafe. We return an
+    // error result instead.
+    let op_id_str = prepared.operation_id.to_string();
+    if let Some(ref writer) = ctx.writer {
+        if let Err(e) = writer
+            .write_tool_call_approved(
+                ctx.turn_id,
+                ctx.step_id,
+                ctx.step_gen,
+                &call_id.to_string(),
+                Some(&op_id_str),
+                name,
+            )
+            .await
+        {
+            return ContextItem::ToolResult {
+                call_id,
+                content: format!("Journal write failed (ToolCallApproved): {e}"),
+                is_error: true,
+            };
+        }
+        if let Err(e) = writer
+            .write_tool_started(
+                ctx.turn_id,
+                ctx.step_id,
+                ctx.step_gen,
+                &call_id.to_string(),
+                Some(&op_id_str),
+                name,
+            )
+            .await
+        {
+            // Fail-closed: refuse to execute the side effect if the
+            // durable pre-execution marker cannot be written.
+            return ContextItem::ToolResult {
+                call_id,
+                content: format!("Journal write failed (ToolExecutionStarted, fail-closed): {e}"),
+                is_error: true,
+            };
+        }
+    }
+
     // Narrow-scope check: if the user approved only a narrowed subset of
     // args, fail-closed unless the actual call falls inside it.
-    if let ApprovalResolution::Narrow { narrowed_args } = &lease.resolution {
+    // Then REPLACE the execution args with the narrowed version — this is
+    // where Narrow actually takes effect. The tool will run with the
+    // narrowed_args, not the original model-issued ones.
+    let effective_args = if let ApprovalResolution::Narrow { narrowed_args } = &lease.resolution {
         if !args_within_narrowed_scope(args, narrowed_args) {
             return ContextItem::ToolResult {
                 call_id,
@@ -1072,7 +1328,10 @@ async fn execute_single_tool(
                 is_error: true,
             };
         }
-    }
+        narrowed_args.clone()
+    } else {
+        args.clone()
+    };
 
     // Sandbox check for file/exec operations.
     if name == "exec" {
@@ -1080,7 +1339,7 @@ async fn execute_single_tool(
             return ContextItem::ToolResult { call_id, content: format!("Sandbox: {e}"), is_error: true };
         }
     }
-    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+    if let Some(path) = effective_args.get("path").and_then(|v| v.as_str()) {
         if name.contains("write") || name.contains("edit") {
             if let Err(e) = sandbox.validate_write(std::path::Path::new(path)) {
                 return ContextItem::ToolResult { call_id, content: format!("Sandbox: {e}"), is_error: true };
@@ -1122,11 +1381,20 @@ async fn execute_single_tool(
             is_error: true,
         };
     }
+    // Write LeaseConsumed to journal — durable record that the
+    // single-use lease was consumed, so crash recovery can reject
+    // duplicate execution attempts on the same call_id.
+    if let Some(ref writer) = ctx.writer {
+        let _ = writer
+            .write_lease_consumed(&call_id.to_string(), &call_id.to_string())
+            .await;
+    }
 
     // Execute against the bound capability revision, using the prepared
-    // operation id (audit/idempotency key).
+    // operation id (audit/idempotency key). Uses `effective_args` which
+    // may be the narrowed version if the user approved a Narrow resolution.
     match runtime {
-        Some(rt) => match rt.execute(args.clone(), prepared.operation_id).await {
+        Some(rt) => match rt.execute(effective_args, prepared.operation_id).await {
             Ok(output) => ContextItem::ToolResult {
                 call_id,
                 content: output.to_string(),

@@ -404,6 +404,15 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
             let env = EventEnvelope::wrap(seq, session_id, UpdateContent::RequestPermission(payload));
             Some(ServerFrame::Event(env))
         }
+        LoopSessionEvent::IndeterminateToolCall { call_id, tool_name, message } => {
+            let content = UpdateContent::ItemStarted {
+                item_id: call_id,
+                item_type: format!("indeterminate:{tool_name}"),
+            };
+            let _ = message; // message is logged but not forwarded as ACP
+            let env = EventEnvelope::wrap(seq, session_id, content);
+            Some(ServerFrame::Event(env))
+        }
     }
 }
 
@@ -1318,6 +1327,9 @@ async fn run_interactive_with(
                 Some(LoopSessionEvent::ApprovalRequested { ticket_id, tool_name, risk, .. }) => {
                     println!("\n[approval pending] ticket={ticket_id} tool={tool_name} risk={risk}");
                 }
+                Some(LoopSessionEvent::IndeterminateToolCall { call_id, tool_name, message }) => {
+                    println!("\n[indeterminate] call_id={call_id} tool={tool_name}: {message}");
+                }
                 None => break,
             }
         }
@@ -1777,6 +1789,14 @@ fn summarize_payload(
             let lease = payload.get("lease_id").and_then(|v| v.as_str()).unwrap_or("?");
             let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
             format!("lease expired id={lease} reason={reason}")
+        }
+        SkillSnapshotRecorded => {
+            let skill_gen = payload.get("skill_generation").and_then(|v| v.as_u64()).unwrap_or(0);
+            let count = payload.get("skills")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            format!("skill snapshot gen={skill_gen} count={count}")
         }
     }
 }
