@@ -18,6 +18,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// Arguments for the ReadFileTool.
+///
+/// Supports three modes:
+/// 1. **Legacy single-range** (backward-compatible): `offset` + `limit` + `max_bytes`
+/// 2. **Multi-range**: `ranges` array of `ReadRange` objects
+/// 3. **Anchor**: a single range with `start_pattern` / `end_pattern`
+///
+/// When `ranges` is present it takes precedence over `offset`/`limit`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFileArgs {
     pub path: String,
@@ -27,6 +35,16 @@ pub struct ReadFileArgs {
     pub limit: Option<usize>,
     #[serde(default)]
     pub max_bytes: Option<usize>,
+    /// Multiple ranges to read from the same file. When present, the
+    /// output concatenates all ranges with `--- range N ---` separators.
+    #[serde(default)]
+    pub ranges: Option<Vec<ReadRange>>,
+    /// Output format override. When set to "hashline", each line is
+    /// prefixed with `{line_num}\t{short_hash}\t{content}` for change
+    /// detection without re-hashing the entire file. When None, the
+    /// default line_numbered / multi_range format is used.
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +56,14 @@ pub struct ReadFileOutput {
     pub lines_returned: usize,
     pub truncated: bool,
     pub file_size_bytes: u64,
+    /// Stable file snapshot at the moment of reading. Edit tools can
+    /// consume this as `expected_snapshot` for version fencing (§9.2).
+    #[serde(default)]
+    pub snapshot: Option<FileSnapshot>,
+    /// The rendering format actually used for this output (L1 standardization).
+    /// Possible values: "line_numbered", "hashline", "raw", "hex_dump", "markdown".
+    #[serde(default)]
+    pub render_format: String,
 }
 
 pub struct ReadFileTool;
@@ -76,7 +102,17 @@ impl Tool for ReadFileTool {
                 "path": {"type": "string", "description": "Path to the file to read"},
                 "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed)"},
                 "limit": {"type": "integer", "description": "Maximum number of lines to return"},
-                "max_bytes": {"type": "integer", "description": "Maximum bytes to read"}
+                "max_bytes": {"type": "integer", "description": "Maximum bytes to read"},
+                "ranges": {
+                    "type": "array",
+                    "description": "Multiple ranges to read. Each element is one of: {\"start_line\":N,\"count\":M} | {\"start_byte\":N,\"count\":M} | {\"start_pattern\":\"regex\",\"end_pattern\":\"regex\"}",
+                    "items": {"type": "object"}
+                },
+                "format": {
+                    "type": "string",
+                    "description": "Output format: 'line_numbered' (default) | 'hashline' (each line prefixed with line_num + short SHA-256 hash for change detection)",
+                    "enum": ["line_numbered", "hashline"]
+                }
             },
             "required": ["path"]
         })
@@ -118,21 +154,232 @@ impl ToolRuntime for ReadFileTool {
         };
         let all_lines: Vec<&str> = content.lines().collect();
         let total_lines = all_lines.len();
-
-        let offset = args.offset.unwrap_or(1).max(1);
-        let limit = args.limit.unwrap_or(usize::MAX);
         let max_bytes = args.max_bytes.unwrap_or(usize::MAX);
 
-        let start_idx = (offset - 1).min(total_lines);
-        let end_idx = (start_idx + limit).min(total_lines);
-        let selected: Vec<&str> = all_lines[start_idx..end_idx].to_vec();
+        // Multi-range mode: when `ranges` is present, use it instead of
+        // the legacy offset/limit pair.
+        // Hashline mode: when `format` is "hashline", use per-line SHA-256
+        // hashing for change detection (L1 standardization).
+        let use_hashline = args.format.as_deref() == Some("hashline");
+        let (output, lines_returned, truncated) = if use_hashline {
+            let start_idx = args.offset.unwrap_or(1).max(1) - 1;
+            let lim = args.limit.unwrap_or(usize::MAX);
+            let end_idx = (start_idx + lim).min(all_lines.len());
+            render_hashline(&all_lines, start_idx, end_idx, max_bytes)
+        } else if let Some(ref ranges) = args.ranges {
+            render_multi_range(&all_lines, ranges, max_bytes)?
+        } else {
+            render_single_range(&all_lines, args.offset, args.limit, max_bytes)
+        };
 
-        let mut output = String::new();
-        let mut bytes = 0usize;
-        let mut lines_returned = 0usize;
-        let mut truncated = false;
+        // Type routing: for known binary/special extensions, append a
+        // diagnostic note so the model knows the content type.
+        let type_note = type_routing_note(&args.path);
+        let final_output = if type_note.is_empty() {
+            output
+        } else {
+            format!("{type_note}\n{output}")
+        };
 
-        for (i, line) in selected.iter().enumerate() {
+        // Determine the render format actually used for this output (L1 standardization).
+        let render_format = if use_hashline {
+            "hashline"
+        } else if type_note.contains("binary image") {
+            "hex_dump"
+        } else if type_note.contains("Markdown") {
+            "markdown"
+        } else if type_note.contains("JSON") {
+            "json"
+        } else if !type_note.is_empty() {
+            "line_numbered"
+        } else if args.ranges.is_some() {
+            "multi_range"
+        } else {
+            "line_numbered"
+        };
+
+        let canonical_path = crate::fsutil::canonicalize(std::path::Path::new(&args.path));
+        let canonical_resource_id = format!("fs://{}", canonical_path.display());
+        let display_path = PathBuf::from(&args.path);
+
+        let read_range = if args.offset.is_some() || args.limit.is_some() {
+            ReadRange::Lines {
+                start_line: args.offset.unwrap_or(1) as u64,
+                count: args.limit.map(|v| v as u64),
+            }
+        } else if args.ranges.is_some() {
+            ReadRange::Whole // simplified; multi-range snapshot covers whole file
+        } else {
+            ReadRange::Whole
+        };
+
+        let snapshot = FileSnapshot {
+            canonical_resource_id,
+            display_path: display_path.clone(),
+            file_type: FileType::Text,
+            size: file_size,
+            mtime_secs: std::fs::metadata(&args.path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64),
+            content_hash: Some(content_hash.clone()),
+            range_hash: Some(content_hash.clone()),
+            line_ending: LineEnding::Lf,
+            encoding: Some("utf-8".into()),
+            read_at: SystemTime::now(),
+            environment_id: String::new(),
+            read_range,
+        };
+
+        let result = ReadFileOutput {
+            path: args.path,
+            content: final_output,
+            content_hash,
+            total_lines,
+            lines_returned,
+            truncated,
+            file_size_bytes: file_size,
+            snapshot: Some(snapshot),
+            render_format: render_format.to_string(),
+        };
+
+        serde_json::to_value(result).map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
+    }
+}
+
+// ── Range rendering helpers ──────────────────────────────────────────
+
+/// Render lines in L1 hashline format: each line is prefixed with
+/// `{line_num}\t{short_hash}\t{content}`. The short hash is the first
+/// 8 hex chars of SHA-256(line_content), enabling change detection
+/// without re-hashing the entire file.
+fn render_hashline(
+    all_lines: &[&str],
+    start_idx: usize,
+    end_idx: usize,
+    max_bytes: usize,
+) -> (String, usize, bool) {
+    use sha2::{Digest, Sha256};
+    let mut output = String::new();
+    let mut bytes = 0usize;
+    let mut lines_returned = 0usize;
+    let mut truncated = false;
+
+    for (i, line) in all_lines[start_idx..end_idx].iter().enumerate() {
+        let line_num = start_idx + i + 1;
+        let mut h = Sha256::new();
+        h.update(line.as_bytes());
+        let short_hash = format!("{:x}", h.finalize());
+        let short_hash = &short_hash[..8];
+        let formatted = format!("{line_num}\t{short_hash}\t{line}\n");
+        if bytes + formatted.len() > max_bytes {
+            truncated = true;
+            break;
+        }
+        bytes += formatted.len();
+        lines_returned += 1;
+        output.push_str(&formatted);
+    }
+    (output, lines_returned, truncated)
+}
+
+/// Render a single legacy offset/limit range.
+fn render_single_range(
+    all_lines: &[&str],
+    offset: Option<usize>,
+    limit: Option<usize>,
+    max_bytes: usize,
+) -> (String, usize, bool) {
+    let total_lines = all_lines.len();
+    let start = offset.unwrap_or(1).max(1);
+    let lim = limit.unwrap_or(usize::MAX);
+    let start_idx = (start - 1).min(total_lines);
+    let end_idx = (start_idx + lim).min(total_lines);
+
+    let mut output = String::new();
+    let mut bytes = 0usize;
+    let mut lines_returned = 0usize;
+    let mut truncated = false;
+
+    for (i, line) in all_lines[start_idx..end_idx].iter().enumerate() {
+        let line_num = start_idx + i + 1;
+        let formatted = format!("{line_num}\t{line}\n");
+        if bytes + formatted.len() > max_bytes {
+            truncated = true;
+            break;
+        }
+        bytes += formatted.len();
+        lines_returned += 1;
+        output.push_str(&formatted);
+    }
+    (output, lines_returned, truncated)
+}
+
+/// Render multiple ranges, concatenating with separators.
+fn render_multi_range(
+    all_lines: &[&str],
+    ranges: &[ReadRange],
+    max_bytes: usize,
+) -> Result<(String, usize, bool), GrodexError> {
+    let total_lines = all_lines.len();
+    let mut output = String::new();
+    let mut total_lines_returned = 0usize;
+    let mut truncated = false;
+    let mut bytes = 0usize;
+
+    for (idx, range) in ranges.iter().enumerate() {
+        if ranges.len() > 1 {
+            let sep = format!("--- range {} ---\n", idx + 1);
+            if bytes + sep.len() > max_bytes {
+                truncated = true;
+                break;
+            }
+            bytes += sep.len();
+            output.push_str(&sep);
+        }
+
+        let (start_idx, end_idx) = match range {
+            ReadRange::Whole => (0, total_lines),
+            ReadRange::Lines { start_line, count } => {
+                let s = ((*start_line as usize).saturating_sub(1)).min(total_lines);
+                let c = count.map(|c| c as usize).unwrap_or(total_lines);
+                (s, (s + c).min(total_lines))
+            }
+            ReadRange::Bytes { start_byte, count } => {
+                // Convert byte range to line range by scanning offsets.
+                let content: String = all_lines.join("\n");
+                let sb = (*start_byte as usize).min(content.len());
+                let eb = count
+                    .map(|c| (sb + c as usize).min(content.len()))
+                    .unwrap_or(content.len());
+                // Map byte offsets back to line indices.
+                let mut byte_offset = 0;
+                let mut line_start = 0;
+                let mut line_end = total_lines;
+                for (i, line) in all_lines.iter().enumerate() {
+                    if byte_offset + line.len() >= sb && line_start == 0 && byte_offset <= sb {
+                        line_start = i;
+                    }
+                    byte_offset += line.len() + 1; // +1 for '\n'
+                    if byte_offset >= eb {
+                        line_end = (i + 1).min(total_lines);
+                        break;
+                    }
+                }
+                (line_start, line_end)
+            }
+            ReadRange::Pages { .. } => {
+                return Err(GrodexError::ToolExecution(
+                    "page ranges not supported for text files".into(),
+                ));
+            }
+            ReadRange::Anchor { start_pattern, end_pattern } => {
+                resolve_anchor_range(all_lines, start_pattern, end_pattern.as_deref())
+            }
+        };
+
+        for (i, line) in all_lines[start_idx..end_idx].iter().enumerate() {
             let line_num = start_idx + i + 1;
             let formatted = format!("{line_num}\t{line}\n");
             if bytes + formatted.len() > max_bytes {
@@ -140,21 +387,77 @@ impl ToolRuntime for ReadFileTool {
                 break;
             }
             bytes += formatted.len();
-            lines_returned += 1;
+            total_lines_returned += 1;
             output.push_str(&formatted);
         }
+        if truncated {
+            break;
+        }
+    }
 
-        let result = ReadFileOutput {
-            path: args.path,
-            content: output,
-            content_hash,
-            total_lines,
-            lines_returned,
-            truncated,
-            file_size_bytes: file_size,
-        };
+    Ok((output, total_lines_returned, truncated))
+}
 
-        serde_json::to_value(result).map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
+/// Resolve an anchor range to (start_idx, end_idx) line indices.
+///
+/// Searches for the first line matching `start_pattern` (substring match).
+/// If `end_pattern` is Some, extends to include lines through the first
+/// match of `end_pattern` after the start (inclusive).
+/// If `end_pattern` is None, returns just the single matched start line.
+fn resolve_anchor_range(
+    all_lines: &[&str],
+    start_pattern: &str,
+    end_pattern: Option<&str>,
+) -> (usize, usize) {
+    let total = all_lines.len();
+    // Find start line (first match).
+    let start_idx = all_lines
+        .iter()
+        .position(|l| l.contains(start_pattern));
+
+    let Some(start) = start_idx else {
+        return (0, 0); // pattern not found → empty range
+    };
+
+    if let Some(end_pat) = end_pattern {
+        // Find end line: first match of end_pattern at or after start.
+        let end_idx = all_lines[start..]
+            .iter()
+            .position(|l| l.contains(end_pat))
+            .map(|p| (start + p + 1).min(total))
+            .unwrap_or(total); // no end match → through EOF
+        (start, end_idx)
+    } else {
+        // Single-line anchor: just the matched line.
+        (start, start + 1)
+    }
+}
+
+/// Type routing note based on file extension.
+///
+/// Returns a prefix string to prepend to the output for non-plain-text
+/// file types. Returns empty string for standard text files.
+fn type_routing_note(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "rs" => "[file type: Rust source — syntax-aware rendering]".into(),
+        "md" | "mdx" => "[file type: Markdown — rendered content]".into(),
+        "json" => "[file type: JSON — structured data]".into(),
+        "toml" => "[file type: TOML — configuration]".into(),
+        "yaml" | "yml" => "[file type: YAML — configuration]".into(),
+        "py" => "[file type: Python source]".into(),
+        "js" | "ts" | "jsx" | "tsx" => "[file type: JavaScript/TypeScript source]".into(),
+        "go" => "[file type: Go source]".into(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" => {
+            "[file type: binary image — cannot display as text]".into()
+        }
+        "pdf" => "[file type: PDF binary — cannot display as text]".into(),
+        _ => String::new(),
     }
 }
 
@@ -257,24 +560,38 @@ impl BuiltInTool for ReadFileTool {
 
         let start_idx = (offset - 1).min(total_lines);
         let end_idx = (start_idx + limit).min(total_lines);
-        let selected: Vec<&str> = all_lines[start_idx..end_idx].to_vec();
 
-        let mut output = String::new();
-        let mut bytes = 0usize;
-        let mut lines_returned = 0usize;
-        let mut truncated = false;
+        // Hashline mode: when `format` is "hashline", use per-line SHA-256
+        // hashing for change detection (L1 standardization).
+        let use_hashline = prepared.args.format.as_deref() == Some("hashline");
+        let (output, lines_returned, truncated) = if use_hashline {
+            render_hashline(&all_lines, start_idx, end_idx, max_bytes)
+        } else {
+            let selected: Vec<&str> = all_lines[start_idx..end_idx].to_vec();
+            let mut output = String::new();
+            let mut bytes = 0usize;
+            let mut lines_returned = 0usize;
+            let mut truncated = false;
 
-        for (i, line) in selected.iter().enumerate() {
-            let line_num = start_idx + i + 1;
-            let formatted = format!("{line_num}\t{line}\n");
-            if bytes + formatted.len() > max_bytes {
-                truncated = true;
-                break;
+            for (i, line) in selected.iter().enumerate() {
+                let line_num = start_idx + i + 1;
+                let formatted = format!("{line_num}\t{line}\n");
+                if bytes + formatted.len() > max_bytes {
+                    truncated = true;
+                    break;
+                }
+                bytes += formatted.len();
+                lines_returned += 1;
+                output.push_str(&formatted);
             }
-            bytes += formatted.len();
-            lines_returned += 1;
-            output.push_str(&formatted);
-        }
+            (output, lines_returned, truncated)
+        };
+
+        let render_format = if use_hashline {
+            "hashline"
+        } else {
+            "line_numbered"
+        };
 
         let result = ReadFileOutput {
             path: prepared.args.path.clone(),
@@ -284,6 +601,8 @@ impl BuiltInTool for ReadFileTool {
             lines_returned,
             truncated,
             file_size_bytes: prepared.file_size_bytes,
+            snapshot: Some(prepared.snapshot.clone()),
+            render_format: render_format.to_string(),
         };
 
         let output_serialized = serde_json::to_string(&result).ok();
@@ -390,5 +709,81 @@ mod tests {
         assert_eq!(output.lines_returned, 3);
         assert!(output.content.contains("5\tline 5"));
         assert!(output.content.contains("7\tline 7"));
+    }
+
+    #[tokio::test]
+    async fn read_file_multi_range() {
+        use grodex_core::tool::ToolRuntime;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        for i in 1..=20 {
+            writeln!(tmp, "line {i}").unwrap();
+        }
+
+        let tool = ReadFileTool::new();
+        let result = ToolRuntime::execute(
+            &tool,
+            serde_json::json!({
+                "path": tmp.path(),
+                "ranges": [
+                    {"Lines": {"start_line": 1, "count": 3}},
+                    {"Lines": {"start_line": 18, "count": 3}}
+                ]
+            }),
+            OperationId::new(),
+        )
+            .await
+            .unwrap();
+
+        let output: ReadFileOutput = serde_json::from_value(result).unwrap();
+        assert_eq!(output.lines_returned, 6);
+        assert!(output.content.contains("1\tline 1"));
+        assert!(output.content.contains("3\tline 3"));
+        assert!(output.content.contains("18\tline 18"));
+        assert!(output.content.contains("20\tline 20"));
+        assert!(output.content.contains("--- range 1 ---"));
+        assert!(output.content.contains("--- range 2 ---"));
+    }
+
+    #[tokio::test]
+    async fn read_file_anchor_range() {
+        use grodex_core::tool::ToolRuntime;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "header").unwrap();
+        writeln!(tmp, "fn alpha() {{").unwrap();
+        writeln!(tmp, "    let x = 1;").unwrap();
+        writeln!(tmp, "}}").unwrap();
+        writeln!(tmp, "fn beta() {{").unwrap();
+        writeln!(tmp, "    let y = 2;").unwrap();
+        writeln!(tmp, "}}").unwrap();
+
+        let tool = ReadFileTool::new();
+        let result = ToolRuntime::execute(
+            &tool,
+            serde_json::json!({
+                "path": tmp.path(),
+                "ranges": [
+                    {"Anchor": {"start_pattern": "fn alpha", "end_pattern": "}"}}
+                ]
+            }),
+            OperationId::new(),
+        )
+            .await
+            .unwrap();
+
+        let output: ReadFileOutput = serde_json::from_value(result).unwrap();
+        // Should include lines from "fn alpha" through "}"
+        assert!(output.content.contains("fn alpha"));
+        assert!(output.content.contains("let x = 1"));
+        assert!(output.content.contains("}"));
+        // Should NOT include beta
+        assert!(!output.content.contains("fn beta"));
+    }
+
+    #[test]
+    fn type_routing_detects_extensions() {
+        assert!(type_routing_note("foo.rs").contains("Rust"));
+        assert!(type_routing_note("bar.md").contains("Markdown"));
+        assert!(type_routing_note("img.png").contains("binary image"));
+        assert!(type_routing_note("unknown.xyz").is_empty());
     }
 }

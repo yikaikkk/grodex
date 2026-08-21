@@ -24,7 +24,8 @@ pub struct Skill {
     pub name: String,
     /// Short description for listing (from frontmatter or first heading).
     pub description: String,
-    /// Full skill content (markdown body).
+    /// Full skill content (markdown body). Empty when content has been
+    /// unloaded for on-demand loading (R14-6d); reload via `load_content`.
     pub content: String,
     /// Where this skill was discovered.
     pub source: SkillSource,
@@ -33,6 +34,11 @@ pub struct Skill {
     /// SHA-256 content hash for trust verification. Changes when the
     /// skill file is modified, requiring re-confirmation.
     pub content_hash: Option<String>,
+    /// Whether this skill is trusted to inject full content into the
+    /// prompt (R14-6c). Builtin and User skills are always trusted;
+    /// Project skills are trusted only if the workspace is trusted.
+    /// Untrusted skills show name+description only.
+    pub trusted: bool,
 }
 
 impl Skill {
@@ -46,7 +52,7 @@ impl Skill {
     /// ---
     /// # Skill content
     /// ```
-    pub fn from_markdown(path: PathBuf, source: SkillSource, raw: &str) -> Self {
+    pub fn from_markdown(path: PathBuf, source: SkillSource, raw: &str, trusted: bool) -> Self {
         let (name, description, content) = Self::parse_frontmatter(raw);
 
         let name = name.unwrap_or_else(|| {
@@ -72,7 +78,26 @@ impl Skill {
             source,
             path,
             content_hash: Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes()))),
+            trusted,
         }
+    }
+
+    /// Reload skill content from disk (R14-6d: on-demand loading).
+    /// Reads the file at `self.path` and repopulates `content` and
+    /// `content_hash`. Returns `Err` if the file cannot be read.
+    pub fn load_content(&mut self) -> std::io::Result<()> {
+        let raw = std::fs::read_to_string(&self.path)?;
+        let (_, _, content) = Self::parse_frontmatter(&raw);
+        self.content = content.to_string();
+        self.content_hash = Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes())));
+        Ok(())
+    }
+
+    /// Unload skill content to free memory (R14-6d: on-demand loading).
+    /// The content hash is preserved so change detection still works.
+    /// Call `load_content` to reload when the skill is needed again.
+    pub fn unload_content(&mut self) {
+        self.content.clear();
     }
 
     /// Parse YAML frontmatter from markdown.
@@ -115,17 +140,18 @@ mod tests {
     #[test]
     fn parse_frontmatter_with_name() {
         let raw = "---\nname: test-skill\ndescription: A test\n---\n# Hello\nContent here";
-        let skill = Skill::from_markdown(PathBuf::from("test.md"), SkillSource::Project, raw);
+        let skill = Skill::from_markdown(PathBuf::from("test.md"), SkillSource::Project, raw, true);
         assert_eq!(skill.name, "test-skill");
         assert_eq!(skill.description, "A test");
         assert!(skill.content.contains("# Hello"));
         assert!(!skill.content.contains("---"));
+        assert!(skill.trusted);
     }
 
     #[test]
     fn no_frontmatter_uses_filename() {
         let raw = "# My Skill\nSome content";
-        let skill = Skill::from_markdown(PathBuf::from("my-skill.md"), SkillSource::User, raw);
+        let skill = Skill::from_markdown(PathBuf::from("my-skill.md"), SkillSource::User, raw, true);
         assert_eq!(skill.name, "my-skill");
         assert_eq!(skill.description, "My Skill");
     }

@@ -209,11 +209,22 @@ pub enum SessionEvent {
     /// The PermissionManager emits this the moment `policy.evaluate()`
     /// returns `Ask` and a ticket lands in the broker. The frontend uses
     /// it to render a pending approval row with timeout countdown.
+    ///
+    /// `args` and `call_id` are included so the frontend can display the
+    /// original tool arguments and correlate with the tool call. For
+    /// recovered-pending tickets (from crash recovery), these fields are
+    /// populated from the journal's `ApprovalRequested` event payload.
     ApprovalRequested {
         ticket_id: String,
         tool_name: String,
         summary: String,
         risk: String,
         timeout_remaining_ms: u64,
+        /// The tool call arguments that triggered the approval request.
+        /// `None` for legacy events without args in the journal.
+        args: Option<serde_json::Value>,
+        /// The tool call id this approval is for.
+        /// `None` if not available (e.g. legacy events).
+        call_id: Option<String>,
     },
 }

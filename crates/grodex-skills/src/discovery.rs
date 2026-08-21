@@ -28,7 +28,7 @@ impl SkillDiscovery {
     ///    The skill name defaults to the subdirectory name.
     /// 2. If it is a `*.md` **file** directly under `skills/`, load it as a
     ///    legacy single-file skill (back-compat).
-    pub fn scan_dir(dir: &Path, source: SkillSource) -> Vec<Skill> {
+    pub fn scan_dir(dir: &Path, source: SkillSource, trusted: bool) -> Vec<Skill> {
         let mut skills = Vec::new();
         let skills_dir = dir.join("skills");
 
@@ -46,7 +46,7 @@ impl SkillDiscovery {
 
                 if file_type.is_dir() {
                     // Case 1: <skills>/<name>/  — modern directory-based skill
-                    if let Some(skill) = Self::load_skill_from_dir(&path, source) {
+                    if let Some(skill) = Self::load_skill_from_dir(&path, source, trusted) {
                         skills.push(skill);
                     }
                 } else if file_type.is_file()
@@ -54,7 +54,7 @@ impl SkillDiscovery {
                 {
                     // Case 2: <skills>/<name>.md  — legacy single-file skill (back-compat)
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        let skill = Skill::from_markdown(path.clone(), source, &content);
+                        let skill = Skill::from_markdown(path.clone(), source, &content, trusted);
                         skills.push(skill);
                     }
                 }
@@ -70,7 +70,7 @@ impl SkillDiscovery {
     /// Tries `SKILL.md` first, then `README.md`. Filename stem is overridden
     /// by the enclosing directory name so `my-skill/SKILL.md` produces a skill
     /// named `my-skill` (consistent with the directory layout).
-    fn load_skill_from_dir(skill_dir: &Path, source: SkillSource) -> Option<Skill> {
+    fn load_skill_from_dir(skill_dir: &Path, source: SkillSource, trusted: bool) -> Option<Skill> {
         let candidates: [&str; 2] = ["SKILL.md", "README.md"];
 
         for candidate in &candidates {
@@ -99,6 +99,7 @@ impl SkillDiscovery {
                         source,
                         path: md_path,
                         content_hash: Some(hash),
+                        trusted,
                     });
                 }
             }
@@ -108,9 +109,10 @@ impl SkillDiscovery {
     }
 
     /// Discover skills from the user's global `.grodex/` directory.
+    /// User-level skills are always trusted (the user owns them).
     pub fn discover_user() -> Vec<Skill> {
         if let Some(home) = dirs::home_dir() {
-            Self::scan_dir(&home.join(".grodex"), SkillSource::User)
+            Self::scan_dir(&home.join(".grodex"), SkillSource::User, true)
         } else {
             Vec::new()
         }
@@ -118,12 +120,14 @@ impl SkillDiscovery {
 
     /// Discover skills from the project's `.grodex/` directory.
     /// Walks up from `cwd` to find the nearest `.grodex/skills/`.
-    pub fn discover_project(cwd: &Path) -> Vec<Skill> {
+    /// Project skills are trusted only if the workspace is trusted
+    /// (R14-6c: fail-closed for untrusted workspaces).
+    pub fn discover_project(cwd: &Path, workspace_trusted: bool) -> Vec<Skill> {
         let mut current = cwd.to_path_buf();
         loop {
             let grodex_dir = current.join(".grodex");
             if grodex_dir.join("skills").is_dir() {
-                return Self::scan_dir(&grodex_dir, SkillSource::Project);
+                return Self::scan_dir(&grodex_dir, SkillSource::Project, workspace_trusted);
             }
             if !current.pop() {
                 break;

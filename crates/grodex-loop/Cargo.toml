@@ -28,6 +28,7 @@ async-trait.workspace = true
 tokio.workspace = true
 sha2 = "0.10"
 grodex-capability.workspace = true
+tracing = "0.1"
 
 [target.'cfg(not(loom))'.dev-dependencies]
 anyhow.workspace = true

@@ -7,6 +7,17 @@ use crate::lint::{lint_catalog, LintReport};
 use crate::skill::{Skill, SkillSource};
 use std::path::{Path, PathBuf};
 
+/// A lightweight summary of a skill for listing purposes.
+/// Does not include the full content — use `read_content()` for that.
+#[derive(Debug, Clone)]
+pub struct SkillSummary {
+    pub name: String,
+    pub description: String,
+    pub source: SkillSource,
+    pub trusted: bool,
+    pub content_loaded: bool,
+}
+
 /// A collection of all discovered skills.
 #[derive(Debug, Clone, Default)]
 pub struct SkillCatalog {
@@ -26,16 +37,21 @@ pub struct SkillSnapshot {
     pub path: PathBuf,
     pub content_hash: String,
     pub content: String,
+    /// Whether the skill was trusted at snapshot time (R14-6c).
+    pub trusted: bool,
 }
 
 impl SkillCatalog {
     /// Discover all skills from standard locations.
     /// Runs lint during discovery: skills with error-level findings
     /// are excluded from the catalog (Design Doc 08 §7: "Lint 接入").
-    pub fn discover(cwd: &Path) -> Self {
+    ///
+    /// `workspace_trusted` controls whether Project-level skills are
+    /// trusted (R14-6c). Builtin and User skills are always trusted.
+    pub fn discover(cwd: &Path, workspace_trusted: bool) -> Self {
         let mut skills = Vec::new();
         // Project first (higher priority), then user.
-        skills.extend(SkillDiscovery::discover_project(cwd));
+        skills.extend(SkillDiscovery::discover_project(cwd, workspace_trusted));
         skills.extend(SkillDiscovery::discover_user());
         // Deduplicate by name (first wins = project).
         let mut seen = std::collections::HashSet::new();
@@ -62,6 +78,31 @@ impl SkillCatalog {
         &self.skills
     }
 
+    /// Read the full content of a skill by name.
+    /// Returns None if the skill is not found or content is not loaded.
+    /// This is separate from `list()` to support lazy loading (R14-6d).
+    pub fn read_content(&self, name: &str) -> Option<&str> {
+        self.skills
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.content.as_str())
+    }
+
+    /// List skill summaries (name + description + source) without loading content.
+    /// Useful for showing available skills without reading full bodies.
+    pub fn list_summaries(&self) -> Vec<SkillSummary> {
+        self.skills
+            .iter()
+            .map(|s| SkillSummary {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                source: s.source.clone(),
+                trusted: s.trusted,
+                content_loaded: !s.content.is_empty(),
+            })
+            .collect()
+    }
+
     /// Find a skill by name.
     pub fn find(&self, name: &str) -> Option<&Skill> {
         self.skills.iter().find(|s| s.name == name)
@@ -78,8 +119,11 @@ impl SkillCatalog {
     }
 
     /// Format all skills as a compact prompt listing.
-    /// Includes the full skill content so the model can actually
-    /// follow the instructions (Design Doc 08 §6: "正文加载").
+    ///
+    /// Trusted skills include the full content so the model can follow
+    /// the instructions (Design Doc 08 §6: "正文加载"). Untrusted skills
+    /// (R14-6c: Project skills in an untrusted workspace) show name and
+    /// description only — the model is told the content is withheld.
     pub fn format_for_prompt(&self) -> String {
         if self.skills.is_empty() {
             return String::new();
@@ -87,10 +131,20 @@ impl SkillCatalog {
 
         let mut out = String::from("## Available Skills\n\n");
         for skill in &self.skills {
-            out.push_str(&format!(
-                "### {}\n**Description**: {}\n\n{}\n\n",
-                skill.name, skill.description, skill.content
-            ));
+            if skill.trusted {
+                out.push_str(&format!(
+                    "### {}\n**Description**: {}\n\n{}\n\n",
+                    skill.name, skill.description, skill.content
+                ));
+            } else {
+                // R14-6c: untrusted skill — withhold content, show metadata only.
+                out.push_str(&format!(
+                    "### {} (untrusted)\n**Description**: {}\n\n\
+                     *Content withheld — workspace is not trusted. Run with `--trusted` \
+                     to enable this skill's full instructions.*\n\n",
+                    skill.name, skill.description
+                ));
+            }
         }
         out
     }
@@ -116,6 +170,7 @@ impl SkillCatalog {
                 path: s.path.clone(),
                 content_hash: s.content_hash.clone().unwrap_or_default(),
                 content: s.content.clone(),
+                trusted: s.trusted,
             })
             .collect()
     }
@@ -154,8 +209,9 @@ mod tests {
 
     /// Build a project-only catalog (without discover_user leakage from
     /// whatever `~/.grodex/skills` the developer has locally).
+    /// Project skills are marked trusted (tests use a trusted workspace).
     fn project_catalog(cwd: &std::path::Path) -> SkillCatalog {
-        let mut skills = SkillDiscovery::discover_project(cwd);
+        let mut skills = SkillDiscovery::discover_project(cwd, true);
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         let mut seen = std::collections::HashSet::new();
         skills.retain(|s| seen.insert(s.name.clone()));

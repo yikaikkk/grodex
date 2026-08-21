@@ -66,6 +66,86 @@ impl ContextItem {
         };
         text.len().max(4) / 3
     }
+
+    /// Convert a ToolResult into a synthetic User message for round-trip
+    /// injection. This is used when tool responses need to be re-injected
+    /// into the context as user-visible content (e.g. after compaction
+    /// or when the provider doesn't support native tool result messages).
+    pub fn tool_result_as_user(call_id: &ToolCallId, tool_name: &str, content: &str) -> Self {
+        ContextItem::User {
+            content: format!(
+                "[Tool Result: {} (call_id: {})]\n{}",
+                tool_name, call_id, content
+            ),
+            message_id: Some(format!("tool_resp_{}", call_id)),
+        }
+    }
+
+    /// Build a synthetic system notification (e.g. for session events,
+    /// compaction notifications, or runtime warnings).
+    pub fn synthetic_notification(content: &str) -> Self {
+        ContextItem::System {
+            content: format!("[System Notification]\n{}", content),
+        }
+    }
+
+    /// Convert a batch of ToolResult items into synthetic User messages
+    /// for round-trip injection. This is used when:
+    ///   1. The provider doesn't support native tool result messages
+    ///   2. After compaction, tool results need to be re-injected as context
+    ///   3. During crash recovery, tool results need to be replayed
+    ///
+    /// Each ToolResult is converted to a User message with the tool name
+    /// and call_id embedded for traceability. Non-ToolResult items are
+    /// filtered out.
+    pub fn batch_tool_results_as_users(
+        items: &[ContextItem],
+        tool_names: &std::collections::HashMap<ToolCallId, String>,
+    ) -> Vec<Self> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                ContextItem::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } => {
+                    let tool_name = tool_names
+                        .get(call_id)
+                        .map(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    let prefix = if *is_error { "[Tool Error" } else { "[Tool Result" };
+                    Some(ContextItem::User {
+                        content: format!(
+                            "{}: {} (call_id: {})]\n{}",
+                            prefix, tool_name, call_id, content
+                        ),
+                        message_id: Some(format!("tool_resp_{}", call_id)),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Build a compaction notification message that summarizes what was
+    /// compacted and provides the model with context about the compaction.
+    /// Used after compaction to inform the model that older context has
+    /// been summarized.
+    pub fn compaction_notification(
+        summary: &str,
+        items_compacted: usize,
+        tokens_freed: usize,
+    ) -> Self {
+        ContextItem::System {
+            content: format!(
+                "[Compaction Notification]\n\
+                 Compacted {} items, freed ~{} tokens.\n\
+                 Summary:\n{}",
+                items_compacted, tokens_freed, summary
+            ),
+        }
+    }
 }
 
 // ── Evidence provenance (doc 11 §16) ──────────────────────────────

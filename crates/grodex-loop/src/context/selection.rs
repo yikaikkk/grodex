@@ -5,7 +5,7 @@
 //! Then snap forward past any tool-result runs so the model never
 //! sees orphaned tool calls without their results.
 
-use crate::context::types::CompactionPlan;
+use crate::context::types::{CompactionItemView, CompactionPlan};
 use grodex_core::context::ContextItem;
 
 /// Select items for compaction.
@@ -67,6 +67,13 @@ pub fn select_items_to_compact(
         estimated_tokens_before: total_tokens,
         compact_tokens,
         keep_tokens,
+        source_history_version: None,
+        trigger: Some(crate::context::types::CompactionTrigger::BudgetExceeded),
+        strategy: Some(crate::context::types::CompactionStrategy::SummarizeOldest),
+        prefix_boundary: Some(split_idx),
+        state_capsule_id: None,
+        deadline: None,
+        estimated_summary_tokens: None,
     })
 }
 
@@ -140,6 +147,59 @@ fn is_reasoning_summary(item: &ContextItem) -> bool {
 
 fn is_assistant(item: &ContextItem) -> bool {
     matches!(item, ContextItem::Assistant { .. })
+}
+
+/// Age-tiered micro-prune: remove items older than the threshold.
+///
+/// This is a lightweight alternative to full compaction — it simply
+/// drops old items without summarizing them. Useful for keeping the
+/// context window manageable in long sessions.
+pub fn micro_prune_by_age(
+    items: &[ContextItem],
+    current_turn: u64,
+    config: &crate::context::types::AgeTierPruneConfig,
+) -> crate::context::types::MicroPruneResult {
+    let mut tokens_freed = 0u64;
+    let mut items_pruned = 0usize;
+    let mut remaining = Vec::new();
+
+    for (idx, item) in items.iter().enumerate() {
+        // Estimate age: items at the start of the list are oldest.
+        // We use the index as a proxy for turn age.
+        let estimated_age = items.len().saturating_sub(idx) as u64;
+        let item_tokens = item.token_count();
+
+        if estimated_age > config.age_threshold_turns
+            && tokens_freed + item_tokens >= config.min_tokens_to_prune
+            && config.max_tokens_to_prune.map_or(true, |max| tokens_freed < max)
+        {
+            // Skip tool pairs if configured to preserve them.
+            if config.preserve_tool_pairs && is_tool_call(item) {
+                // Check if the next item is a tool result.
+                if idx + 1 < items.len() && is_tool_result(&items[idx + 1]) {
+                    remaining.push(item.clone());
+                    continue;
+                }
+            }
+            tokens_freed += item_tokens;
+            items_pruned += 1;
+        } else {
+            remaining.push(item.clone());
+        }
+    }
+
+    crate::context::types::MicroPruneResult {
+        items_pruned,
+        tokens_freed,
+        remaining_items: remaining,
+    }
+}
+
+/// Build a synthetic system message (e.g., for compaction summary injection).
+pub fn build_synthetic_message(content: &str, label: &str) -> ContextItem {
+    ContextItem::System {
+        content: format!("[{label}]\n{content}"),
+    }
 }
 
 #[cfg(test)]

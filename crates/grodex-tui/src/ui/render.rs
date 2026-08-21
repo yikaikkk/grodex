@@ -981,8 +981,10 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
         // Will be set by the most-recent Thinking block render pass if
         // the clamped value differs from the stored one.
         let mut thinking_scroll_clamp: Option<u16> = None;
+        let turns_total = turns.len();
 
-        for turn_range in turns {
+        for (turn_idx, turn_range) in turns.into_iter().enumerate() {
+            let is_latest_turn = turn_idx + 1 == turns_total;
             let turn = &state.messages[turn_range];
 
             let mut assistant_header_rendered = false;
@@ -1077,50 +1079,89 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                             }
                             let total = wrapped.len();
 
-                            if thinking_expanded {
-                                // ── Expanded: full CoT inline ───────────────
-                                for wl in &wrapped {
-                                    rows.push(Line::from(vec![
-                                        Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                        style_s(c_thinking_text(), wl.clone()),
-                                    ]));
+                            if is_latest_turn {
+                                // ── Latest turn: auto-scroll + Ctrl+O ──
+                                // Auto-scroll to bottom when streaming
+                                // (not done) so the user always sees the
+                                // latest reasoning. Once done, respect
+                                // the user's manual scroll position.
+                                if !done {
+                                    let max_scroll = total.saturating_sub(12);
+                                    thinking_scroll_clamp = Some(max_scroll as u16);
                                 }
-                                rows.push(Line::from(vec![
-                                    Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                    style_s(c_dim(), "(Ctrl+O collapse)"),
-                                ]));
-                            } else {
-                                // ── Collapsed: fixed-height scrollable window ─
-                                const COLLAPSED_HEIGHT: usize = 12;
-                                let max_scroll = total.saturating_sub(COLLAPSED_HEIGHT);
-                                let scroll = (thinking_scroll_in as usize).min(max_scroll);
-                                // Store clamped value for write-back after loop.
-                                thinking_scroll_clamp = Some(scroll as u16);
 
-                                let end = (scroll + COLLAPSED_HEIGHT).min(total);
-                                for wl in &wrapped[scroll..end] {
+                                if thinking_expanded {
+                                    // Expanded: full CoT inline
+                                    for wl in &wrapped {
+                                        rows.push(Line::from(vec![
+                                            Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                            style_s(c_thinking_text(), wl.clone()),
+                                        ]));
+                                    }
                                     rows.push(Line::from(vec![
                                         Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                        style_s(c_thinking_text(), wl.clone()),
-                                    ]));
-                                }
-                                // Hint line
-                                if total > COLLAPSED_HEIGHT {
-                                    let hint = format!(
-                                        "(Ctrl+O expand · Ctrl-N/P scroll · {}/{})",
-                                        scroll + 1,
-                                        total
-                                    );
-                                    rows.push(Line::from(vec![
-                                        Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                        style_s(c_dim(), hint),
+                                        style_s(c_dim(), "(Ctrl+O collapse)"),
                                     ]));
                                 } else {
+                                    // Collapsed: fixed-height scrollable window
+                                    const COLLAPSED_HEIGHT: usize = 12;
+                                    let max_scroll = total.saturating_sub(COLLAPSED_HEIGHT);
+                                    let scroll = if *done {
+                                        (thinking_scroll_in as usize).min(max_scroll)
+                                    } else {
+                                        max_scroll // auto-follow bottom
+                                    };
+                                    thinking_scroll_clamp = Some(scroll as u16);
+
+                                    let end = (scroll + COLLAPSED_HEIGHT).min(total);
+                                    for wl in &wrapped[scroll..end] {
+                                        rows.push(Line::from(vec![
+                                            Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                            style_s(c_thinking_text(), wl.clone()),
+                                        ]));
+                                    }
+                                    // Hint line
+                                    if total > COLLAPSED_HEIGHT {
+                                        let hint = format!(
+                                            "(Ctrl+O expand · Ctrl-N/P scroll · {}/{})",
+                                            scroll + 1,
+                                            total
+                                        );
+                                        rows.push(Line::from(vec![
+                                            Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                            style_s(c_dim(), hint),
+                                        ]));
+                                    } else {
+                                        rows.push(Line::from(vec![
+                                            Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                            style_s(c_dim(), "(Ctrl+O expand)"),
+                                        ]));
+                                    }
+                                }
+                            } else {
+                                // ── Older turns: always compact ──────────
+                                // Show a fixed-height window of the LAST
+                                // N lines (no expand, no scroll controls).
+                                // The user can Ctrl+O on the latest turn
+                                // to see its full reasoning.
+                                const COMPACT_HEIGHT: usize = 5;
+                                let start = total.saturating_sub(COMPACT_HEIGHT);
+                                for wl in &wrapped[start..] {
                                     rows.push(Line::from(vec![
                                         Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                        style_s(c_dim(), "(Ctrl+O expand)"),
+                                        style_s(c_thinking_text(), wl.clone()),
                                     ]));
                                 }
+                                let hidden = start;
+                                let hint = if hidden > 0 {
+                                    format!("({} lines above · {} total)", hidden, total)
+                                } else {
+                                    format!("({} lines)", total)
+                                };
+                                rows.push(Line::from(vec![
+                                    Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                    style_s(c_dim(), hint),
+                                ]));
                             }
                         }
                         rows.push(Line::from(vec![Span::raw("")]));

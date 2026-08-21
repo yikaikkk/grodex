@@ -812,4 +812,44 @@ impl RolloutWriter {
         )
         .await
     }
+
+    /// Record an application-initiated tool call (invariant #17).
+    ///
+    /// AppOnly calls bypass model sampling — they are produced by
+    /// application logic (auto-compaction, system maintenance, human-
+    /// initiated side effects). They MUST still be journaled so that
+    /// recovery/replay can account for their side effects.
+    ///
+    /// Always durable — these calls have no model-side record, so
+    /// the journal entry is the only audit trail.
+    pub async fn write_app_only_tool_call(
+        &self,
+        turn_id: Option<TurnId>,
+        call_id: &str,
+        operation_id: Option<&str>,
+        tool_name: &str,
+        args: &serde_json::Value,
+        result: &serde_json::Value,
+        reason: &str,
+    ) -> Result<u64, GrodexError> {
+        let mut payload = serde_json::json!({
+            "call_id": call_id,
+            "tool_name": tool_name,
+            "args": args,
+            "result": result,
+            "reason": reason,
+        });
+        if let Some(op) = operation_id {
+            payload["operation_id"] = serde_json::json!(op);
+        }
+        self.write(
+            RolloutEventType::AppOnlyToolCall,
+            turn_id,
+            None,
+            None,
+            payload,
+            true, // durable: only audit trail for app-initiated calls
+        )
+        .await
+    }
 }

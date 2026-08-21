@@ -103,6 +103,15 @@ pub enum ReadRange {
         /// None = through end of document.
         count: Option<u32>,
     },
+    /// Pattern-anchor range: find lines matching start_pattern, then
+    /// optionally extend to the first line matching end_pattern.
+    Anchor {
+        /// Regex or literal pattern for the start line.
+        start_pattern: String,
+        /// Optional pattern for the end line (inclusive). None = just the
+        /// matched start line.
+        end_pattern: Option<String>,
+    },
 }
 
 impl Default for ReadRange {
@@ -390,6 +399,33 @@ pub enum ChangeType {
     /// Not a content change, but metadata (chmod, xattr, mtime, …).
     Metadata,
 }
+
+/// Description of the contract a built-in tool follows.
+///
+/// Each built-in tool declares its argument schema, output schema,
+/// side-effect classification, and concurrency class. The contract
+/// is used for validation, prompt generation, and policy enforcement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuiltInToolContract {
+    /// Tool name (e.g. "read", "edit", "exec").
+    pub tool_name: String,
+    /// JSON Schema for the tool's arguments.
+    pub args_schema: serde_json::Value,
+    /// JSON Schema for the tool's output.
+    pub output_schema: serde_json::Value,
+    /// Side-effect classification.
+    pub side_effect: SideEffectClass,
+    /// Concurrency classification.
+    pub concurrency: ConcurrencyClass,
+    /// Whether this tool requires approval before execution.
+    pub requires_approval: bool,
+    /// Contract version (bumps on schema changes).
+    pub contract_version: u64,
+    /// Human-readable description for the model.
+    pub description: String,
+}
+
+use grodex_core::tool::{ConcurrencyClass, SideEffectClass};
 
 /// Unified envelope shared by Read/Edit/Exec/Write/Patch results (§8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

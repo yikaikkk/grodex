@@ -1437,6 +1437,7 @@ impl GrodexTui {
                                             .unwrap_or_else(|_| ".".to_string());
                                         let catalog = grodex_skills::catalog::SkillCatalog::discover(
                                             std::path::Path::new(&cwd),
+                                            true, // TUI listing: treat as trusted for display
                                         );
                                         if catalog.is_empty() {
                                             self.state.push_log(format!(

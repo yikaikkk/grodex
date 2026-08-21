@@ -90,6 +90,14 @@ pub struct ApprovalTicket {
     pub session_id: Option<String>,
     pub source_agent_id: Option<String>,
     pub task_id: Option<String>,
+    /// Resolved resources this approval binds to (Design Doc 15 §20.5.9).
+    /// Populated during prepare() so the approval is bound to concrete
+    /// file paths / resource IDs, not raw user strings.
+    pub resolved_resources: Vec<String>,
+    /// Plan hash for multi-step operations (e.g. apply_patch).
+    /// Binds the approval to a specific plan so replayed calls with
+    /// different plans cannot reuse the same approval.
+    pub plan_hash: Option<String>,
 }
 
 impl ApprovalTicket {
@@ -117,6 +125,8 @@ impl ApprovalTicket {
             session_id: None,
             source_agent_id: None,
             task_id: None,
+            resolved_resources: Vec::new(),
+            plan_hash: None,
         };
         (ticket, rx)
     }

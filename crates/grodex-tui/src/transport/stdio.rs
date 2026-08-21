@@ -113,27 +113,43 @@ impl StdioClient {
     }
 
     pub fn send_acp_command(&mut self, c: &AcpCommand) -> Result<()> {
-        let mut retries = 0usize;
-        loop {
-            if self.inflight_events < self.max_inflight_events {
-                break;
+        // ResolveApproval is a critical-path command: it unblocks the agent's
+        // permission gate. If we apply backpressure to it, the agent can get
+        // stuck waiting for approval while the TUI waits for the agent to
+        // drain — a classic deadlock. Exempt it from the inflight cap.
+        let is_approval = matches!(c, AcpCommand::ResolveApproval(_));
+
+        if !is_approval {
+            let mut retries = 0usize;
+            // Wait up to 500ms (50 × 10ms) for the agent to drain before
+            // giving up. Subagent spawning can take a few hundred ms;
+            // the old 100ms (10 retries) was too aggressive and caused
+            // "背压限制 inflight=1 > max_inflight=1" errors when the
+            // user tried to approve delegate_task tool calls.
+            let max_retries = 50usize;
+            loop {
+                if self.inflight_events < self.max_inflight_events {
+                    break;
+                }
+                if retries >= max_retries {
+                    return Err(anyhow!(
+                        "背压限制：inflight={} 超过 max_inflight={}",
+                        self.inflight_events,
+                        self.max_inflight_events
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                retries += 1;
             }
-            if retries >= 10 {
-                return Err(anyhow!(
-                    "背压限制：inflight={} 超过 max_inflight={}",
-                    self.inflight_events,
-                    self.max_inflight_events
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-            retries += 1;
         }
 
         let frame = ClientFrame::Command { inner: c.clone() };
         let line = serde_json::to_string(&frame).context("序列化 ClientFrame 失败")?;
         writeln!(self.stdin, "{line}").context("写入子进程 stdin 失败")?;
         self.stdin.flush().context("flush stdin 失败")?;
-        self.inflight_events += 1;
+        if !is_approval {
+            self.inflight_events += 1;
+        }
         Ok(())
     }
 
@@ -246,7 +262,7 @@ impl StdioClient {
                 inflight_events,
                 requested_pause_ms,
             } => {
-                self.max_inflight_events = inflight_events.max(1);
+                self.max_inflight_events = inflight_events.max(4);
                 if let Some(ms) = requested_pause_ms {
                     self.pending_logs
                         .push(format!("[transport] FlowControl: 暂停 {ms}ms"));

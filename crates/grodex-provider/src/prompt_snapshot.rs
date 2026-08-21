@@ -34,6 +34,24 @@ pub struct PromptSnapshot {
     pub tool_schemas: Vec<ToolSpec>,
     /// When this snapshot was captured.
     pub created_at: DateTime<Utc>,
+    /// Session identifier this snapshot belongs to.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Turn identifier at the time of snapshot.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// Step identifier at the time of snapshot.
+    #[serde(default)]
+    pub step_id: Option<String>,
+    /// Version of the context history at snapshot time.
+    #[serde(default)]
+    pub context_history_version: Option<u64>,
+    /// Identifier of the capability snapshot used.
+    #[serde(default)]
+    pub capability_snapshot_id: Option<String>,
+    /// Identifier of the memory snapshot used.
+    #[serde(default)]
+    pub memory_snapshot_id: Option<String>,
 }
 
 impl PromptSnapshot {
@@ -69,6 +87,12 @@ impl PromptSnapshot {
             items: items.to_vec(),
             tool_schemas: tool_schemas.to_vec(),
             created_at: Utc::now(),
+            session_id: None,
+            turn_id: None,
+            step_id: None,
+            context_history_version: None,
+            capability_snapshot_id: None,
+            memory_snapshot_id: None,
         }
     }
 

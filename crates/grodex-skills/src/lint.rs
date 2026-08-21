@@ -261,6 +261,7 @@ mod tests {
             source: SkillSource::Project,
             path: PathBuf::from("test.md"),
             content_hash: None,
+            trusted: true,
         }
     }
 

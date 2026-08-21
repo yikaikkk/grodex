@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use grodex_core::error::GrodexError;
 use grodex_core::id::OperationId;
 use grodex_core::tool::{ConcurrencyClass, SideEffectClass, Tool, ToolMetadata, ToolRuntime};
+use sha2::{Digest, Sha256};
 
 use crate::process::McpProcess;
 use crate::server::McpServerConfig;
@@ -23,6 +24,9 @@ pub struct McpToolAdapter {
     input_schema: serde_json::Value,
     /// Full namespaced name: `mcp_{server}_{tool}`.
     full_name: String,
+    /// Contract revision for this tool (Design Doc 15 §7.3).
+    /// Bumped when the tool's schema or semantics change.
+    contract_revision: u64,
 }
 
 impl McpToolAdapter {
@@ -41,7 +45,14 @@ impl McpToolAdapter {
             tool_description: tool_description.into(),
             input_schema,
             full_name,
+            contract_revision: 1,
         }
+    }
+
+    /// Set the contract revision for this tool.
+    pub fn with_contract_revision(mut self, revision: u64) -> Self {
+        self.contract_revision = revision;
+        self
     }
 
     /// The full namespaced tool name.
@@ -101,5 +112,54 @@ impl ToolRuntime for McpToolAdapter {
             .map_err(|e| GrodexError::ToolExecution(format!("MCP call '{}': {e}", self.tool_name)))?;
 
         Ok(result)
+    }
+}
+
+/// A prepared MCP tool call with revision fence (§7.3).
+///
+/// Captures the contract revision at prepare time so that execute can
+/// verify the tool's contract hasn't changed between prepare and execute.
+/// This prevents stale-tool-call bugs where the model plans against one
+/// version of a tool's schema but executes against a different one.
+#[derive(Debug, Clone)]
+pub struct PreparedMcpCall {
+    /// The full namespaced tool name.
+    pub full_name: String,
+    /// The arguments to pass to the tool.
+    pub args: serde_json::Value,
+    /// The contract revision at prepare time.
+    pub contract_revision: u64,
+    /// SHA-256 hash of (tool_name + args + revision) for plan_id.
+    pub plan_hash: String,
+}
+
+impl PreparedMcpCall {
+    /// Create a new prepared call, computing the plan hash.
+    pub fn new(full_name: String, args: serde_json::Value, contract_revision: u64) -> Self {
+        let mut h = Sha256::new();
+        h.update(full_name.as_bytes());
+        h.update(args.to_string().as_bytes());
+        h.update(contract_revision.to_le_bytes());
+        let full = format!("{:x}", h.finalize());
+        let plan_hash = full[..16].to_string();
+        Self {
+            full_name,
+            args,
+            contract_revision,
+            plan_hash,
+        }
+    }
+
+    /// Verify the revision fence: returns Err if the current revision
+    /// doesn't match what was captured at prepare time.
+    pub fn verify_revision(&self, current_revision: u64) -> Result<(), GrodexError> {
+        if self.contract_revision != current_revision {
+            Err(GrodexError::ToolExecution(format!(
+                "stale MCP tool call: {} prepared at revision {} but current is {}",
+                self.full_name, self.contract_revision, current_revision
+            )))
+        } else {
+            Ok(())
+        }
     }
 }

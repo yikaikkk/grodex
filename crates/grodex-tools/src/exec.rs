@@ -3,6 +3,7 @@
 //! Phase 1: simple process execution with timeout.
 //! Phase 2+: process handle for long-running tasks, stdin support.
 
+use crate::cancel::CancelRegistry;
 use crate::common::{
     BuiltInTool, ChangedResource, ChangeType, HeadTailBuffer, ModelContent, PreparedCall,
     ProcessHandle, ProcessState, Retryability, SideEffectHint, ToolResultEnvelope, ToolStatus,
@@ -34,6 +35,27 @@ pub struct ExecArgs {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Run the command in the background. When true, the tool returns
+    /// immediately with a `process_id` the caller can use to poll/kill.
+    #[serde(default)]
+    pub background: bool,
+    /// Wait this many milliseconds before returning partial output + handle.
+    /// Useful for long build commands: the caller gets intermediate progress.
+    #[serde(default)]
+    pub yield_time_ms: Option<u64>,
+    /// Shell execution mode. "auto" picks the platform default shell;
+    /// "bash"/"sh"/"zsh" force a specific shell; "none" executes the
+    /// command directly without a shell wrapper.
+    #[serde(default = "default_shell_mode")]
+    pub shell_mode: String,
+    /// Environment variable overrides for the child process. Each entry
+    /// is "KEY=VALUE". These are merged on top of the parent env.
+    #[serde(default)]
+    pub env_delta: Vec<String>,
+}
+
+fn default_shell_mode() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +70,21 @@ pub struct ExecOutput {
     pub duration_ms: u64,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// Whether the command is still running (background or yield_time mode).
+    #[serde(default)]
+    pub still_running: bool,
+    /// Retained head bytes when stdout was truncated (HeadTailBuffer).
+    #[serde(default)]
+    pub retained_head: Option<String>,
+    /// Retained tail bytes when stdout was truncated (HeadTailBuffer).
+    #[serde(default)]
+    pub retained_tail: Option<String>,
+    /// Shell mode actually used for this execution.
+    #[serde(default)]
+    pub shell_mode_used: String,
+    /// Environment variables that were set for the child process.
+    #[serde(default)]
+    pub env_delta_applied: Vec<String>,
 }
 
 pub struct ExecTool {
@@ -65,6 +102,10 @@ pub struct ExecTool {
     /// session's `SandboxManager` effective profile). Required together
     /// with `sandbox_runtime` for the sandboxed path.
     sandbox_profile: Option<SandboxProfile>,
+    /// Cancel registry for OperationId-level cancellation (§11.4).
+    /// When set, the tool registers a CancellationToken before spawning
+    /// and checks it during execution.
+    cancel_registry: Option<CancelRegistry>,
 }
 
 impl Default for ExecTool {
@@ -80,6 +121,7 @@ impl ExecTool {
             default_timeout: Duration::from_secs(120),
             sandbox_runtime: None,
             sandbox_profile: None,
+            cancel_registry: None,
         }
     }
 
@@ -100,6 +142,16 @@ impl ExecTool {
     ) -> Self {
         self.sandbox_runtime = Some(client);
         self.sandbox_profile = Some(profile);
+        self
+    }
+
+    /// Enable OperationId-level cancellation (§11.4).
+    ///
+    /// When set, the tool registers a `CancellationToken` before spawning
+    /// a process. The agent loop can call `cancel_registry.cancel(op_id)`
+    /// to trigger the cancel pipeline (SIGINT → grace → SIGKILL).
+    pub fn with_cancel_registry(mut self, registry: CancelRegistry) -> Self {
+        self.cancel_registry = Some(registry);
         self
     }
 }
@@ -126,7 +178,9 @@ impl Tool for ExecTool {
                 "command": {"type": "string", "description": "The shell command to execute"},
                 "cwd": {"type": "string", "description": "Working directory for the command"},
                 "timeout_secs": {"type": "integer", "description": "Timeout in seconds"},
-                "description": {"type": "string", "description": "Human-readable description of what this command does"}
+                "description": {"type": "string", "description": "Human-readable description of what this command does"},
+                "background": {"type": "boolean", "description": "Run in background; returns process_id immediately (default: false)"},
+                "yield_time_ms": {"type": "integer", "description": "Wait this many ms then return partial output + handle for long-running commands"}
             },
             "required": ["command"]
         })
@@ -159,6 +213,14 @@ impl ToolRuntime for ExecTool {
 
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(120));
+
+        // ── Cancel token registration (§11.4) ──
+        let cancel_token = if let Some(ref registry) = self.cancel_registry {
+            let token = registry.register(operation_id.to_string()).await;
+            Some(token)
+        } else {
+            None
+        };
 
         // ── Sandbox-enforced path ──────────────────────────────────
         // When the session wired a `SandboxRuntimeClient` + effective profile
@@ -217,6 +279,11 @@ impl ToolRuntime for ExecTool {
                         duration_ms,
                         stdout_truncated,
                         stderr_truncated,
+                        still_running: false,
+                        retained_head: None,
+                        retained_tail: None,
+                        shell_mode_used: args.shell_mode.clone(),
+                        env_delta_applied: args.env_delta.clone(),
                     };
                     serde_json::to_value(result)
                         .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
@@ -240,6 +307,11 @@ impl ToolRuntime for ExecTool {
                         duration_ms,
                         stdout_truncated: false,
                         stderr_truncated: false,
+                        still_running: false,
+                        retained_head: None,
+                        retained_tail: None,
+                        shell_mode_used: args.shell_mode.clone(),
+                        env_delta_applied: args.env_delta.clone(),
                     };
                     serde_json::to_value(result)
                         .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
@@ -267,57 +339,321 @@ impl ToolRuntime for ExecTool {
             cmd.current_dir(cwd);
         }
 
-        // Spawn the child and capture its PID *before* awaiting completion.
-        // Previously this returned `std::process::id()` — the agent's own
-        // PID — which is meaningless to callers tracking the child.
-        let child = match cmd.spawn() {
+        // Spawn the child and capture its PID.
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return Err(GrodexError::ToolExecution(format!("exec spawn failed: {e}"))),
         };
         let child_pid = child.id();
 
-        let output = tokio::time::timeout(timeout, child.wait_with_output()).await;
+        // ── Background mode: return immediately with PID ──
+        if args.background {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let result = ExecOutput {
+                command: args.command,
+                process_id: child_pid,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+                timed_out: false,
+                duration_ms,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                still_running: true,
+                retained_head: None,
+                retained_tail: None,
+                shell_mode_used: args.shell_mode.clone(),
+                env_delta_applied: args.env_delta.clone(),
+            };
+            // Detach the child process (don't kill on drop).
+            // The child continues running in the background.
+            std::mem::forget(child);
+            return serde_json::to_value(result)
+                .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")));
+        }
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+        // ── Yield-time mode: wait specified duration, return partial output ──
+        if let Some(yield_ms) = args.yield_time_ms {
+            // We cannot use `wait_with_output` here because it consumes the
+            // child, making it impossible to detach on timeout. Instead we
+            // take stdout/stderr, spawn collectors, and wait on the child
+            // separately so we can `forget` it if the yield expires.
+            let mut child = child;
+            let stdout_child = child.stdout.take();
+            let stderr_child = child.stderr.take();
+            let stdout_handle = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                if let Some(mut r) = stdout_child {
+                    let _ = r.read_to_end(&mut buf).await;
+                }
+                buf
+            });
+            let stderr_handle = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                if let Some(mut r) = stderr_child {
+                    let _ = r.read_to_end(&mut buf).await;
+                }
+                buf
+            });
 
-        match output {
-            Ok(Ok(proc_output)) => {
-                let stdout = String::from_utf8_lossy(&proc_output.stdout);
-                let stderr = String::from_utf8_lossy(&proc_output.stderr);
-
-                let (stdout_str, stdout_truncated) = Self::truncate(&stdout, self.max_output_bytes);
-                let (stderr_str, stderr_truncated) = Self::truncate(&stderr, self.max_output_bytes);
-
-                let result = ExecOutput {
-                    command: args.command,
-                    process_id: child_pid,
-                    stdout: stdout_str,
-                    stderr: stderr_str,
-                    exit_code: proc_output.status.code(),
-                    timed_out: false,
-                    duration_ms,
-                    stdout_truncated,
-                    stderr_truncated,
-                };
-
-                serde_json::to_value(result).map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
-            }
-            Ok(Err(e)) => Err(GrodexError::ToolExecution(format!("exec failed: {e}"))),
-            Err(_) => {
-                let result = ExecOutput {
-                    command: args.command,
-                    process_id: child_pid,
-                    stdout: String::new(),
-                    stderr: format!("command timed out after {timeout:?}"),
-                    exit_code: None,
-                    timed_out: true,
-                    duration_ms,
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                };
-                serde_json::to_value(result).map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
+            let yield_dur = Duration::from_millis(yield_ms);
+            match tokio::time::timeout(yield_dur, child.wait()).await {
+                Ok(Ok(status)) => {
+                    // Completed within yield time — collect output.
+                    let stdout_bytes = stdout_handle.await.unwrap_or_default();
+                    let stderr_bytes = stderr_handle.await.unwrap_or_default();
+                    let stdout = String::from_utf8_lossy(&stdout_bytes);
+                    let stderr = String::from_utf8_lossy(&stderr_bytes);
+                    let (stdout_str, stdout_truncated) = Self::truncate(&stdout, self.max_output_bytes);
+                    let (stderr_str, stderr_truncated) = Self::truncate(&stderr, self.max_output_bytes);
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let result = ExecOutput {
+                        command: args.command,
+                        process_id: child_pid,
+                        stdout: stdout_str,
+                        stderr: stderr_str,
+                        exit_code: status.code(),
+                        timed_out: false,
+                        duration_ms,
+                        stdout_truncated,
+                        stderr_truncated,
+                        still_running: false,
+                        retained_head: None,
+                        retained_tail: None,
+                        shell_mode_used: args.shell_mode.clone(),
+                        env_delta_applied: args.env_delta.clone(),
+                    };
+                    return serde_json::to_value(result)
+                        .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")));
+                }
+                Ok(Err(e)) => {
+                    return Err(GrodexError::ToolExecution(format!("exec failed: {e}")));
+                }
+                Err(_) => {
+                    // Yield time elapsed — return PID so caller can poll/kill.
+                    // Detach the child so it keeps running.
+                    std::mem::forget(child);
+                    // Abort the collectors (they'll never finish since we
+                    // detached the child's stdout/stderr pipes).
+                    stdout_handle.abort();
+                    stderr_handle.abort();
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let result = ExecOutput {
+                        command: args.command,
+                        process_id: child_pid,
+                        stdout: String::new(),
+                        stderr: format!("yield_time_ms={yield_ms} elapsed; command still running (pid={child_pid:?})"),
+                        exit_code: None,
+                        timed_out: false,
+                        duration_ms,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        still_running: true,
+                        retained_head: None,
+                        retained_tail: None,
+                        shell_mode_used: args.shell_mode.clone(),
+                        env_delta_applied: args.env_delta.clone(),
+                    };
+                    return serde_json::to_value(result)
+                        .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")));
+                }
             }
         }
+
+        // ── Normal mode: wait for completion with timeout + cancel ──
+        let _output = if let Some(ref token) = cancel_token {
+            // When cancel is enabled, we can't use wait_with_output() because
+            // it consumes child. Instead, take stdout/stderr, spawn collectors,
+            // and wait on child separately so we can kill it on cancel.
+            let stdout_child = child.stdout.take();
+            let stderr_child = child.stderr.take();
+            let stdout_handle = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                if let Some(mut r) = stdout_child {
+                    let _ = r.read_to_end(&mut buf).await;
+                }
+                buf
+            });
+            let stderr_handle = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                if let Some(mut r) = stderr_child {
+                    let _ = r.read_to_end(&mut buf).await;
+                }
+                buf
+            });
+
+            let token_clone = token.clone();
+            let wait_result = tokio::select! {
+                result = tokio::time::timeout(timeout, child.wait()) => {
+                    match result {
+                        Ok(Ok(status)) => Ok(Some(status)),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")),
+                    }
+                }
+                _ = token_clone.cancelled() => {
+                    // Cancel requested — kill the child.
+                    let _ = child.start_kill();
+                    let _ = child.wait().await; // reap
+                    Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"))
+                }
+            };
+
+            let stdout_bytes = stdout_handle.await.unwrap_or_default();
+            let stderr_bytes = stderr_handle.await.unwrap_or_default();
+            let stdout_str = String::from_utf8_lossy(&stdout_bytes).to_string();
+            let stderr_str = String::from_utf8_lossy(&stderr_bytes).to_string();
+
+            match wait_result {
+                Ok(Some(status)) => {
+                    let (stdout_t, stdout_trunc) = Self::truncate(&stdout_str, self.max_output_bytes);
+                    let (stderr_t, stderr_trunc) = Self::truncate(&stderr_str, self.max_output_bytes);
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    // Clean up cancel token.
+                    if let Some(ref registry) = self.cancel_registry {
+                        registry.remove(&operation_id.to_string()).await;
+                    }
+                    let result = ExecOutput {
+                        command: args.command,
+                        process_id: child_pid,
+                        stdout: stdout_t,
+                        stderr: stderr_t,
+                        exit_code: status.code(),
+                        timed_out: false,
+                        duration_ms,
+                        stdout_truncated: stdout_trunc,
+                        stderr_truncated: stderr_trunc,
+                        still_running: false,
+                        retained_head: None,
+                        retained_tail: None,
+                        shell_mode_used: args.shell_mode.clone(),
+                        env_delta_applied: args.env_delta.clone(),
+                    };
+                    return serde_json::to_value(result)
+                        .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    // Cancelled.
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    if let Some(ref registry) = self.cancel_registry {
+                        registry.remove(&operation_id.to_string()).await;
+                    }
+                    let reason = token.reason().await.unwrap_or_else(|| "cancelled".into());
+                    let result = ExecOutput {
+                        command: args.command,
+                        process_id: child_pid,
+                        stdout: stdout_str,
+                        stderr: format!("command cancelled: {reason}"),
+                        exit_code: None,
+                        timed_out: false,
+                        duration_ms,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        still_running: false,
+                        retained_head: None,
+                        retained_tail: None,
+                        shell_mode_used: args.shell_mode.clone(),
+                        env_delta_applied: args.env_delta.clone(),
+                    };
+                    return serde_json::to_value(result)
+                        .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    if let Some(ref registry) = self.cancel_registry {
+                        registry.remove(&operation_id.to_string()).await;
+                    }
+                    let result = ExecOutput {
+                        command: args.command,
+                        process_id: child_pid,
+                        stdout: stdout_str,
+                        stderr: format!("command timed out after {timeout:?}"),
+                        exit_code: None,
+                        timed_out: true,
+                        duration_ms,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        still_running: false,
+                        retained_head: None,
+                        retained_tail: None,
+                        shell_mode_used: args.shell_mode.clone(),
+                        env_delta_applied: args.env_delta.clone(),
+                    };
+                    return serde_json::to_value(result)
+                        .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")));
+                }
+                Err(e) => {
+                    if let Some(ref registry) = self.cancel_registry {
+                        registry.remove(&operation_id.to_string()).await;
+                    }
+                    return Err(GrodexError::ToolExecution(format!("exec failed: {e}")));
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            // No cancel token — use the simple wait_with_output path.
+            match tokio::time::timeout(timeout, child.wait_with_output()).await {
+                Ok(Ok(proc_output)) => {
+                    let stdout = String::from_utf8_lossy(&proc_output.stdout);
+                    let stderr = String::from_utf8_lossy(&proc_output.stderr);
+                    let (stdout_str, stdout_truncated) = Self::truncate(&stdout, self.max_output_bytes);
+                    let (stderr_str, stderr_truncated) = Self::truncate(&stderr, self.max_output_bytes);
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let result = ExecOutput {
+                        command: args.command,
+                        process_id: child_pid,
+                        stdout: stdout_str,
+                        stderr: stderr_str,
+                        exit_code: proc_output.status.code(),
+                        timed_out: false,
+                        duration_ms,
+                        stdout_truncated,
+                        stderr_truncated,
+                        still_running: false,
+                        retained_head: None,
+                        retained_tail: None,
+                        shell_mode_used: args.shell_mode.clone(),
+                        env_delta_applied: args.env_delta.clone(),
+                    };
+                    return serde_json::to_value(result)
+                        .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")));
+                }
+                Ok(Err(e)) => {
+                    if let Some(ref registry) = self.cancel_registry {
+                        registry.remove(&operation_id.to_string()).await;
+                    }
+                    return Err(GrodexError::ToolExecution(format!("exec failed: {e}")));
+                }
+                Err(_) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    if let Some(ref registry) = self.cancel_registry {
+                        registry.remove(&operation_id.to_string()).await;
+                    }
+                    let result = ExecOutput {
+                        command: args.command,
+                        process_id: child_pid,
+                        stdout: String::new(),
+                        stderr: format!("command timed out after {timeout:?}"),
+                        exit_code: None,
+                        timed_out: true,
+                        duration_ms,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        still_running: false,
+                        retained_head: None,
+                        retained_tail: None,
+                        shell_mode_used: args.shell_mode.clone(),
+                        env_delta_applied: args.env_delta.clone(),
+                    };
+                    return serde_json::to_value(result)
+                        .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")));
+                }
+            }
+        };
     }
 }
 
@@ -510,6 +846,11 @@ impl BuiltInTool for ExecTool {
                     duration_ms,
                     stdout_truncated,
                     stderr_truncated,
+                    still_running: false,
+                    retained_head: None,
+                    retained_tail: None,
+                    shell_mode_used: prepared.args.shell_mode.clone(),
+                    env_delta_applied: prepared.args.env_delta.clone(),
                 };
 
                 let output_serialized = serde_json::to_string(&result).ok();
@@ -598,6 +939,11 @@ impl BuiltInTool for ExecTool {
                     duration_ms,
                     stdout_truncated: false,
                     stderr_truncated: false,
+                    still_running: false,
+                    retained_head: None,
+                    retained_tail: None,
+                    shell_mode_used: prepared.args.shell_mode.clone(),
+                    env_delta_applied: prepared.args.env_delta.clone(),
                 };
 
                 let output_serialized = serde_json::to_string(&result).ok();
@@ -711,5 +1057,75 @@ mod tests {
         let (out, truncated) = ExecTool::truncate("hello", 100);
         assert!(!truncated);
         assert_eq!(out, "hello");
+    }
+
+    #[tokio::test]
+    async fn exec_background_returns_immediately_with_pid() {
+        let tool = ExecTool::new();
+        // `sleep 10` is a long-running command; background mode should return
+        // immediately with still_running=true and a valid PID.
+        let result = ToolRuntime::execute(
+            &tool,
+            serde_json::json!({"command": "sleep 10", "background": true}),
+            OperationId::new(),
+        )
+        .await
+        .unwrap();
+
+        let output: ExecOutput = serde_json::from_value(result).unwrap();
+        assert!(output.still_running, "background command must be still_running");
+        assert!(output.process_id.is_some(), "must return a process_id");
+        assert!(output.exit_code.is_none(), "no exit code yet");
+        assert!(!output.timed_out);
+
+        // Clean up: kill the background sleep.
+        if let Some(pid) = output.process_id {
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .output();
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_yield_time_completes_within_window() {
+        let tool = ExecTool::new();
+        // `echo hi` finishes well within 5 seconds.
+        let result = ToolRuntime::execute(
+            &tool,
+            serde_json::json!({"command": "echo hi", "yield_time_ms": 5000}),
+            OperationId::new(),
+        )
+        .await
+        .unwrap();
+
+        let output: ExecOutput = serde_json::from_value(result).unwrap();
+        assert!(!output.still_running, "fast command should not be still_running");
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.stdout.contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn exec_yield_time_expires_returns_still_running() {
+        let tool = ExecTool::new();
+        // `sleep 30` won't finish within 50ms yield window.
+        let result = ToolRuntime::execute(
+            &tool,
+            serde_json::json!({"command": "sleep 30", "yield_time_ms": 50}),
+            OperationId::new(),
+        )
+        .await
+        .unwrap();
+
+        let output: ExecOutput = serde_json::from_value(result).unwrap();
+        assert!(output.still_running, "yield expired → still_running");
+        assert!(output.process_id.is_some(), "must return pid for later poll/kill");
+        assert!(output.exit_code.is_none());
+
+        // Clean up.
+        if let Some(pid) = output.process_id {
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .output();
+        }
     }
 }

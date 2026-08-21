@@ -34,3 +34,23 @@ pub struct SandboxBinding {
     /// When this binding was created.
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
+
+/// A policy binding attaches a security policy to a Step/Turn snapshot.
+///
+/// Design Doc 10 §12.1: the StepSnapshot carries both a SandboxBinding
+/// and a PolicyBinding. The PolicyBinding records which policy generation
+/// was in effect when the Step was captured, enabling revocation fence
+/// checks during replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyBinding {
+    /// Policy identifier (e.g. "default", "enterprise-strict").
+    pub policy_id: String,
+    /// Generation of the policy at binding time.
+    pub policy_generation: u64,
+    /// Maximum authority ceiling allowed by this policy.
+    pub authority_ceiling: u8,
+    /// Whether this policy allows deferred capability promotion.
+    pub deferred_promotion_allowed: bool,
+    /// When this binding was created.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}

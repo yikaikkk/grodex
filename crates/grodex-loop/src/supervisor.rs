@@ -39,6 +39,98 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+// ── BackgroundTaskBarrier (invariant #11) ─────────────────────────────
+//
+// Invariant #11: "后台任务完成 ≠ 主 Agent 已读取" — background task
+// completion does not imply the main agent has consumed the result.
+//
+// The barrier tracks two monotonic counters:
+//   - completed_epoch: bumped each time a background task finishes
+//   - consumed_epoch: bumped when the main agent explicitly acknowledges
+//
+// The invariant is: consumed_epoch <= completed_epoch at all times.
+// A debug_assert fires if the main agent tries to consume a result
+// that hasn't been completed yet (consumed_epoch would exceed
+// completed_epoch).
+
+/// Fence enforcing invariant #11: background task completion is
+/// distinct from main-agent consumption.
+///
+/// Usage:
+///   1. Background task finishes → `notify_completed()`
+///   2. Main agent reads the result → `consume()` (debug_asserts)
+///   3. `consumed_epoch` must never exceed `completed_epoch`
+#[derive(Debug)]
+pub struct BackgroundTaskBarrier {
+    /// Number of background tasks that have completed.
+    completed_epoch: u64,
+    /// Number of completions the main agent has acknowledged.
+    consumed_epoch: u64,
+}
+
+impl BackgroundTaskBarrier {
+    /// Create a new barrier at epoch 0.
+    pub fn new() -> Self {
+        Self {
+            completed_epoch: 0,
+            consumed_epoch: 0,
+        }
+    }
+
+    /// Signal that a background task has completed.
+    /// Bumps the completed epoch.
+    pub fn notify_completed(&mut self) {
+        self.completed_epoch = self.completed_epoch.saturating_add(1);
+    }
+
+    /// The main agent acknowledges (consumes) one completed background
+    /// task result.
+    ///
+    /// # Panics (debug_assert)
+    /// Panics in debug builds if `consumed_epoch >= completed_epoch`,
+    /// which would mean the agent is reading a result that hasn't been
+    /// completed yet (invariant #11 violation).
+    pub fn consume(&mut self) {
+        debug_assert!(
+            self.consumed_epoch < self.completed_epoch,
+            "invariant #11 violated: consumed_epoch ({}) >= completed_epoch ({}) \
+             — main agent read a background result before it completed",
+            self.consumed_epoch,
+            self.completed_epoch,
+        );
+        if self.consumed_epoch < self.completed_epoch {
+            self.consumed_epoch += 1;
+        }
+    }
+
+    /// How many completions are pending (completed but not yet consumed).
+    pub fn pending_count(&self) -> u64 {
+        self.completed_epoch.saturating_sub(self.consumed_epoch)
+    }
+
+    /// The current completed epoch.
+    pub fn completed_epoch(&self) -> u64 {
+        self.completed_epoch
+    }
+
+    /// The current consumed epoch.
+    pub fn consumed_epoch(&self) -> u64 {
+        self.consumed_epoch
+    }
+
+    /// Reset both counters (e.g. on session boundary).
+    pub fn reset(&mut self) {
+        self.completed_epoch = 0;
+        self.consumed_epoch = 0;
+    }
+}
+
+impl Default for BackgroundTaskBarrier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Turn completion message from a spawned turn task.
 struct TurnCompletion {
     turn_id: grodex_core::id::TurnId,
@@ -107,6 +199,10 @@ pub struct SessionSupervisor {
     /// Discovered once per session, reused across turns — the filesystem
     /// walk is the expensive part; `build()` is just string assembly.
     cached_discovered_nodes: Option<Vec<InstructionNode>>,
+    /// Invariant #11 fence: tracks background task completions vs main
+    /// agent consumption. Ensures the agent never reads a result that
+    /// hasn't been fully produced yet.
+    background_barrier: BackgroundTaskBarrier,
 }
 
 impl SessionSupervisor {
@@ -166,6 +262,7 @@ impl SessionSupervisor {
             prev_skill_snapshot: None,
             skill_generation: 1,
             cached_discovered_nodes: None,
+            background_barrier: BackgroundTaskBarrier::new(),
         };
 
         let handle = SessionHandle { cmd_tx, event_rx };
@@ -176,7 +273,13 @@ impl SessionSupervisor {
     ///
     /// Following Grok's pattern: completions and commands are multiplexed.
     /// Turn execution runs in spawned tasks so the loop stays responsive.
+    #[tracing::instrument(
+        level = "info",
+        skip(self),
+        fields(session_id = %self.session.id)
+    )]
     pub async fn run(&mut self) {
+        tracing::info!("session supervisor starting");
         if let Err(e) = self.session.transition_to(SessionState::Idle) {
             let _ = self.event_tx.send(SessionEvent::Error { message: e }).await;
             return;
@@ -262,6 +365,11 @@ impl SessionSupervisor {
         let _ = self.event_tx.send(SessionEvent::Shutdown).await;
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, cmd),
+        fields(session_id = %self.session.id)
+    )]
     async fn handle_command(&mut self, cmd: SessionCommand) -> bool {
         match cmd {
             SessionCommand::StartTurn { user_input } => {
@@ -478,13 +586,32 @@ impl SessionSupervisor {
                 // Human adjudication for an Indeterminate tool call.
                 // Write the durable ToolOutcomeResolved event so the
                 // journal records the user's decision for future resumes.
+                //
+                // R14-4: Look up operation_id from the journal so the
+                // resolved event can be correlated with the original
+                // Prepared/Started events for idempotency on replay.
+                let op_id = if let Some(ref writer) = self.writer {
+                    if let Ok(events) = writer.store().replay_from(0).await {
+                        events.iter()
+                            .find(|ev| {
+                                ev.payload.get("call_id").and_then(|v| v.as_str()) == Some(&call_id)
+                                    && ev.event_type == grodex_rollout::event::RolloutEventType::ToolExecutionStarted
+                            })
+                            .and_then(|ev| ev.payload.get("operation_id").and_then(|v| v.as_str()))
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 match resolution {
                     crate::command::IndeterminateResolution::Succeeded => {
                         if let Some(ref writer) = self.writer {
                             let _ = writer
                                 .write_tool_outcome_resolved(
                                     &call_id,
-                                    None, // operation_id
+                                    op_id.as_deref(),
                                     "succeeded",
                                     content.as_deref(),
                                     Some("user"),
@@ -504,7 +631,7 @@ impl SessionSupervisor {
                             let _ = writer
                                 .write_tool_outcome_resolved(
                                     &call_id,
-                                    None, // operation_id
+                                    op_id.as_deref(),
                                     "failed",
                                     content.as_deref(),
                                     Some("user"),
@@ -697,27 +824,45 @@ impl SessionSupervisor {
         // After replay, check for tool calls that started but never
         // finished (ToolExecutionStarted without matching
         // ToolExecutionFinished/ToolResultCommitted). These represent
-        // side effects in an unknown state — the user must adjudicate.
-        let checkpoint = grodex_rollout::recovery::recover_from_journal(&events);
+        // side effects in an unknown state.
+        //
+        // R14-6b: consult SideEffectClass to avoid blocking resume behind
+        // a human decision for trivially-replayable tools. ReadOnly and
+        // Idempotent tools are classified as NotStarted (safe to
+        // auto-replay); only NonIdempotent / unknown tools become
+        // Indeterminate (human must adjudicate).
+        let side_effect_map = {
+            let cap_handle = self.coordinator.capability_handle();
+            let cap = cap_handle.lock().await;
+            cap.side_effect_map()
+        };
+        let checkpoint = grodex_rollout::recovery::recover_from_journal_with_metadata(
+            &events,
+            &side_effect_map,
+        );
         for (call_id, fate) in &checkpoint.call_fate {
             if matches!(fate, grodex_rollout::recovery::ToolCallFate::Indeterminate) {
-                // Look up the tool name from the journal events.
-                let tool_name = events
+                // Look up tool name and operation_id from the journal events.
+                let started_event = events
                     .iter()
                     .find(|ev| {
                         ev.payload.get("call_id").and_then(|v| v.as_str()) == Some(call_id.as_str())
                             && ev.event_type == grodex_rollout::event::RolloutEventType::ToolExecutionStarted
-                    })
+                    });
+                let tool_name = started_event
                     .and_then(|ev| ev.payload.get("name").and_then(|v| v.as_str()))
                     .unwrap_or("unknown")
                     .to_string();
+                let op_id = started_event
+                    .and_then(|ev| ev.payload.get("operation_id").and_then(|v| v.as_str()))
+                    .map(|s| s.to_string());
                 // Write the durable indeterminate marker so future
                 // resumes don't re-report the same call.
                 if let Some(w) = &self.writer {
                     let _ = w
                         .write_tool_outcome_indeterminate(
                             call_id,
-                            None,
+                            op_id.as_deref(),
                             &tool_name,
                             "crash_recovery: started without finished",
                         )
@@ -743,7 +888,22 @@ impl SessionSupervisor {
         // Re-surface approval tickets that were requested but never
         // resolved before the crash. The user needs to adjudicate them
         // so the corresponding tool calls can proceed (or be denied).
+        //
+        // R14-2 fix: Previously these tickets were only re-surfaced to the
+        // frontend as events, but NOT re-injected into the ApprovalBroker
+        // memory table. This meant `ResolveApproval` → `permission.resolve()`
+        // would return false (ticket not found in broker), and the user's
+        // decision was silently dropped. Now we re-inject each pending
+        // ticket into the broker with a fresh oneshot channel, so resolve()
+        // can find it and the decision is properly recorded.
         for ticket in checkpoint.pending_approval_tickets() {
+            // Re-inject into the broker so ResolveApproval can find it.
+            self.permission.lock().await.reinject_pending_ticket(
+                &ticket.ticket_id,
+                &ticket.tool_name,
+                ticket.call_id.as_deref(),
+                ticket.args.as_ref(),
+            );
             let _ = self.event_tx
                 .send(SessionEvent::ApprovalRequested {
                     ticket_id: ticket.ticket_id.clone(),
@@ -755,11 +915,18 @@ impl SessionSupervisor {
                     ),
                     risk: "recovered".into(),
                     timeout_remaining_ms: 120_000,
+                    args: ticket.args.clone(),
+                    call_id: ticket.call_id.clone(),
                 })
                 .await;
         }
     }
 
+    #[tracing::instrument(
+        level = "info",
+        skip(self),
+        fields(session_id = %self.session.id)
+    )]
     async fn start_turn(&mut self, user_input: String) {
         // Invariant #1/#2: at most one Turn is admitted at a time. The
         // session state machine rejects a second admit while one is running,
@@ -809,7 +976,7 @@ impl SessionSupervisor {
         //   - If changed, bump skill_generation so the model sees updates
         //   - Freeze a Turn-level snapshot (immutable mid-Turn)
         //   - Write SkillSnapshotRecorded to journal for version auditing
-        let new_catalog = SkillCatalog::discover(&self.cwd);
+        let new_catalog = SkillCatalog::discover(&self.cwd, self.workspace_trusted);
         if let Some(prev) = &self.prev_skill_snapshot {
             if new_catalog.has_changed_since(prev) {
                 self.skill_generation = self.skill_generation.wrapping_add(1);
@@ -823,6 +990,7 @@ impl SessionSupervisor {
                     "source": format!("{:?}", s.source),
                     "path": s.path.to_string_lossy(),
                     "content_hash": s.content_hash,
+                    "trusted": s.trusted,
                 })
             }).collect();
             let _ = writer
@@ -914,6 +1082,8 @@ impl SessionSupervisor {
                             summary,
                             risk,
                             timeout_remaining_ms,
+                            args: None,
+                            call_id: None,
                         },
                     };
                     let _ = event_tx.send(ev).await;
@@ -1060,5 +1230,72 @@ impl SessionHandle {
 
     pub async fn recv(&mut self) -> Option<SessionEvent> {
         self.event_rx.recv().await
+    }
+}
+
+#[cfg(test)]
+mod barrier_tests {
+    use super::BackgroundTaskBarrier;
+
+    #[test]
+    fn barrier_starts_at_zero() {
+        let b = BackgroundTaskBarrier::new();
+        assert_eq!(b.completed_epoch(), 0);
+        assert_eq!(b.consumed_epoch(), 0);
+        assert_eq!(b.pending_count(), 0);
+    }
+
+    #[test]
+    fn notify_completed_bumps_epoch() {
+        let mut b = BackgroundTaskBarrier::new();
+        b.notify_completed();
+        assert_eq!(b.completed_epoch(), 1);
+        assert_eq!(b.pending_count(), 1);
+        b.notify_completed();
+        assert_eq!(b.completed_epoch(), 2);
+        assert_eq!(b.pending_count(), 2);
+    }
+
+    #[test]
+    fn consume_decrements_pending() {
+        let mut b = BackgroundTaskBarrier::new();
+        b.notify_completed();
+        b.notify_completed();
+        assert_eq!(b.pending_count(), 2);
+
+        b.consume();
+        assert_eq!(b.consumed_epoch(), 1);
+        assert_eq!(b.pending_count(), 1);
+
+        b.consume();
+        assert_eq!(b.consumed_epoch(), 2);
+        assert_eq!(b.pending_count(), 0);
+    }
+
+    #[test]
+    fn consume_does_not_exceed_completed() {
+        let mut b = BackgroundTaskBarrier::new();
+        b.notify_completed();
+        b.consume();
+        // After consuming the only completion, pending_count is 0.
+        // A second consume would violate the invariant (debug_assert),
+        // so we verify the safe state instead.
+        assert_eq!(b.consumed_epoch(), 1);
+        assert_eq!(b.completed_epoch(), 1);
+        assert_eq!(b.pending_count(), 0);
+    }
+
+    #[test]
+    fn reset_clears_both_epochs() {
+        let mut b = BackgroundTaskBarrier::new();
+        b.notify_completed();
+        b.notify_completed();
+        b.consume();
+        assert_eq!(b.completed_epoch(), 2);
+        assert_eq!(b.consumed_epoch(), 1);
+
+        b.reset();
+        assert_eq!(b.completed_epoch(), 0);
+        assert_eq!(b.consumed_epoch(), 0);
     }
 }

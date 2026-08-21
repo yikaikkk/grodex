@@ -139,6 +139,21 @@ pub enum RolloutEventType {
     ///   - skills: [{ name, source, path, content_hash }]
     ///   - skill_generation: u64
     SkillSnapshotRecorded,
+
+    /// An application-initiated tool call that does NOT go through
+    /// model sampling (invariant #17). AppOnly calls are produced by
+    /// application logic (e.g. auto-fixup, system maintenance, or
+    /// human-initiated side effects) and must still be recorded in
+    /// the rollout journal for auditability and recovery.
+    ///
+    /// Schema:
+    ///   - tool_name: str
+    ///   - args: Value
+    ///   - result: Value
+    ///   - reason: str  (why this was AppOnly, e.g. "auto_compaction", "system_maintenance")
+    ///   - operation_id: str?
+    ///   - call_id: str
+    AppOnlyToolCall,
 }
 
 /// Sensitivity classification for an event.

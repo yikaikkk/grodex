@@ -17,6 +17,7 @@
 //! a tool run cannot be replayed by a crash-recovery retry (invariant #16:
 //! revocation may only tighten; a lease is a one-shot, never refreshed).
 
+use grodex_core::id::CommitSequence;
 use grodex_core::policy::PolicyDecision;
 use std::time::{Duration, Instant};
 
@@ -74,6 +75,10 @@ impl From<PolicyDecision> for ApprovalResolution {
 /// subsequent calls return `false` — a replayed call (e.g. after a crash
 /// recovery retry) cannot reuse the lease. `max_uses` is fixed at 1 for
 /// side-effecting tools (the design's PermissionLease invariant).
+///
+/// The `commit_seq` field orders this lease in the same CommitSequence
+/// as tool results, ensuring the approval pipeline is auditable and
+/// the order of approvals matches the order of execution.
 #[derive(Debug, Clone)]
 pub struct PermissionLease {
     /// The tool call id this lease authorizes.
@@ -87,6 +92,16 @@ pub struct PermissionLease {
     /// Revocation epoch at mint time. Revalidation refuses if the live epoch
     /// advanced past this (invariant #16: revocation only tightens).
     pub revocation_epoch: u64,
+    /// Position in the commit sequence — orders this approval relative
+    /// to other tool calls in the same Turn. Assigned by the
+    /// TurnCoordinator when the lease is minted.
+    pub commit_seq: Option<CommitSequence>,
+    /// Resolved resources this lease is bound to (§20.5.9).
+    /// If the tool's actual target resources differ from these at
+    /// execute time, the lease is stale and must be re-approved.
+    pub resolved_resources: Vec<String>,
+    /// Plan hash binding (for multi-step operations).
+    pub plan_hash: Option<String>,
     uses: u8,
 }
 
@@ -104,6 +119,9 @@ impl PermissionLease {
             max_uses: 1,
             expires_at: ttl.map(|d| Instant::now() + d),
             revocation_epoch,
+            commit_seq: None,
+            resolved_resources: Vec::new(),
+            plan_hash: None,
             uses: 0,
         }
     }

@@ -392,25 +392,30 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
             summary,
             risk,
             timeout_remaining_ms,
+            args,
+            call_id: _,
         } => {
             let payload = grodex_protocol::acp::RequestPermissionPayload {
                 ticket_id,
                 tool_name,
                 summary,
                 risk,
-                arguments_snapshot: None,
+                arguments_snapshot: args,
                 timeout_remaining_ms,
             };
             let env = EventEnvelope::wrap(seq, session_id, UpdateContent::RequestPermission(payload));
             Some(ServerFrame::Event(env))
         }
         LoopSessionEvent::IndeterminateToolCall { call_id, tool_name, message } => {
+            // Forward to frontend with full message so the user can make
+            // an informed decision about the indeterminate tool call.
             let content = UpdateContent::ItemStarted {
-                item_id: call_id,
+                item_id: call_id.clone(),
                 item_type: format!("indeterminate:{tool_name}"),
             };
-            let _ = message; // message is logged but not forwarded as ACP
             let env = EventEnvelope::wrap(seq, session_id, content);
+            // Also print to stderr for log visibility (ACP path).
+            eprintln!("[indeterminate] call_id={call_id} tool={tool_name}: {message}");
             Some(ServerFrame::Event(env))
         }
     }
@@ -1797,6 +1802,11 @@ fn summarize_payload(
                 .map(|a| a.len())
                 .unwrap_or(0);
             format!("skill snapshot gen={skill_gen} count={count}")
+        }
+        AppOnlyToolCall => {
+            let tool = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
+            let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("app-only tool={tool} reason={reason}")
         }
     }
 }

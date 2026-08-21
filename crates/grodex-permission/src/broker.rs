@@ -11,6 +11,7 @@
 use crate::store::{StoreError, TicketStore};
 use crate::ticket::{ApprovalTicket, TicketStatus};
 use crate::resolution::ApprovalResolution;
+use grodex_core::id::ToolCallId;
 use grodex_core::policy::PolicyDecision;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -109,6 +110,8 @@ impl ApprovalBroker {
             session_id: ticket.session_id,
             source_agent_id: ticket.source_agent_id,
             task_id: ticket.task_id,
+            resolved_resources: ticket.resolved_resources,
+            plan_hash: ticket.plan_hash,
         };
 
         if let Some(store) = &self.store {
@@ -191,6 +194,52 @@ impl ApprovalBroker {
                 let _ = tx.send(ApprovalResolution::Cancel);
             }
         }
+    }
+
+    /// Re-inject a pending approval ticket recovered from the journal
+    /// into the broker's in-memory table.
+    ///
+    /// This is used by `handle_resume_session` to ensure `resolve()` can
+    /// find tickets that were requested before a crash but never resolved.
+    /// The re-injected ticket gets a fresh oneshot sender; its receiver is
+    /// dropped because the original tool future was lost in the crash.
+    pub fn reinject_pending_ticket(
+        &mut self,
+        ticket_id: &str,
+        tool_name: &str,
+        call_id: Option<&str>,
+        args: Option<&serde_json::Value>,
+    ) {
+        // Don't re-inject if already present (idempotent).
+        if self.tickets.contains_key(ticket_id) {
+            return;
+        }
+
+        let (tx, _rx) = oneshot::channel::<ApprovalResolution>();
+        let tool_call_id = call_id
+            .and_then(|s| ToolCallId::from_string(s).ok())
+            .unwrap_or_default();
+        let ticket = ApprovalTicket {
+            ticket_id: ticket_id.to_string(),
+            tool_call_id,
+            tool_name: tool_name.to_string(),
+            summary: format!("[recovered-pending] {tool_name}"),
+            risk_level: crate::ticket::RiskLevel::Medium,
+            status: TicketStatus::Pending,
+            decision_tx: Some(tx),
+            policy_decision: None,
+            created_at: std::time::Instant::now(),
+            timeout: self.default_timeout,
+            arguments_snapshot: args.cloned(),
+            policy_rule_matches: None,
+            granted_by: None,
+            session_id: None,
+            source_agent_id: None,
+            task_id: None,
+            resolved_resources: Vec::new(),
+            plan_hash: None,
+        };
+        self.tickets.insert(ticket_id.to_string(), ticket);
     }
 
     pub fn expire_timed_out(&mut self) -> usize {

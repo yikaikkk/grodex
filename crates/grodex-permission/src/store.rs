@@ -334,6 +334,8 @@ fn raw_row_to_ticket(
         session_id,
         source_agent_id,
         task_id,
+        resolved_resources: Vec::new(),
+        plan_hash: None,
     })
 }
 

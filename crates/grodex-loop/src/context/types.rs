@@ -6,8 +6,34 @@
 
 use grodex_core::context::ContextItem;
 
+/// Strategy used for compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CompactionStrategy {
+    /// Summarize oldest items to free budget.
+    SummarizeOldest,
+    /// Sliding window: keep the most recent N items.
+    SlidingWindow,
+    /// Hierarchical: summarize prior summaries.
+    Hierarchical,
+    /// Agent chose to skip compaction this cycle.
+    Skipped,
+}
+
+/// What triggered the compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CompactionTrigger {
+    /// Token budget exceeded.
+    BudgetExceeded,
+    /// Explicit user/agent request.
+    Manual,
+    /// Periodic (every N turns).
+    Periodic,
+    /// Context window pressure from the provider.
+    ProviderPressure,
+}
+
 /// A plan describing what to compact and what to keep.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompactionPlan {
     /// Items that will be summarized (oldest, exceeding budget).
     pub items_to_compact: Vec<ContextItem>,
@@ -19,6 +45,27 @@ pub struct CompactionPlan {
     pub compact_tokens: u64,
     /// Estimated tokens in items_to_keep.
     pub keep_tokens: u64,
+    /// Source history version this plan was computed against.
+    #[serde(default)]
+    pub source_history_version: Option<u64>,
+    /// What triggered this compaction.
+    #[serde(default)]
+    pub trigger: Option<CompactionTrigger>,
+    /// Which strategy was chosen.
+    #[serde(default)]
+    pub strategy: Option<CompactionStrategy>,
+    /// Boundary index: items before this are compacted.
+    #[serde(default)]
+    pub prefix_boundary: Option<usize>,
+    /// ID of the state capsule to embed after compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_capsule_id: Option<String>,
+    /// Deadline by which compaction must complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<std::time::SystemTime>,
+    /// Predicted token count of the summary output.
+    #[serde(default)]
+    pub estimated_summary_tokens: Option<u64>,
 }
 
 /// Result of a compaction operation.
@@ -142,4 +189,55 @@ impl CompactionPlan {
         }
         out
     }
+}
+
+/// Age-tiered micro-prune configuration.
+/// Items older than the threshold are candidates for pruning.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgeTierPruneConfig {
+    /// Age threshold in turns. Items older than this are pruned.
+    pub age_threshold_turns: u64,
+    /// Minimum tokens to prune per cycle (avoid churn).
+    pub min_tokens_to_prune: u64,
+    /// Whether to preserve tool-call/tool-result pairs.
+    pub preserve_tool_pairs: bool,
+    /// Maximum tokens to prune per cycle (safety limit).
+    pub max_tokens_to_prune: Option<u64>,
+}
+
+impl Default for AgeTierPruneConfig {
+    fn default() -> Self {
+        Self {
+            age_threshold_turns: 10,
+            min_tokens_to_prune: 100,
+            preserve_tool_pairs: true,
+            max_tokens_to_prune: None,
+        }
+    }
+}
+
+/// Result of a micro-prune operation.
+#[derive(Debug, Clone)]
+pub struct MicroPruneResult {
+    /// Number of items pruned.
+    pub items_pruned: usize,
+    /// Tokens freed by pruning.
+    pub tokens_freed: u64,
+    /// Remaining items after pruning.
+    pub remaining_items: Vec<ContextItem>,
+}
+
+/// Tool exposure tracking — which tools the model has seen and used.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ToolExposure {
+    /// Tools advertised to the model in the current request.
+    pub advertised_tools: Vec<String>,
+    /// Tools the model has called at least once this session.
+    pub used_tools: Vec<String>,
+    /// Tools that were advertised but never called.
+    pub unused_advertised: Vec<String>,
+    /// Turn number when each tool was first advertised.
+    pub first_advertised_at: std::collections::HashMap<String, u64>,
+    /// Turn number when each tool was first used.
+    pub first_used_at: std::collections::HashMap<String, u64>,
 }

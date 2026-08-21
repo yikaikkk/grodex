@@ -491,6 +491,37 @@ impl SessionRuntimeBuilder {
             }
         };
 
+        // Initial index scan + reconcile: walk the workspace for .md files,
+        // diff against the indexed_files table, and apply deletions. New/changed
+        // files are registered in indexed_files (content parsing into MemoryUnit
+        // is deferred to a later phase when a Markdown parser is available).
+        // Fail-open: scan errors must not block session startup.
+        if let Some(ref db) = memory {
+            let scanned = grodex_memory::scan_directory(&self.cwd);
+            let diff = grodex_memory::reconcile(db, &scanned);
+            if !diff.is_empty() {
+                // Apply deletions (orphan units, bump generation).
+                let _ = grodex_memory::apply_deletions(db, &diff);
+                // Register new/changed files in indexed_files so the
+                // index table reflects the current filesystem state.
+                let current_gen = db.read_generation().unwrap_or(1);
+                for file in diff.new_files.iter().chain(diff.changed_files.iter()) {
+                    let indexed = grodex_memory::IndexedFile {
+                        path: file.key.clone(),
+                        source_kind: grodex_memory::types::SourceKind::Memory,
+                        mtime: file.mtime,
+                        size: file.size as i64,
+                        content_hash: file.content_hash.clone(),
+                        index_generation: current_gen,
+                        last_indexed_at: chrono::Utc::now(),
+                    };
+                    let _ = db.upsert_indexed_file(&indexed);
+                }
+                // Bump generation after inserts so the snapshot invalidates.
+                let _ = db.bump_generation();
+            }
+        }
+
         // Embedding model for hybrid RAG (FTS5 + vector). Fail-open:
         // if embedding is not configured (enable_embedding=false or
         // missing API key env var), the model is None and
@@ -593,26 +624,51 @@ impl SessionRuntimeBuilder {
     }
 }
 
-/// Build a `PermissionPolicy` from the config `[rules]` table.
+/// Build a `PermissionPolicy` from the config.
 ///
-/// Supported config forms (config.example.toml):
-///   ```toml
-///   [rules]
-///   read_file = "allow"
-///   write_file = "ask"
-///   exec = "deny"
-///   ```
+/// Two config forms are supported:
+///
+/// ## Simple form (backward-compatible)
+/// ```toml
+/// [rules]
+/// read_file = "allow"
+/// write_file = "ask"
+/// exec = "deny"
+/// ```
 /// Each key is a tool name (or `*`), each value is `allow` / `ask` / `deny`.
-/// When no `[rules]` table is present, a safe default is applied:
-///   - `read_file` → Allow
-///   - `*`         → Ask   (every side-effecting tool prompts)
-/// This avoids the prior footgun where an empty `PermissionPolicy::new()`
-/// made *every* tool `Ask`, and — because the approval chain was broken —
-/// every tool call timed out.
+///
+/// ## Extended form (with matchers)
+/// ```toml
+/// [[permission_rules]]
+/// tool = "exec"
+/// decision = "allow"
+/// priority = 10
+/// command = { pattern = "git *" }
+///
+/// [[permission_rules]]
+/// tool = "write_file"
+/// decision = "deny"
+/// resource = { arg_path = "/path", pattern = "/etc/*" }
+///
+/// [[permission_rules]]
+/// tool = "read_file"
+/// decision = "allow"
+/// arg_patterns = [{ arg_path = "/path", pattern = "/tmp/*" }]
+/// ```
+///
+/// Both forms can coexist in the same config. Simple `[rules]` entries
+/// are loaded first (lower priority), then `[[permission_rules]]` entries
+/// are loaded (can override with higher `priority`).
+///
+/// When neither `[rules]` nor `[[permission_rules]]` is present, a safe
+/// default is applied: `read_file` → Allow, `*` → Ask.
 fn build_permission_policy(cfg: &toml::Value) -> PermissionPolicy {
     let mut policy = PermissionPolicy::new();
 
-    let Some(rules_tbl) = cfg.get("rules").and_then(|v| v.as_table()) else {
+    let has_simple = cfg.get("rules").and_then(|v| v.as_table()).is_some();
+    let has_extended = cfg.get("permission_rules").and_then(|v| v.as_array()).is_some();
+
+    if !has_simple && !has_extended {
         // Safe default: reads allowed, everything else asks.
         policy.add_rule(PolicyRule {
             tool_pattern: "read_file".into(),
@@ -637,29 +693,112 @@ fn build_permission_policy(cfg: &toml::Value) -> PermissionPolicy {
             priority: 0,
         });
         return policy;
-    };
-
-    for (tool, decision_val) in rules_tbl {
-        let Some(decision_str) = decision_val.as_str() else { continue };
-        let decision = match decision_str.to_lowercase().as_str() {
-            "allow" => PolicyDecision::Allow,
-            "deny" => PolicyDecision::Deny,
-            "ask" => PolicyDecision::Ask,
-            _ => continue,
-        };
-        policy.add_rule(PolicyRule {
-            tool_pattern: tool.clone(),
-            arg_patterns: Vec::new(),
-            command: None,
-            resource: None,
-            rule_id: None,
-            network: None,
-            mcp: None,
-            decision,
-            priority: 0,
-        });
     }
+
+    // Simple form: [rules]
+    if let Some(rules_tbl) = cfg.get("rules").and_then(|v| v.as_table()) {
+        for (tool, decision_val) in rules_tbl {
+            let Some(decision_str) = decision_val.as_str() else { continue };
+            let decision = match decision_str.to_lowercase().as_str() {
+                "allow" => PolicyDecision::Allow,
+                "deny" => PolicyDecision::Deny,
+                "ask" => PolicyDecision::Ask,
+                _ => continue,
+            };
+            policy.add_rule(PolicyRule {
+                tool_pattern: tool.clone(),
+                arg_patterns: Vec::new(),
+                command: None,
+                resource: None,
+                rule_id: None,
+                network: None,
+                mcp: None,
+                decision,
+                priority: 0,
+            });
+        }
+    }
+
+    // Extended form: [[permission_rules]]
+    if let Some(ext_rules) = cfg.get("permission_rules").and_then(|v| v.as_array()) {
+        for entry in ext_rules {
+            let Some(tool) = entry.get("tool").and_then(|v| v.as_str()) else { continue };
+            let Some(decision_str) = entry.get("decision").and_then(|v| v.as_str()) else { continue };
+            let decision = match decision_str.to_lowercase().as_str() {
+                "allow" => PolicyDecision::Allow,
+                "deny" => PolicyDecision::Deny,
+                "ask" => PolicyDecision::Ask,
+                _ => continue,
+            };
+            let priority = entry.get("priority").and_then(|v| v.as_integer()).unwrap_or(0) as u8;
+
+            // Parse optional matchers via serde_json conversion (toml Value → serde_json Value)
+            let toml_to_json = |key: &str| -> Option<serde_json::Value> {
+                entry.get(key).map(|v| toml_to_json_value(v))
+            };
+
+            let command = toml_to_json("command")
+                .and_then(|v| serde_json::from_value(v).ok());
+            let resource = toml_to_json("resource")
+                .and_then(|v| serde_json::from_value(v).ok());
+            let network = toml_to_json("network")
+                .and_then(|v| serde_json::from_value(v).ok());
+            let mcp = toml_to_json("mcp")
+                .and_then(|v| serde_json::from_value(v).ok());
+            let rule_id = entry.get("rule_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+            // Parse arg_patterns array
+            let arg_patterns = entry.get("arg_patterns")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            let json_val = toml_to_json_value(v);
+                            serde_json::from_value(json_val).ok()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            policy.add_rule(PolicyRule {
+                tool_pattern: tool.to_string(),
+                arg_patterns,
+                command,
+                resource,
+                rule_id,
+                network,
+                mcp,
+                decision,
+                priority,
+            });
+        }
+    }
+
     policy
+}
+
+/// Convert a `toml::Value` to `serde_json::Value` for deserializing
+/// complex matchers from TOML config.
+fn toml_to_json_value(v: &toml::Value) -> serde_json::Value {
+    match v {
+        toml::Value::String(s) => serde_json::Value::String(s.clone()),
+        toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+        toml::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter().map(toml_to_json_value).collect(),
+        ),
+        toml::Value::Table(tbl) => {
+            let map: serde_json::Map<String, serde_json::Value> = tbl
+                .iter()
+                .map(|(k, v)| (k.clone(), toml_to_json_value(v)))
+                .collect();
+            serde_json::Value::Object(map)
+        }
+        _ => serde_json::Value::Null,
+    }
 }
 
 /// Build a `SandboxManager` from the `sandbox_profile` config value.

@@ -43,7 +43,10 @@ impl RouterDecision {
 }
 
 /// A fingerprint of the query for diagnostics (not the raw text).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Also used as a cache key for `MemoryContextSnapshot` (invariant #10),
+/// so it derives `Hash` + `Eq` for use in `HashMap`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryFingerprint {
     /// Normalized query (whitespace-folded, trimmed).
     pub normalized: String,
@@ -53,6 +56,41 @@ pub struct QueryFingerprint {
     pub has_history_signal: bool,
     /// Whether the query contains action/skill signals.
     pub has_action_signal: bool,
+}
+
+impl QueryFingerprint {
+    /// Create a fingerprint from a raw user query string.
+    ///
+    /// The normalization is whitespace-fold + trimmed + lowercased,
+    /// matching the negative cache's normalization so the same query
+    /// produces the same fingerprint across layers.
+    pub fn from_query(query: &str) -> Self {
+        let normalized: String = query
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        let term_count = normalized.split_whitespace().count();
+
+        let history_signals = [
+            "last", "before", "why", "failed", "original", "evidence",
+            "evolution", "history", "previous", "prior",
+        ];
+        let action_signals = [
+            "action", "release", "deploy", "test", "build",
+            "发布", "部署", "构建", "测试",
+        ];
+
+        let has_history_signal = history_signals.iter().any(|s| normalized.contains(s));
+        let has_action_signal = action_signals.iter().any(|s| normalized.contains(s));
+
+        Self {
+            normalized,
+            term_count,
+            has_history_signal,
+            has_action_signal,
+        }
+    }
 }
 
 /// The conservative multi-label Intent Router.

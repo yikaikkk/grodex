@@ -266,6 +266,45 @@ impl CapabilityManager {
         Vec::new()
     }
 
+    /// Get the JSON Schema for a specific tool from the latest retained
+    /// generation. Returns `None` if the tool or generation is not found.
+    /// Used by Narrow flow to validate narrowed_args structure.
+    pub fn tool_schema(&self, name: &str) -> Option<serde_json::Value> {
+        for g in self.generations.iter().rev() {
+            if let Some(spec) = g.tool_specs.get(name) {
+                return Some(spec.parameters.clone());
+            }
+        }
+        None
+    }
+
+    /// Get ToolMetadata for a specific tool from the latest retained
+    /// generation. Returns `None` if the tool has no registered metadata.
+    /// Used by the scheduler (ConcurrencyClass) and crash recovery
+    /// (SideEffectClass) to make execution and replay decisions.
+    pub fn tool_metadata(&self, name: &str) -> Option<grodex_core::tool::ToolMetadata> {
+        for g in self.generations.iter().rev() {
+            if let Some(m) = g.tool_metadata.get(name) {
+                return Some(m.clone());
+            }
+        }
+        None
+    }
+
+    /// Build a tool-name → SideEffectClass map from the latest generation.
+    /// Consumed by crash recovery (R14-6b) to decide whether an in-flight
+    /// tool call is safe to auto-replay (ReadOnly/Idempotent) or requires
+    /// human adjudication (NonIdempotent).
+    pub fn side_effect_map(&self) -> std::collections::HashMap<String, grodex_core::tool::SideEffectClass> {
+        let mut map = std::collections::HashMap::new();
+        if let Some(g) = self.generations.back() {
+            for (name, meta) in &g.tool_metadata {
+                map.insert(name.clone(), meta.side_effect_class);
+            }
+        }
+        map
+    }
+
     /// Check if a generation has been evicted from the buffer.
     pub fn is_evicted(&self, generation: u64) -> bool {
         self.generations.front().map(|g| g.generation > generation).unwrap_or(true)

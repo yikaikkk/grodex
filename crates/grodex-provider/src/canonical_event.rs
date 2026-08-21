@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Opaque provider reasoning envelope. Carries hidden chain-of-thought
 /// payload that must not enter the visible transcript. Managed by the
 /// provider adapter, never exposed directly to the model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderReasoningEnvelope {
     pub provider_family: String,
     pub model_family: String,
@@ -25,6 +25,15 @@ pub struct ProviderReasoningEnvelope {
     pub visible_summary: Option<String>,
     /// Compatibility tag for model switching.
     pub compatibility_tag: String,
+    /// Size of the opaque payload in bytes.
+    #[serde(default)]
+    pub payload_size_bytes: u64,
+    /// Retention policy applied to this envelope ("discard", "summary_only", "full").
+    #[serde(default)]
+    pub retention_policy: String,
+    /// Timestamp when the envelope was created.
+    #[serde(default)]
+    pub created_at_ms: i64,
 }
 
 /// All events emitted during a streaming model response.

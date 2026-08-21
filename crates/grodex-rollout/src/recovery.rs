@@ -1,8 +1,9 @@
 use crate::event::RolloutEvent;
 use crate::event::RolloutEventType;
 use grodex_core::id::ToolCallId;
+use grodex_core::tool::SideEffectClass;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// How the recovery algorithm classified a single tool call after
 /// scanning the journal.
@@ -56,6 +57,10 @@ pub struct RecoveryCheckpoint {
     /// the set of *pending* (unresolved) tickets that must be
     /// re-surfaced to the frontend on resume.
     pub requested_tickets: BTreeMap<String, RequestedTicketInfo>,
+    /// call_id → tool_name, extracted from ToolCallPrepared events.
+    /// Used by the SideEffectClass-aware recovery pass (R14-6b) to look
+    /// up whether an in-flight call is safe to auto-replay.
+    pub call_tool_names: BTreeMap<String, String>,
 }
 
 /// Terminal state of an approval ticket, reconstructed from the journal.
@@ -97,7 +102,33 @@ fn operation_id(ev: &RolloutEvent) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Recovery without runtime metadata — all in-flight calls become
+/// `Indeterminate` (safest default). Equivalent to calling
+/// [`recover_from_journal_with_metadata`] with an empty map.
 pub fn recover_from_journal(events: &[RolloutEvent]) -> RecoveryCheckpoint {
+    recover_from_journal_with_metadata(events, &HashMap::new())
+}
+
+/// Recovery with SideEffectClass metadata (R14-6b).
+///
+/// `side_effect_lookup` maps tool_name → SideEffectClass, typically built
+/// from `CapabilityManager::side_effect_map()`. During the final
+/// classification pass, in-flight calls (Started without Finished) are
+/// classified based on their tool's side-effect profile:
+///
+/// - **ReadOnly** → `NotStarted` (safe to auto-replay — no side effects)
+/// - **Idempotent** → `NotStarted` (safe to auto-replay — operation_id
+///   dedup catches double-execution if the first one actually completed)
+/// - **NonIdempotent** or **unknown** → `Indeterminate` (human must
+///   adjudicate — the side-effect state is genuinely unknown)
+///
+/// This prevents trivially-replayable read-only tools (e.g. `read_file`)
+/// from blocking resume behind a human decision, while still protecting
+/// truly non-idempotent side effects (e.g. `exec rm -rf`).
+pub fn recover_from_journal_with_metadata(
+    events: &[RolloutEvent],
+    side_effect_lookup: &HashMap<String, SideEffectClass>,
+) -> RecoveryCheckpoint {
     let mut cp = RecoveryCheckpoint::default();
     for ev in events {
         let cid = call_id(ev);
@@ -112,6 +143,11 @@ pub fn recover_from_journal(events: &[RolloutEvent]) -> RecoveryCheckpoint {
                     // but be defensive).
                     cp.call_fate.entry(c.clone())
                         .or_insert(ToolCallFate::NotStarted);
+                    // R14-6b: record tool_name for SideEffectClass lookup
+                    // during the final classification pass.
+                    if let Some(name) = ev.payload.get("name").and_then(|v| v.as_str()) {
+                        cp.call_tool_names.insert(c.clone(), name.to_string());
+                    }
                 }
             }
             RolloutEventType::ToolCallApproved => {
@@ -247,10 +283,25 @@ pub fn recover_from_journal(events: &[RolloutEvent]) -> RecoveryCheckpoint {
     }
 
     // Final classification pass: anything still in in_flight_call_ids
-    // at the end of the scan = started without finished → Indeterminate.
+    // at the end of the scan = started without finished.
+    //
+    // R14-6b: consult SideEffectClass to decide the fate:
+    //   ReadOnly / Idempotent → NotStarted (safe to auto-replay)
+    //   NonIdempotent / unknown → Indeterminate (human must adjudicate)
     for c in cp.in_flight_call_ids.iter().cloned().collect::<Vec<_>>() {
         if matches!(cp.call_fate.get(&c), None | Some(ToolCallFate::NotStarted)) {
-            cp.call_fate.insert(c, ToolCallFate::Indeterminate);
+            let side_effect = cp.call_tool_names
+                .get(&c)
+                .and_then(|name| side_effect_lookup.get(name))
+                .copied();
+            let fate = match side_effect {
+                Some(SideEffectClass::ReadOnly) | Some(SideEffectClass::Idempotent) => {
+                    ToolCallFate::NotStarted
+                }
+                // NonIdempotent or unknown metadata → safest: ask human.
+                _ => ToolCallFate::Indeterminate,
+            };
+            cp.call_fate.insert(c, fate);
         }
     }
 

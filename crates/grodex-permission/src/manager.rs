@@ -337,6 +337,33 @@ impl PermissionManager {
         self.broker.resolve(ticket_id, decision, narrowed_args)
     }
 
+    /// Re-inject a pending approval ticket recovered from the journal
+    /// into the broker's in-memory table.
+    ///
+    /// During crash recovery, `handle_resume_session` discovers approval
+    /// tickets that were requested but never resolved. Without this method,
+    /// `resolve()` would return `false` (ticket not in broker) and the
+    /// user's decision would be silently dropped.
+    ///
+    /// The re-injected ticket gets a fresh oneshot channel. Since the
+    /// original tool future was lost in the crash, the channel receiver
+    /// is dropped — but `resolve()` will still succeed, record the
+    /// decision to the SQLite store (if configured), and write the
+    /// `ApprovalResolved` journal event via the supervisor. This ensures:
+    ///   1. The user's decision is durably recorded.
+    ///   2. Future resume passes see the ticket as resolved.
+    ///   3. If the same operation_id is resubmitted, policy evaluation
+    ///      can find the prior decision in the journal.
+    pub fn reinject_pending_ticket(
+        &mut self,
+        ticket_id: &str,
+        tool_name: &str,
+        call_id: Option<&str>,
+        args: Option<&serde_json::Value>,
+    ) {
+        self.broker.reinject_pending_ticket(ticket_id, tool_name, call_id, args);
+    }
+
     /// Cancel all pending approvals (session shutdown).
     pub fn cancel_all(&mut self) {
         self.broker.cancel_all();

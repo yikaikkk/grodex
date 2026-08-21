@@ -43,6 +43,15 @@ pub struct CapsuleAuthority {
     pub unresolved_errors: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_action: Option<String>,
+    /// Semantic summary of decisions made since last compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_summary: Option<String>,
+    /// Files with pending write-back to the sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirty_files: Vec<String>,
+    /// MCP server connection references currently active.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_mcp_servers: Vec<String>,
 }
 
 impl CapsuleAuthority {
@@ -63,6 +72,9 @@ impl CapsuleAuthority {
             && self.memory_snapshot_refs.is_empty()
             && self.unresolved_errors.is_empty()
             && self.next_action.is_none()
+            && self.decision_summary.is_none()
+            && self.dirty_files.is_empty()
+            && self.active_mcp_servers.is_empty()
     }
 }
 
@@ -73,6 +85,21 @@ impl CapsuleAuthority {
 /// be inferred from the conversation summary alone.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StateCapsule {
+    /// Session identifier this capsule belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Turn identifier at the time of compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// Step identifier (monotonic within the turn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    /// Context history version (generation counter) at compaction time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_history_version: Option<u64>,
+    /// When this capsule was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<std::time::SystemTime>,
     sections: Vec<CapsuleSection>,
     /// Structured runtime authority (doc 11 §9.4). Rendered before
     /// free-form sections so the model sees authoritative state first.
