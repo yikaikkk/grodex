@@ -72,11 +72,31 @@ struct ChatFunctionDelta {
     arguments: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ChatUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    /// OpenAI-style nested details: `prompt_tokens_details.cached_tokens`.
+    #[serde(default)]
+    prompt_tokens_details: Option<ChatPromptTokensDetails>,
+    /// DeepSeek-style flat fields (`prompt_cache_hit_tokens`).
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens_details: Option<ChatCompletionTokensDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
 }
 
 pub struct ChatCompletionsDecoder {
@@ -122,7 +142,7 @@ impl ChatCompletionsDecoder {
             self.model = Some(m.clone());
         }
         if let Some(ref u) = chunk.usage {
-            self.usage = Some(ChatUsage { ..*u });
+            self.usage = Some(u.clone());
         }
 
         for choice in chunk.choices {
@@ -296,16 +316,32 @@ impl StreamingDecoder for ChatCompletionsDecoder {
             _ => Some(StopReason::Stop),
         };
 
-        let usage = self.usage.as_ref().map(|u| SettledUsage {
-            estimated: false,
-            input_tokens: u.prompt_tokens.unwrap_or(0),
-            cached_input_tokens: 0,
-            cache_creation_tokens: 0,
-            output_tokens: u.completion_tokens.unwrap_or(0),
-            reasoning_tokens: 0,
-            total_tokens: u.total_tokens.unwrap_or(0),
-            cost_micro_units: None,
-            currency: None,
+        let usage = self.usage.as_ref().map(|u| {
+            // Cached-input tokens: OpenAI nests them under
+            // prompt_tokens_details.cached_tokens; DeepSeek exposes flat
+            // prompt_cache_hit_tokens. Take whichever is present.
+            let cached = u
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens.unwrap_or(0))
+                .unwrap_or(0)
+                .max(u.prompt_cache_hit_tokens.unwrap_or(0));
+            let reasoning = u
+                .completion_tokens_details
+                .as_ref()
+                .map(|d| d.reasoning_tokens.unwrap_or(0))
+                .unwrap_or(0);
+            SettledUsage {
+                estimated: false,
+                input_tokens: u.prompt_tokens.unwrap_or(0),
+                cached_input_tokens: cached,
+                cache_creation_tokens: 0,
+                output_tokens: u.completion_tokens.unwrap_or(0),
+                reasoning_tokens: reasoning,
+                total_tokens: u.total_tokens.unwrap_or(0),
+                cost_micro_units: None,
+                currency: None,
+            }
         }).unwrap_or_else(|| SettledUsage {
             estimated: true,
             input_tokens: 0, cached_input_tokens: 0, cache_creation_tokens: 0,

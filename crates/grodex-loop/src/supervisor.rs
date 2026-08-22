@@ -27,12 +27,63 @@ pub struct ModelConfig {
     pub provider: String,
     pub model: String,
     pub wire_protocol: WireProtocol,
+    /// Model's maximum context window in tokens. Used by the compaction
+    /// manager to decide when to trigger. Default: 1_048_576 (1M) to
+    /// match modern models. Override via config `context_window`.
+    pub context_window: u64,
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
-        Self { provider: "openai".into(), model: "gpt-5".into(), wire_protocol: WireProtocol::Responses }
+        Self {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            wire_protocol: WireProtocol::Responses,
+            context_window: 1_048_576,
+        }
     }
+}
+
+/// Infer a model's context window (in tokens) from its name.
+///
+/// Built-in table for common models; substring matching, most-specific
+/// pattern first. Unknown models fall back to 1M — callers can always
+/// override via the `context_window` config key.
+pub fn infer_context_window(model: &str) -> u64 {
+    let m = model.to_ascii_lowercase();
+    // (substring, window) — checked in order, first match wins.
+    const TABLE: &[(&str, u64)] = &[
+        // OpenAI
+        ("gpt-3.5", 16_385),
+        ("gpt-4-turbo", 128_000),
+        ("gpt-4o", 128_000),
+        ("gpt-4.1", 1_047_576),
+        ("gpt-4", 8_192),
+        ("gpt-5", 256_000),
+        ("o1", 200_000),
+        ("o3", 200_000),
+        ("o4-mini", 200_000),
+        // Anthropic (all current models expose 200K)
+        ("claude", 200_000),
+        // DeepSeek
+        ("deepseek", 128_000),
+        // Qwen
+        ("qwen-turbo", 1_000_000),
+        ("qwen", 128_000),
+        // Gemini
+        ("gemini-1.5-pro", 2_000_000),
+        ("gemini-1.5-flash", 1_000_000),
+        ("gemini", 1_048_576),
+        // GLM / Kimi
+        ("glm", 128_000),
+        ("moonshot", 128_000),
+        ("kimi", 128_000),
+    ];
+    TABLE
+        .iter()
+        .find(|(pat, _)| m.contains(pat))
+        .map(|(_, w)| *w)
+        .unwrap_or(1_048_576)
 }
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -491,7 +542,7 @@ impl SessionSupervisor {
                 self.handle_resume_session(last_seq, emit_snapshot_to_frontend).await;
                 true
             }
-            SessionCommand::RestoreContext { items } => {
+            SessionCommand::RestoreContext { items, persist } => {
                 // Restore full conversation context so future turns carry
                 // the resumed history. NOTE: there are TWO context
                 // projections we must sync:
@@ -527,27 +578,30 @@ impl SessionSupervisor {
                     // Persist ContextRestored to the new session's journal
                     // so subsequent resumes of the new session id see the
                     // recovered state without re-cross-reading the old id.
-                    if let Some(w) = &self.writer {
-                        if let Err(e) = w.write_context_restored(&items).await {
-                            let _ = self
-                                .event_tx
-                                .send(SessionEvent::Error {
-                                    message: format!(
-                                        "resume: persist ContextRestored failed: {e}"
-                                    ),
-                                })
-                                .await;
+                    // ONLY for boot-restore into a fresh session (`persist`):
+                    // same-journal `/resume` already has every item on disk,
+                    // and re-writing the full context per resume snowballed
+                    // journals (436 MB of duplicate ContextRestored seen).
+                    if persist {
+                        if let Some(w) = &self.writer {
+                            if let Err(e) = w.write_context_restored(&items).await {
+                                let _ = self
+                                    .event_tx
+                                    .send(SessionEvent::Error {
+                                        message: format!(
+                                            "resume: persist ContextRestored failed: {e}"
+                                        ),
+                                    })
+                                    .await;
+                            }
                         }
                     }
-                    let _ = self
-                        .event_tx
-                        .send(SessionEvent::Info {
-                            message: format!(
-                                "[resume] 已恢复 {} 条历史消息（session.context + chat_state 双写）",
-                                items.len()
-                            ),
-                        })
-                        .await;
+                    // Internal diagnostic — use tracing, NOT SessionEvent::Info
+                    // which would leak implementation details to the user.
+                    tracing::info!(
+                        items = items.len(),
+                        "[resume] restored history items"
+                    );
                 }
                 true
             }
@@ -570,15 +624,13 @@ impl SessionSupervisor {
                     // resumed id rather than the transient new one.
                     self.session.id = new_session_id;
                 }
-                let _ = self
-                    .event_tx
-                    .send(SessionEvent::Info {
-                        message: format!(
-                            "[resume] rollout_writer rebind → session_id={}, next_seq={}",
-                            new_session_id, next_seq
-                        ),
-                    })
-                    .await;
+                // Internal diagnostic — use tracing, NOT SessionEvent::Info
+                // which would leak session_id/next_seq to the user.
+                tracing::info!(
+                    session_id = %new_session_id,
+                    next_seq,
+                    "[resume] rollout_writer rebound"
+                );
                 true
             }
             SessionCommand::Shutdown => false,
@@ -696,16 +748,34 @@ impl SessionSupervisor {
             }
         };
 
-        let events = match writer.store().replay_from(0).await {
-            Ok(evts) => evts,
-            Err(e) => {
-                let _ = self.event_tx
-                    .send(SessionEvent::Error {
-                        message: format!("resume: read journal: {e}"),
-                    })
-                    .await;
-                return;
-            }
+        // Lean replay when the store is file-backed: skips materializing
+        // redundant multi-MB ContextRestored payloads (legacy journals
+        // snowballed to hundreds of MB of duplicated snapshots), which
+        // was the dominant cost of "first resume is very slow".
+        // Non-file stores fall back to the regular replay.
+        let events = match writer.store().journal_path() {
+            Some(path) => match crate::reducer::replay_journal_lean(&path, &self.session.id) {
+                Ok((evts, _last_seq, _ctx)) => evts,
+                Err(e) => {
+                    let _ = self.event_tx
+                        .send(SessionEvent::Error {
+                            message: format!("resume: read journal: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+            },
+            None => match writer.store().replay_from(0).await {
+                Ok(evts) => evts,
+                Err(e) => {
+                    let _ = self.event_tx
+                        .send(SessionEvent::Error {
+                            message: format!("resume: read journal: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+            },
         };
 
         if events.is_empty() {
@@ -768,8 +838,17 @@ impl SessionSupervisor {
             // re-resumes of the *new* session id immediately see the
             // recovered context on their next resume (rather than
             // requiring yet-another cross-id read).
-            if let Some(w) = &self.writer {
-                let _ = w.write_context_restored(&context).await;
+            //
+            // Only when WE are the replay source of truth
+            // (`emit_snapshot_to_frontend = true`, self-resume fallback).
+            // ACP same-journal resume sends emit=false AND follows up with
+            // RestoreContext — persisting here too would write the whole
+            // context back into the journal we literally just replayed
+            // (the snowball that grew journals by a full copy per resume).
+            if emit_snapshot_to_frontend {
+                if let Some(w) = &self.writer {
+                    let _ = w.write_context_restored(&context).await;
+                }
             }
         }
 
@@ -1010,14 +1089,20 @@ impl SessionSupervisor {
             .with_discovered_nodes(
                 self.cached_discovered_nodes.clone().unwrap_or_default(),
             );
+        // Memory RAG results are VOLATILE (depend on the current user
+        // input). They must NOT be baked into the system prompt — that
+        // would change the request prefix every turn and defeat provider
+        // prompt caching. Instead they travel as a trailing Developer
+        // instruction block, which the sampler emits AFTER the stable
+        // system prompt (see client.rs) so the cached prefix survives.
+        let mut memory_block: Option<String> = None;
         if let Some(ref db) = self.memory {
             // Hybrid RRF retrieval (FTS5 + vector, fail-open to pure FTS).
             // emb=None → vector list empty → RRF degrades to pure FTS5 ranking.
             // emb=Some → embed query, search vectors, fuse with FTS5 results.
             match db.retrieve_hybrid_memory(&user_input_for_memory, 5, self.embedding.as_ref()).await {
                 Ok(units) if !units.is_empty() => {
-                    let mem_text = grodex_memory::RetrievedUnit::format_for_prompt(&units);
-                    builder.base_instructions.push(mem_text);
+                    memory_block = Some(grodex_memory::RetrievedUnit::format_for_prompt(&units));
                 }
                 Ok(_) => {} // no results — nothing to inject
                 Err(e) => {
@@ -1030,11 +1115,18 @@ impl SessionSupervisor {
         // The manifest already assembled all instruction nodes in four-zone
         // order (A → C → B → D) into `content`. We pass it as a single
         // system instruction block — the zone ordering is preserved.
-        let instructions = vec![grodex_provider::canonical_request::InstructionBlock {
+        let mut instructions = vec![grodex_provider::canonical_request::InstructionBlock {
             role: grodex_provider::canonical_request::InstructionRole::System,
             content: manifest.content.clone(),
             priority: 0,
         }];
+        if let Some(mem_text) = memory_block {
+            instructions.push(grodex_provider::canonical_request::InstructionBlock {
+                role: grodex_provider::canonical_request::InstructionRole::Developer,
+                content: mem_text,
+                priority: 1,
+            });
+        }
 
         // Spawn turn as a tokio task.
         let turn_ctx = TurnContext::with_model(
@@ -1102,17 +1194,61 @@ impl SessionSupervisor {
         self.current_turn_handle = None;
         self.current_turn_cancel = None;
 
-        let text = completion.outcome.final_text;
+        let text = completion.outcome.final_text.clone();
         if !text.is_empty() {
             let _ = self.event_tx.send(SessionEvent::StepCompleted {
                 turn_id: completion.turn_id,
                 text: text.clone(),
             }).await;
         } else {
-            // Check for errors.
+            // Check for sampling errors first.
+            let mut found_error = false;
             for step in &completion.outcome.steps {
                 if let Some(ref err) = step.error {
                     let _ = self.event_tx.send(SessionEvent::Error { message: format!("{err}") }).await;
+                    found_error = true;
+                }
+            }
+            // ── Step-budget exhaustion notice ─────────────────────
+            // The coordinator forces a wrap-up summary when max_steps is
+            // hit; make that VISIBLE to the user so a long task ending
+            // early is never mistaken for a completed one.
+            if completion.outcome.steps_exhausted {
+                let _ = self.event_tx.send(SessionEvent::Info {
+                    message: format!(
+                        "⚠️ 已达到本轮最大执行步数（{} 步），上方已自动生成进展总结。发一条消息（如“继续”）即可接着完成未完成的工作。",
+                        completion.outcome.steps.len().saturating_sub(1)
+                    ),
+                }).await;
+            }
+            // ── Issue #4 fix: output-break-after-tool-failure ──────
+            // When the model produced no text AND no sampling error was
+            // recorded, the likely cause is that tool(s) failed and the
+            // model either returned empty text or never got to respond.
+            // Without a fallback message the TUI shows "Done (with errors)"
+            // with no explanation — the user sees the output "break".
+            //
+            // Surface a summary of what happened so the user always sees
+            // *something* informative after a turn, even when the model
+            // went silent.
+            if !found_error {
+                let mut tools_called_count = 0usize;
+                for step in &completion.outcome.steps {
+                    tools_called_count += step.tool_calls.len();
+                }
+                // If tools were called but no text came back, this is
+                // almost always a tool-failure scenario. Surface a
+                // helpful summary so the user isn't left wondering.
+                if tools_called_count > 0 {
+                    let summary = format!(
+                        "本轮调用了 {} 个工具但未生成回复。可能有工具执行失败，请检查上方的工具结果卡片。",
+                        tools_called_count,
+                    );
+                    let _ = self.event_tx.send(SessionEvent::Info { message: summary }).await;
+                } else if completion.outcome.steps.is_empty() {
+                    let _ = self.event_tx.send(SessionEvent::Info {
+                        message: "本轮未产生任何输出。".into(),
+                    }).await;
                 }
             }
         }
@@ -1126,7 +1262,24 @@ impl SessionSupervisor {
             let _ = self.event_tx.send(SessionEvent::Error { message: e }).await;
         }
 
-        let _ = self.event_tx.send(SessionEvent::TurnCompleted { turn_id: completion.turn_id }).await;
+        // Aggregate token usage across all steps so the frontend can
+        // show the prompt-cache hit rate for this turn.
+        let (input_tokens, cached_tokens) = completion
+            .outcome
+            .steps
+            .iter()
+            .filter_map(|s| s.usage.as_ref())
+            .fold((0u64, 0u64), |(inp, cac), u| {
+                (inp + u.input_tokens, cac + u.cached_input_tokens)
+            });
+        let _ = self
+            .event_tx
+            .send(SessionEvent::TurnCompleted {
+                turn_id: completion.turn_id,
+                input_tokens,
+                cached_tokens,
+            })
+            .await;
 
         // Write TurnCompleted rollout event.
         if let Some(ref writer) = self.writer {
@@ -1203,6 +1356,8 @@ impl SessionSupervisor {
         if had_turn {
             let _ = self.event_tx.send(SessionEvent::TurnCompleted {
                 turn_id: turn_id.unwrap_or_default(),
+                input_tokens: 0,
+                cached_tokens: 0,
             }).await;
         }
     }

@@ -4,8 +4,15 @@
 //! master tokens in a `HashMap<String, String>` in memory, so a process
 //! restart lost every token. This module defines a [`SecretStore`] trait that
 //! offloads secret material to the operating system's native credential
-//! vault (macOS Keychain / Windows CredMan / Linux Secret Service), so tokens
-//! survive restarts and are never written to plaintext config.
+//! vault, so tokens survive restarts and are never written to plaintext
+//! config.
+//!
+//! Platform support (as implemented):
+//! - macOS: [`MacOSKeychainStore`] shells out to the `security` CLI.
+//! - Linux / Windows: **no native backend yet** — callers fail-soft to
+//!   [`InMemorySecretStore`], i.e. tokens are memory-only and lost on
+//!   restart (secure, but not durable). A Secret Service / CredMan
+//!   implementation is a future task; do not document it as available.
 //!
 //! Two implementations ship here:
 //! - [`InMemorySecretStore`] — for tests and as a fail-soft fallback.

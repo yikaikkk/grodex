@@ -132,11 +132,22 @@ fn estimate_item_tokens(item: &ContextItem) -> u64 {
     (chars as u64).div_ceil(4)
 }
 
-/// Repair dangling tool calls: dedup duplicate tool results + remove
-/// orphaned tool calls that have no matching results.
+/// Repair dangling tool calls: dedup duplicate tool results, remove
+/// orphaned tool calls that have no matching results, and remove empty
+/// assistant messages whose tool_calls were all orphaned.
+///
+/// This fixes the ChatCompletions API error:
+///   "An assistant message with 'tool_calls' must be followed by tool
+///    messages responding to each 'tool_call_id'"
+/// which occurs when the user cancels a turn after tool_calls have been
+/// pushed to the context but before tool results arrive.
+///
 /// Called before user message push and at build-request time.
-fn ensure_conversation_integrity(conversation: &mut Vec<ContextItem>) {
-    // Dedup: remove duplicate ToolResults with the same call_id.
+/// Operates on BOTH the raw conversation AND the model-visible projection
+/// (they are separate structures — the projection is what `get_conversation`
+/// returns to the turn coordinator for API requests).
+fn ensure_conversation_integrity(conversation: &mut Vec<ContextItem>, projection: &mut ContextProjection) {
+    // ── Step 1: Dedup duplicate ToolResults ──────────────────────
     let mut seen_results = HashSet::new();
     conversation.retain(|item| {
         if let ContextItem::ToolResult { call_id, .. } = item {
@@ -147,7 +158,7 @@ fn ensure_conversation_integrity(conversation: &mut Vec<ContextItem>) {
         true
     });
 
-    // Remove orphaned ToolCalls whose ToolResults were dropped.
+    // ── Step 2: Collect result IDs and find orphaned ToolCalls ───
     let result_ids: HashSet<ToolCallId> = conversation
         .iter()
         .filter_map(|i| match i {
@@ -156,13 +167,68 @@ fn ensure_conversation_integrity(conversation: &mut Vec<ContextItem>) {
         })
         .collect();
 
-    conversation.retain(|item| {
+    // Track which ToolCall indices are orphaned (no matching result).
+    let mut orphaned_indices: HashSet<usize> = HashSet::new();
+    for (i, item) in conversation.iter().enumerate() {
         if let ContextItem::ToolCall { call_id, .. } = item {
-            result_ids.contains(call_id)
-        } else {
-            true
+            if !result_ids.contains(call_id) {
+                orphaned_indices.insert(i);
+            }
         }
-    });
+    }
+
+    // ── Step 3: Find Assistant messages whose ALL tool_calls are orphaned ──
+    // In build_chat_body, an Assistant is merged with immediately following
+    // ToolCall items into one API message with a tool_calls array. If ALL
+    // those ToolCalls are orphaned, the entire assistant+tool_calls group
+    // must be removed to keep the API happy.
+    let mut assistant_remove: HashSet<usize> = HashSet::new();
+    let mut i = 0;
+    while i < conversation.len() {
+        if matches!(conversation[i], ContextItem::Assistant { .. }) {
+            let start = i + 1;
+            let mut end = start;
+            while end < conversation.len()
+                && matches!(conversation[end], ContextItem::ToolCall { .. })
+            {
+                end += 1;
+            }
+            if end > start {
+                // This assistant has tool_calls — check if ALL are orphaned.
+                let all_orphaned = (start..end).all(|j| orphaned_indices.contains(&j));
+                if all_orphaned {
+                    // Only remove the assistant if it has no text content.
+                    // An assistant with text + tool_calls is valid even after
+                    // tool_calls are removed (build_chat_body emits it as a
+                    // plain assistant message without tool_calls).
+                    let has_text = match &conversation[i] {
+                        ContextItem::Assistant { content } => !content.is_empty(),
+                        _ => false,
+                    };
+                    if !has_text {
+                        assistant_remove.insert(i);
+                    }
+                }
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+
+    // ── Step 4: Rebuild conversation if anything changed ─────────
+    if !orphaned_indices.is_empty() || !assistant_remove.is_empty() {
+        let new_conv: Vec<ContextItem> = conversation
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !orphaned_indices.contains(idx) && !assistant_remove.contains(idx))
+            .map(|(_, item)| item.clone())
+            .collect();
+
+        *conversation = new_conv;
+        // Sync the projection — this is the structure `get_conversation` returns.
+        projection.replace(conversation.clone());
+    }
 }
 
 // ── Actor ──────────────────────────────────────────────────────────
@@ -205,7 +271,13 @@ impl ChatStateActor {
     fn handle(&mut self, cmd: ChatStateCommand) {
         match cmd {
             ChatStateCommand::PushUserMessage { item, reply } => {
-                ensure_conversation_integrity(&mut self.state.conversation);
+                ensure_conversation_integrity(
+                    &mut self.state.conversation,
+                    &mut self.state.projection,
+                );
+                // Recalculate total_tokens after integrity repair.
+                self.state.total_tokens =
+                    self.state.conversation.iter().map(estimate_item_tokens).sum();
                 self.state.push(item);
                 self.state.prompt_index += 1;
                 let _ = reply.send(());
@@ -374,5 +446,78 @@ mod tests {
         handle.push_user_message(ContextItem::User { content: "hello world this is a test".into(), message_id: None }).await;
         let tokens = handle.get_total_tokens().await;
         assert!(tokens > 0);
+    }
+
+    /// Regression test: after cancel, orphaned ToolCalls and their
+    /// empty Assistant message are removed before the next API request.
+    #[tokio::test]
+    async fn cancel_cleanup_orphaned_tool_calls() {
+        let handle = ChatStateActor::spawn();
+        let call_id_a = ToolCallId::new();
+        let call_id_b = ToolCallId::new();
+
+        // Simulate a turn: user → assistant (empty) → tool_calls (no results = cancel).
+        handle.push_user_message(ContextItem::User { content: "do stuff".into(), message_id: None }).await;
+        handle.push_assistant_response("".into()).await;
+        handle.push_tool_call(call_id_a, "exec".into(), serde_json::json!({"command": "ls"})).await;
+        handle.push_tool_call(call_id_b, "read".into(), serde_json::json!({"path": "/tmp"})).await;
+        // User cancels here — no tool results pushed.
+
+        // Next user message triggers ensure_conversation_integrity.
+        handle.push_user_message(ContextItem::User { content: "nevermind".into(), message_id: None }).await;
+        let conv = handle.get_conversation().await;
+
+        // The orphaned ToolCalls and the empty Assistant should be gone.
+        // Only the two User messages should remain.
+        assert_eq!(conv.len(), 2, "expected 2 User messages, got: {conv:?}");
+        assert!(matches!(conv[0], ContextItem::User { .. }));
+        assert!(matches!(conv[1], ContextItem::User { .. }));
+    }
+
+    /// Assistant with text content is preserved even if all tool_calls are orphaned.
+    #[tokio::test]
+    async fn cancel_cleanup_keeps_assistant_with_text() {
+        let handle = ChatStateActor::spawn();
+        let call_id_a = ToolCallId::new();
+
+        handle.push_user_message(ContextItem::User { content: "do stuff".into(), message_id: None }).await;
+        handle.push_assistant_response("Let me call some tools.".into()).await;
+        handle.push_tool_call(call_id_a, "exec".into(), serde_json::json!({"command": "ls"})).await;
+        // Cancel — no results.
+
+        handle.push_user_message(ContextItem::User { content: "nevermind".into(), message_id: None }).await;
+        let conv = handle.get_conversation().await;
+
+        // Assistant with text is kept (as a plain assistant message without tool_calls).
+        // Only the orphaned ToolCall is removed.
+        assert_eq!(conv.len(), 3, "expected User + Assistant(text) + User, got: {conv:?}");
+        assert!(matches!(conv[1], ContextItem::Assistant { .. }));
+    }
+
+    /// Partial cancel: some tools completed, some didn't → remove only orphaned.
+    #[tokio::test]
+    async fn cancel_cleanup_partial_results() {
+        let handle = ChatStateActor::spawn();
+        let call_id_a = ToolCallId::new();
+        let call_id_b = ToolCallId::new();
+
+        handle.push_user_message(ContextItem::User { content: "do stuff".into(), message_id: None }).await;
+        handle.push_assistant_response("".into()).await;
+        handle.push_tool_call(call_id_a, "exec".into(), serde_json::json!({"command": "ls"})).await;
+        handle.push_tool_call(call_id_b, "read".into(), serde_json::json!({"path": "/tmp"})).await;
+        // Only tool A completed; tool B was cancelled.
+        handle.push_tool_result(call_id_a, "file1\nfile2".into(), false).await;
+
+        // Next user message triggers cleanup.
+        handle.push_user_message(ContextItem::User { content: "continue".into(), message_id: None }).await;
+        let conv = handle.get_conversation().await;
+
+        // ToolCall B (orphaned) should be removed.
+        // ToolCall A + ToolResult A should remain.
+        // Assistant has empty text but ToolCall A survived → keep it.
+        let has_orphaned = conv.iter().any(|i| matches!(i, ContextItem::ToolCall { call_id, .. } if *call_id == call_id_b));
+        assert!(!has_orphaned, "orphaned ToolCall B should be removed");
+        let has_a = conv.iter().any(|i| matches!(i, ContextItem::ToolCall { call_id, .. } if *call_id == call_id_a));
+        assert!(has_a, "ToolCall A (with result) should remain");
     }
 }

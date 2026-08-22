@@ -20,6 +20,7 @@ grodex-sandbox.workspace = true
 grodex-subagent.workspace = true
 grodex-prompt.workspace = true
 thiserror.workspace = true
+anyhow.workspace = true
 chrono.workspace = true
 tokio-util.workspace = true
 serde.workspace = true

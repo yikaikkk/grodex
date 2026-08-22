@@ -338,8 +338,24 @@ pub enum UpdateContent {
         content: String,
         is_error: bool,
     },
-    /// The Turn has completed.
-    TurnComplete { turn_id: String },
+    /// Sub-agent lifecycle/progress event. The TUI renders each
+    /// sub-agent as a collapsible card: `phase = "started"` opens the
+    /// card, `"step"` appends an internal execution line, `"finished"`
+    /// closes it (`ok = false` marks failure).
+    SubagentProgress {
+        id: String,
+        label: String,
+        phase: String,
+        detail: String,
+        ok: Option<bool>,
+    },
+    /// The Turn has completed. `cached_tokens` is the prompt-cache hit
+    /// subset of `input_tokens` (0 when usage is unavailable).
+    TurnComplete {
+        turn_id: String,
+        input_tokens: u64,
+        cached_tokens: u64,
+    },
     /// A non-final error occurred.
     Error { message: String },
     /// Informational log (success confirmations, diagnostics, resume
@@ -500,7 +516,7 @@ mod tests {
     #[test]
     fn envelope_round_trips_through_json() {
         let s = sid();
-        let e = EventEnvelope::wrap(1, s, UpdateContent::TurnComplete { turn_id: "t1".into() })
+        let e = EventEnvelope::wrap(1, s, UpdateContent::TurnComplete { turn_id: "t1".into(), input_tokens: 0, cached_tokens: 0 })
             .with_generation(2);
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"seq\":1"));

@@ -26,12 +26,12 @@ use anyhow::{anyhow, Result};
 use grodex_auth::AuthManager;
 use grodex_config::{ConfigLayerSource, ConfigResolver, LoadedConfig};
 use grodex_core::policy::PolicyDecision;
-use grodex_core::tool::Tool;
+use grodex_core::tool::{Tool, ToolRuntime};
 use grodex_loop::chat_state::ChatStateActor;
 use grodex_loop::command::SessionEvent as LoopSessionEvent;
 use grodex_loop::delegate_tool::DelegateTool;
 use grodex_loop::rollout_writer::RolloutWriter;
-use grodex_loop::supervisor::ModelConfig;
+use grodex_loop::supervisor::{infer_context_window, ModelConfig};
 use grodex_loop::{Session, SessionHandle, SessionSupervisor, TurnCoordinator};
 use grodex_permission::{PermissionManager, PermissionPolicy, PolicyRule};
 use grodex_provider::descriptor::WireProtocol;
@@ -361,19 +361,61 @@ impl SessionRuntimeBuilder {
             .join("approvals.db");
         let permission_mgr = PermissionManager::new_with_db(policy, &approval_db_path);
 
-        let model_config = self.model_config_override.unwrap_or(ModelConfig {
-            provider: provider_name,
-            model: model_name,
-            wire_protocol,
+        // Compaction trigger threshold (% of context_window) and the
+        // per-tool-result size cap — both optional config overrides that
+        // are wired into the TurnCoordinator below.
+        let compaction_threshold_pct = cfg
+            .get("compaction_threshold_percent")
+            .and_then(|v| v.as_integer())
+            .map(|v| v.clamp(1, 100) as u8);
+        let max_tool_result_bytes = cfg
+            .get("max_tool_result_bytes")
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+            .map(|v| v as usize);
+        // Per-turn sampling step budget. Long multi-tool tasks used to die
+        // at the old hardcoded cap of 10 steps; default is now 40.
+        let max_steps_per_turn = cfg
+            .get("max_steps_per_turn")
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+            .map(|v| v as usize);
+
+        let model_config = self.model_config_override.unwrap_or_else(|| {
+            // context_window: explicit config > built-in model table > 1M
+            // fallback. The compaction manager uses this to decide when to
+            // trigger — a too-small value causes premature compaction or
+            // context overflow.
+            let ctx_window = cfg
+                .get("context_window")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u64)
+                .unwrap_or_else(|| infer_context_window(&model_name));
+            ModelConfig {
+                provider: provider_name,
+                model: model_name,
+                wire_protocol,
+                context_window: ctx_window,
+            }
         });
 
         // ── 7. CapabilityManager + TurnCoordinator ─────────────────
         // Inject permission + sandbox so the coordinator dispatches tool
         // calls through the config-loaded policy (not an empty default)
         // and validates against the config profile.
-        let coordinator = TurnCoordinator::new(actor, chat_state.clone())
+        let mut coordinator = TurnCoordinator::new(actor, chat_state.clone())
             .with_permission(permission_mgr)
-            .with_sandbox(sandbox);
+            .with_sandbox(sandbox)
+            .with_context_window(model_config.context_window);
+        if let Some(pct) = compaction_threshold_pct {
+            coordinator = coordinator.with_compaction_threshold(pct);
+        }
+        if let Some(bytes) = max_tool_result_bytes {
+            coordinator = coordinator.with_max_tool_result_bytes(bytes);
+        }
+        if let Some(steps) = max_steps_per_turn {
+            coordinator = coordinator.with_max_steps(steps);
+        }
 
         // Register built-in tools. Each gets a fresh runtime instance +
         // its JSON schema. The delegate_task tool is wired with:
@@ -404,8 +446,40 @@ impl SessionRuntimeBuilder {
         coordinator
             .register_tool("apply_patch", Arc::new(ApplyPatchTool::new()), ApplyPatchTool::new().input_schema())
             .await;
+        // ── Subagent progress channel ───────────────────────────
+        // The DelegateTool sends structured lifecycle events
+        // (started/step/finished) via this channel. The forwarder task
+        // below converts them to `SessionEvent::SubagentProgress` so
+        // the TUI renders each sub-agent as a collapsible card.
+        let (subagent_progress_tx, mut subagent_progress_rx) =
+            mpsc::unbounded_channel::<grodex_loop::delegate_tool::SubagentProgress>();
+        let subagent_progress_tx = Arc::new(subagent_progress_tx);
+
+        // Sub-agent caps: `max_subagents` = concurrent limit (default 4);
+        // the session total defaults to 4x that.
+        let max_subagents = cfg
+            .get("max_subagents")
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+            .map(|v| v as usize);
+        let max_subagents_total = cfg
+            .get("max_subagents_per_session")
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+            .map(|v| v as usize);
+
         let mut delegate = DelegateTool::new(SubAgentConfig::default())
-            .with_sampling(sub_actor, model_config.clone());
+            .with_sampling(sub_actor, model_config.clone())
+            .with_progress_sender(subagent_progress_tx.clone())
+            .with_limits(max_subagents.unwrap_or(0), max_subagents_total.unwrap_or(0))
+            // Sub-agents get a read-only file tool so analysis tasks can
+            // actually inspect the codebase (bypasses the approval
+            // round-trip — read_file has no side effects).
+            .with_readonly_tools(vec![(
+                "read_file".to_string(),
+                Arc::new(ReadFileTool::new()) as Arc<dyn ToolRuntime>,
+                ReadFileTool::new().input_schema(),
+            )]);
         if let Some(ref w) = writer {
             delegate = delegate.with_writer(w.clone(), SubAgentConfig::default());
         }
@@ -469,27 +543,30 @@ impl SessionRuntimeBuilder {
         // (PromptBuilder + InstructionDiscovery + memory query). The memory
         // database is injected here so RAG context flows into the prompt.
         //
-        // Opens the SQLite + FTS5 database at `~/.grodex/memory.db`.
+        // Opens the SQLite + FTS5 database. Path precedence:
+        //   GRODEX_MEMORY_DB env > config `memory.path` > ~/.grodex/memory.db
+        // Every candidate goes through `expand_user_path` (a literal `~`
+        // from config/env must never reach the filesystem) and its parent
+        // directory is created up front.
         // Fail-open: if the DB cannot be opened (permissions, disk full),
         // memory is set to None — turns proceed without RAG.
-        let memory = match std::env::var("GRODEX_MEMORY_DB") {
-            Ok(path) => grodex_memory::MemoryDatabase::open(std::path::Path::new(&path))
-                .ok()
-                .map(Arc::new),
-            Err(_) => {
-                let default_db = dirs::home_dir().map(|h| h.join(".grodex").join("memory.db"));
-                if let Some(ref db_path) = default_db {
-                    if let Some(parent) = db_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    grodex_memory::MemoryDatabase::open(db_path)
-                        .ok()
-                        .map(Arc::new)
-                } else {
-                    None
-                }
-            }
+        let memory_db_path: Option<std::path::PathBuf> = match std::env::var("GRODEX_MEMORY_DB") {
+            Ok(p) => Some(grodex_config::expand_user_path(&p)),
+            Err(_) => cfg
+                .get("memory")
+                .and_then(|m| m.get("path"))
+                .and_then(|v| v.as_str())
+                .map(grodex_config::expand_user_path)
+                .or_else(|| dirs::home_dir().map(|h| h.join(".grodex").join("memory.db"))),
         };
+        let memory = memory_db_path.and_then(|db_path| {
+            if let Some(parent) = db_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            grodex_memory::MemoryDatabase::open(&db_path)
+                .ok()
+                .map(Arc::new)
+        });
 
         // Initial index scan + reconcile: walk the workspace for .md files,
         // diff against the indexed_files table, and apply deletions. New/changed
@@ -594,11 +671,39 @@ impl SessionRuntimeBuilder {
         // consumers (ACP stdio writer, CLI REPL, future TUI). The
         // supervisor owns `event_rx`; we forward every event to the
         // broadcast channel and hand the receive end to callers.
+        //
+        // Also drain the subagent progress channel: each String message
+        // from DelegateTool is converted to `SessionEvent::Info` so the
+        // TUI renders subagent lifecycle notifications inline with the
+        // conversation (instead of a silent block while the sub-agent
+        // runs).
         let SessionHandle { cmd_tx, mut event_rx } = handle;
         tokio::spawn(async move {
-            while let Some(ev) = event_rx.recv().await {
-                if event_broadcast_tx.send(ev).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    // Supervisor events (text, tool calls, errors, …).
+                    ev = event_rx.recv() => {
+                        match ev {
+                            Some(ev) => {
+                                if event_broadcast_tx.send(ev).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break, // supervisor shut down
+                        }
+                    }
+                    // Subagent progress notifications → SubagentProgress events.
+                    msg = subagent_progress_rx.recv() => {
+                        match msg {
+                            Some(progress) => {
+                                let ev = LoopSessionEvent::SubagentProgress(progress);
+                                if event_broadcast_tx.send(ev).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => {} // DelegateTool dropped — no more progress
+                        }
+                    }
                 }
             }
         });

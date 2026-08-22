@@ -97,8 +97,11 @@ enum Command {
     Version,
     /// Launch the Grodex terminal UI with ACP protocol support.
     Tui {
-        /// Run agent as a subprocess via this command (default: "grodex")
-        #[arg(long, default_value = "grodex")]
+        /// Run agent as a subprocess via this command. Defaults to the
+        /// CURRENT executable itself (`grodex tui` spawns `<self> serve`),
+        /// so it works from `cargo run` without `grodex` being on PATH.
+        /// Set explicitly to override (e.g. a different build).
+        #[arg(long, default_value = "")]
         agent_cmd: String,
         /// Arguments passed to the agent command (default: ["serve"])
         #[arg(last = true, default_values_t = vec!["serve".to_string()])]
@@ -184,6 +187,18 @@ async fn main() {
             println!("grodex {}", env!("CARGO_PKG_VERSION"));
         }
         Command::Tui { agent_cmd, agent_args } => {
+            // Default agent binary: the current executable itself. The
+            // previous default "grodex" required the binary to be on PATH,
+            // which broke `cargo run -- tui` with "无法启动 agent 进程:
+            // grodex serve". current_exe() always exists and supports the
+            // `serve` subcommand.
+            let agent_cmd = if agent_cmd.is_empty() {
+                std::env::current_exe()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "grodex".to_string())
+            } else {
+                agent_cmd
+            };
             if let Err(e) = grodex_tui::transport::stdio::run_with_stdio_transport(&agent_cmd, &agent_args) {
                 eprintln!("TUI 启动失败: {e}");
                 std::process::exit(1);
@@ -338,9 +353,11 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
                 None
             }
         }
-        LoopSessionEvent::TurnCompleted { turn_id } => {
+        LoopSessionEvent::TurnCompleted { turn_id, input_tokens, cached_tokens } => {
             let content = UpdateContent::TurnComplete {
                 turn_id: turn_id.to_string(),
+                input_tokens,
+                cached_tokens,
             };
             let env = EventEnvelope::wrap(seq, session_id, content);
             Some(ServerFrame::Event(env))
@@ -352,6 +369,34 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
         }
         LoopSessionEvent::Info { message } => {
             let content = UpdateContent::Info { message };
+            let env = EventEnvelope::wrap(seq, session_id, content);
+            Some(ServerFrame::Event(env))
+        }
+        LoopSessionEvent::SubagentProgress(p) => {
+            // Flatten the structured loop event into the ACP wire form.
+            let (id, label, phase, detail, ok) = match p {
+                grodex_loop::delegate_tool::SubagentProgress::Started {
+                    id,
+                    label,
+                    task_preview,
+                } => (id, label, "started".to_string(), task_preview, None),
+                grodex_loop::delegate_tool::SubagentProgress::Step { id, detail } => {
+                    (id, String::new(), "step".to_string(), detail, None)
+                }
+                grodex_loop::delegate_tool::SubagentProgress::Finished {
+                    id,
+                    label,
+                    ok,
+                    summary,
+                } => (id, label, "finished".to_string(), summary, Some(ok)),
+            };
+            let content = UpdateContent::SubagentProgress {
+                id,
+                label,
+                phase,
+                detail,
+                ok,
+            };
             let env = EventEnvelope::wrap(seq, session_id, content);
             Some(ServerFrame::Event(env))
         }
@@ -532,27 +577,31 @@ async fn route_command(
                 .await;
                 return (ack_bucket_out, None);
             }
-            // Step 1: read the existing journal. Use `replay_snapshot` (sync,
-            // no actor spawn) — we only need the event bytes for projection.
-            // Fail-closed on corrupt journal.
-            let full_journal = match FileRolloutStore::replay_snapshot(&base_dir, &resume_sid.to_string(), 0) {
-                Ok(j) => j,
-                Err(e) => {
-                    write_protocol_error(
-                        stdout,
-                        command_id.clone(),
-                        "RESUME_IO",
-                        format!("读取旧会话 rollout journal 失败：{e}"),
-                    )
-                    .await;
-                    return (ack_bucket_out, None);
-                }
-            };
+            // Step 1: read the existing journal. Use the LEAN streaming
+            // replay: it skips materializing redundant ContextRestored
+            // payloads (legacy journals snowballed to hundreds of MB of
+            // duplicated snapshots) and reduces the context in the same
+            // pass. Fail-closed on corrupt journal.
+            let resume_journal = base_dir
+                .join(resume_sid.to_string())
+                .join("rollout.jsonl");
+            let (full_journal, last_seq, restored_context) =
+                match grodex_loop::reducer::replay_journal_lean(&resume_journal, &resume_sid) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        write_protocol_error(
+                            stdout,
+                            command_id.clone(),
+                            "RESUME_IO",
+                            format!("读取旧会话 rollout journal 失败：{e}"),
+                        )
+                        .await;
+                        return (ack_bucket_out, None);
+                    }
+                };
 
-            let mut last_seq = 0u64;
             let mut snapshot_items: Vec<grodex_protocol::acp::SnapshotItem> = Vec::new();
             for ev in &full_journal {
-                last_seq = last_seq.max(ev.seq);
                 use grodex_rollout::event::RolloutEventType;
                 match &ev.event_type {
                     RolloutEventType::UserInputAccepted => {
@@ -661,26 +710,10 @@ async fn route_command(
                 }
             }
 
-            // 1) Rebuild ContextItem projection via SessionReducer → inject
-            //    into the *current* session (supervisor) so future turns
-            //    carry the resumed history.
-            let mut restored_context = Vec::new();
-            if !full_journal.is_empty() {
-                let pseudo_sid = SessionId::from_string(&rs.session_id)
-                    .unwrap_or_else(|_| SessionId::new());
-                let mut reducer = SessionReducer::new(pseudo_sid);
-                if let Err(e) = reducer.apply_all(&full_journal) {
-                    write_protocol_error(
-                        stdout,
-                        command_id.clone(),
-                        "RESUME_REPLAY",
-                        format!("重建会话上下文失败：{e}"),
-                    )
-                    .await;
-                    return (ack_bucket_out, None);
-                }
-                restored_context = reducer.context().to_vec();
-            }
+            // 1) Context projection was already rebuilt in the same lean
+            //    replay pass above (`restored_context`) — inject it into
+            //    the *current* session (supervisor) so future turns carry
+            //    the resumed history.
 
             // 2) SnapshotThenLive: send Snapshot frame to TUI so chat
             //    history is replayed to the user (they see old turns).
@@ -727,6 +760,8 @@ async fn route_command(
                                     .as_ref()
                                     .map(|t| t.to_string())
                                     .unwrap_or_default(),
+                                input_tokens: 0,
+                                cached_tokens: 0,
                             })
                         }
                         _ => None,
@@ -836,6 +871,12 @@ async fn route_command(
                 if let Err(e) = handle
                     .send(SessionCommand::RestoreContext {
                         items: restored_context,
+                        // persist=false: the writer was just rebound to
+                        // THIS session's journal — every restored item is
+                        // already on disk. Persisting the whole context
+                        // again per resume snowballed journals (436 MB of
+                        // duplicated ContextRestored events observed).
+                        persist: false,
                     })
                     .await
                 {
@@ -879,6 +920,14 @@ async fn serve_acp() -> Result<()> {
     let mut client_last_consumed = 0u64;
     let mut inflight_cap: u32 = 128;
     let mut requested_pause_until: Option<Instant> = None;
+
+    // Server-side keepalive: long tool executions can leave the event
+    // stream silent for minutes; a periodic Ping keeps the frontend from
+    // treating an idle pipe as a dead connection. Pings carry no seq and
+    // never interact with backpressure.
+    let mut keepalive = tokio::time::interval(Duration::from_secs(15));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await; // consume the immediate first tick
 
     loop {
         tokio::select! {
@@ -964,6 +1013,10 @@ async fn serve_acp() -> Result<()> {
                         write_frame(&mut stdout, &pong).await;
                     }
                 }
+            }
+            _ = keepalive.tick() => {
+                let ping = ServerFrame::Ping { sent_at_ms: now_ms() };
+                write_frame(&mut stdout, &ping).await;
             }
         }
     }
@@ -1335,6 +1388,22 @@ async fn run_interactive_with(
                 Some(LoopSessionEvent::IndeterminateToolCall { call_id, tool_name, message }) => {
                     println!("\n[indeterminate] call_id={call_id} tool={tool_name}: {message}");
                 }
+                Some(LoopSessionEvent::SubagentProgress(p)) => {
+                    // The simple REPL prints only lifecycle edges (start /
+                    // finish); per-step detail is for the TUI card.
+                    use grodex_loop::delegate_tool::SubagentProgress as SP;
+                    match p {
+                        SP::Started { label, task_preview, .. } => {
+                            println!("\n[subagent '{label}'] 开始执行: {task_preview}");
+                        }
+                        SP::Step { .. } => {}
+                        SP::Finished { label, ok, summary, .. } => {
+                            let tag = if ok { "执行完成" } else { "执行失败" };
+                            let preview: String = summary.chars().take(80).collect();
+                            println!("\n[subagent '{label}'] {tag}: {preview}");
+                        }
+                    }
+                }
                 None => break,
             }
         }
@@ -1354,22 +1423,17 @@ async fn resume_session(session_id: &str, cwd: Option<PathBuf>, trusted: bool) {
         eprintln!("Invalid session id: {session_id}");
         std::process::exit(1);
     });
-    let events = match FileRolloutStore::replay_snapshot(&base_dir, session_id, 0) {
-        Ok(e) => e,
-        Err(e) => { eprintln!("Cannot replay: {e}"); std::process::exit(1); }
-    };
+    let resume_journal = base_dir.join(sid.to_string()).join("rollout.jsonl");
+    let (events, _last_seq, ctx) =
+        match grodex_loop::reducer::replay_journal_lean(&resume_journal, &sid) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("Cannot replay: {e}"); std::process::exit(1); }
+        };
     if events.is_empty() {
         println!("No events found. Starting fresh session.");
         // Fall through to normal run...
         return;
     }
-    // Rebuild context from events.
-    let mut reducer = SessionReducer::new(sid);
-    if let Err(e) = reducer.apply_all(&events) {
-        eprintln!("Replay error: {e}");
-        std::process::exit(1);
-    }
-    let ctx = reducer.into_context();
     println!("Resumed session with {} context items.", ctx.len());
     // Inject the rebuilt transcript into a fresh session instead of
     // discarding it. (断链 #8: previously this only printed the count and

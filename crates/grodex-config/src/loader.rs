@@ -10,6 +10,26 @@ use crate::values::{ConfigDiagnostic, DiagnosticLevel};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+/// Expand a leading `~` / `~/...` to the user's home directory.
+///
+/// Config-supplied paths (e.g. `path = "~/.grodex/memory.db"`) must never
+/// reach the filesystem with a literal `~` — the shell does no expansion
+/// inside config files. Paths without a leading `~` pass through as-is;
+/// if the home directory cannot be resolved the literal path is returned
+/// so the caller's IO error surfaces the real problem.
+pub fn expand_user_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(trimmed));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
 /// All config file paths for a session.
 #[derive(Debug, Clone)]
 pub struct ConfigPaths {
@@ -298,4 +318,30 @@ fn fingerprint_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_user_path_leaves_absolute_and_relative_untouched() {
+        assert_eq!(expand_user_path("/tmp/x.db"), PathBuf::from("/tmp/x.db"));
+        assert_eq!(expand_user_path("relative/x.db"), PathBuf::from("relative/x.db"));
+    }
+
+    #[test]
+    fn expand_user_path_expands_tilde_prefix() {
+        let Some(home) = dirs::home_dir() else { return };
+        assert_eq!(
+            expand_user_path("~/.grodex/memory.db"),
+            home.join(".grodex/memory.db")
+        );
+        assert_eq!(expand_user_path("~"), home);
+    }
+
+    #[test]
+    fn expand_user_path_trims_whitespace() {
+        assert_eq!(expand_user_path("  /tmp/x.db  "), PathBuf::from("/tmp/x.db"));
+    }
 }

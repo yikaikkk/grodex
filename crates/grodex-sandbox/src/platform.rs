@@ -9,10 +9,33 @@
 use grodex_sandbox_types::profile::SandboxProfile;
 use std::process::Command;
 
+/// 校验路径能否安全嵌入 Seatbelt 字符串字面量。
+/// Seatbelt 字符串无标准转义机制：路径含 `"`、`\`、换行或控制字符会破坏语法，
+/// 极端情况下可改变规则语义（规则注入）。无法安全表达时整体 fail-closed，
+/// 绝不静默降级——沙箱项目宁可拒绝执行也不能放出语义不明的规则。
+fn seatbelt_safe_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('"')
+        && !path.contains('\\')
+        && !path.chars().any(|c| c.is_control())
+}
+
 /// Generate a macOS Seatbelt sandbox profile (.sb file content).
-/// Returns None on non-macOS or if the profile cannot be expressed.
+/// Returns None on non-macOS or if the profile cannot be expressed
+/// (including paths that cannot be safely embedded — fail-closed).
 pub fn generate_seatbelt_profile(profile: &SandboxProfile) -> Option<String> {
     if !cfg!(target_os = "macos") {
+        return None;
+    }
+
+    // 任一路径无法安全表达 → 拒绝生成整个 profile（上层映射为 ProfileUnrepresentable）。
+    let all_safe = profile
+        .read_only_paths
+        .iter()
+        .chain(profile.read_write_paths.iter())
+        .chain(profile.deny_paths.iter())
+        .all(|p| seatbelt_safe_path(p));
+    if !all_safe {
         return None;
     }
 
@@ -284,6 +307,32 @@ mod tests {
             assert!(sb.contains("(deny file-read* file-write* (subpath \"/etc\"))"));
             assert!(sb.contains("(allow network*)"));
         }
+    }
+
+    #[test]
+    fn seatbelt_safe_path_rejects_dangerous_chars() {
+        assert!(seatbelt_safe_path("/tmp/ok"));
+        assert!(!seatbelt_safe_path(""));
+        // 双引号/反斜杠/换行会破坏字面量或注入规则。
+        assert!(!seatbelt_safe_path("/tmp/\"))\n(allow default"));
+        assert!(!seatbelt_safe_path("/tmp/back\\slash"));
+        assert!(!seatbelt_safe_path("/tmp/new\nline"));
+        assert!(!seatbelt_safe_path("/tmp/tab\there"));
+    }
+
+    #[test]
+    fn seatbelt_profile_rejects_unsafe_paths() {
+        // 任一路径无法安全嵌入 → 拒绝生成整个 profile（fail-closed）。
+        let profile = SandboxProfile {
+            name: "evil".into(),
+            read_only_paths: vec!["/tmp/\")\n(allow default".into()],
+            read_write_paths: vec![],
+            deny_paths: vec![],
+            network_rules: vec![],
+            allow_exec: false,
+            allow_fork: false,
+        };
+        assert!(generate_seatbelt_profile(&profile).is_none());
     }
 
     /// The real enforcement test (audit: "actually apply the syscall").

@@ -56,17 +56,58 @@ impl PathValidator {
         profile.allow_exec
     }
 
-    /// Normalize a path for matching.
-    fn normalize(path: &Path) -> String {
-        path.to_string_lossy().to_string()
+    /// 词法归一（用于尚不存在的路径）：绝对化 + 解析 `.`/`..`。
+    fn normalize_lexical(path: &Path) -> std::path::PathBuf {
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        };
+        let mut out = std::path::PathBuf::new();
+        for comp in abs.components() {
+            use std::path::Component;
+            match comp {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    }
+
+    /// 路径的所有可比形态：原始字面量、词法归一（解 `.`/`..`）、
+    /// 真实形态（`fs::canonicalize`，同时解符号链接，仅在路径存在时可用）。
+    /// 这是防 `../` 与符号链接逃逸的关键：校验层与工具层实际打开的必须覆盖
+    /// 同一路径的真实形态，否则会出现“校验允许、实际逃逸”的窗口。
+    fn forms(path: &Path) -> Vec<String> {
+        let mut v = vec![path.to_string_lossy().to_string()];
+        let lex = Self::normalize_lexical(path).to_string_lossy().to_string();
+        if !v.contains(&lex) {
+            v.push(lex);
+        }
+        if let Ok(c) = std::fs::canonicalize(path) {
+            let cs = c.to_string_lossy().to_string();
+            if !v.contains(&cs) {
+                v.push(cs);
+            }
+        }
+        v
     }
 
     /// Check if a path matches any pattern in the list.
+    /// 路径与模式各自展开全部形态后两两前缀匹配：原始匹配保持向后兼容，
+    /// 交叉匹配覆盖 `../`、符号链接、相对路径与 `/tmp → /private/tmp` 之类的别名，
+    /// 避免“路径不存在只有词法形态、模式存在有真实形态”的混合错配。
     fn matches_any(patterns: &[String], path: &Path) -> bool {
-        let path_str = Self::normalize(path);
+        let path_forms = Self::forms(path);
         for pattern in patterns {
-            if path_str.starts_with(pattern.trim_end_matches('/')) || path_str == *pattern {
-                return true;
+            for pat_form in Self::forms(Path::new(pattern.trim_end_matches('/'))) {
+                let pat_form = pat_form.trim_end_matches('/');
+                if path_forms.iter().any(|pf| pf.starts_with(pat_form)) {
+                    return true;
+                }
             }
         }
         false
@@ -119,5 +160,34 @@ mod tests {
     fn exec_blocked_when_disabled() {
         let p = readonly_profile();
         assert!(!PathValidator::can_exec(&p));
+    }
+
+    #[test]
+    fn dotdot_cannot_bypass_deny() {
+        // 回归：旧实现是纯字符串前缀匹配，`/tmp/public/../secrets/key` 不以
+        // `/tmp/secrets` 开头 → 绕过 deny；又以 `/tmp` 开头 → allow，形成逃逸窗口。
+        // 规范化后 deny 必须命中。
+        let p = readonly_profile();
+        assert!(!PathValidator::can_read(&p, Path::new("/tmp/public/../secrets/key")));
+        assert!(!PathValidator::can_write(
+            &SandboxProfile {
+                name: "rw".into(),
+                read_only_paths: vec![],
+                read_write_paths: vec!["/tmp".into()],
+                deny_paths: vec!["/tmp/secrets".into()],
+                network_rules: vec![],
+                allow_exec: false,
+                allow_fork: false,
+            },
+            Path::new("/tmp/public/../secrets/key")
+        ));
+    }
+
+    #[test]
+    fn dotdot_resolves_back_into_allow() {
+        // `..` 绕出又绕回允许区域，规范化后应仍被允许（不误杀）。
+        let p = readonly_profile();
+        assert!(PathValidator::can_read(&p, Path::new("/tmp/../tmp/foo.txt")));
+        assert!(PathValidator::can_read(&p, Path::new("/tmp/./foo.txt")));
     }
 }

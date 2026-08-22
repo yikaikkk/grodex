@@ -36,7 +36,7 @@ use ratatui::widgets::{Block, Borders as B, Paragraph, Wrap, List, ListItem};
 use ratatui::Frame;
 
 use super::layout::AppLayout;
-use super::state::{ApprovalOption, BUILTIN_SLASH_COMMANDS, ChatMessage, InputMode, TuiAppState};
+use super::state::{ApprovalOption, BUILTIN_SLASH_COMMANDS, ChatMessage, InputMode, ThinkingSegment, TuiAppState};
 
 // ── Palette ───────────────────────────────────────────────────────────
 // 使用终端命名颜色而非硬编码 RGB，让终端自动适配深色/浅色主题。
@@ -71,8 +71,6 @@ fn c_tool_name() -> Style { Style::default().fg(Color::Yellow) }
 fn c_tool_args() -> Style { Style::default().fg(Color::Cyan) }
 fn c_tool_out()  -> Style { Style::default().fg(Color::Gray) }
 fn c_tool_run()  -> Style { Style::default().fg(Color::Yellow) }
-/// Rail color shared by Thinking rail and Tool rail.
-fn c_tool_rail() -> Color { Color::Yellow }
 /// Thinking / reasoning panel.
 fn c_thinking_label() -> Style { Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD) }
 fn c_thinking_text()  -> Style { Style::default().fg(Color::Gray) }
@@ -977,6 +975,7 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
         // doesn't complain about reading state fields while `turn` borrows
         // `state.messages`.
         let thinking_expanded = state.thinking_expanded;
+        let subagent_expanded = state.subagent_expanded;
         let thinking_scroll_in = state.thinking_scroll;
         // Will be set by the most-recent Thinking block render pass if
         // the clamped value differs from the stored one.
@@ -986,17 +985,6 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
         for (turn_idx, turn_range) in turns.into_iter().enumerate() {
             let is_latest_turn = turn_idx + 1 == turns_total;
             let turn = &state.messages[turn_range];
-
-            let mut assistant_header_rendered = false;
-            // Turn-level tool tallies
-            let mut completed_ok: Vec<(String, std::time::Duration)> = Vec::new();
-            let mut completed_err: Vec<(String, std::time::Duration)> = Vec::new();
-            let mut in_flight: Vec<(
-                String,           // short title name(#short)
-                std::time::Duration,
-                String,           // preview string
-                bool,             // is_running (else calling/parsing)
-            )> = Vec::new();
 
             for msg in turn {
                 match msg {
@@ -1055,51 +1043,133 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                         rows.push(Line::from(vec![Span::raw("")]));
                     }
 
-                    ChatMessage::Thinking { text, done } => {
+                    ChatMessage::Thinking { segments, done } => {
                         let tag = if *done { "Thought" } else { "Thinking…" };
                         rows.push(Line::from(vec![
                             Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
                             style_s(c_thinking_label(), tag),
                         ]));
-                        if text.is_empty() {
+                        // ── Flatten segments: thought text + tool cards ──
+                        // Tool calls render INSIDE the Thinking block,
+                        // interleaved with the reasoning text in real call
+                        // order (thought → tool → thought). The assistant
+                        // answer stays a separate, unbroken block below.
+                        let body_w = inner_w.saturating_sub(6).max(20);
+                        let rail = || Span::styled("  ╎ ", Style::default().fg(c_thinking_rail()));
+                        let mut body: Vec<Line> = Vec::new();
+                        for seg in segments {
+                            match seg {
+                                ThinkingSegment::Text(text) => {
+                                    for raw in text.split('\n') {
+                                        for wl in wrap_str(raw, body_w) {
+                                            body.push(Line::from(vec![
+                                                rail(),
+                                                style_s(c_thinking_text(), wl),
+                                            ]));
+                                        }
+                                    }
+                                }
+                                ThinkingSegment::Tool(card) => {
+                                    // Header: ⏺ ✓ name(#id) preview (dur)
+                                    // Freeze the duration at completion so
+                                    // the number doesn't tick every frame.
+                                    let elapsed = match card.finished_at {
+                                        Some(end) => end.duration_since(card.started_at),
+                                        None => card.started_at.elapsed(),
+                                    };
+                                    let short_id = match card.call_id.as_ref().filter(|s| !s.is_empty()) {
+                                        Some(id) => {
+                                            let s: String = id.chars().take(8).collect();
+                                            format!("(#{s})")
+                                        }
+                                        None => String::new(),
+                                    };
+                                    let preview = tool_preview(&card.name, &card.args);
+                                    let (sym, sym_style) = if card.has_result && card.is_error {
+                                        ("✗", c_tool_err())
+                                    } else if card.has_result && card.done {
+                                        ("✓", c_tool_ok())
+                                    } else {
+                                        ("⏳", c_tool_run())
+                                    };
+                                    let mut parts: Vec<Span> = Vec::with_capacity(7);
+                                    parts.push(rail());
+                                    parts.push(style_s(
+                                        if card.has_result && card.is_error { c_error() } else { c_accent() },
+                                        "⏺ ",
+                                    ));
+                                    parts.push(style_s(sym_style, format!("{sym} ")));
+                                    parts.push(style_s(c_tool_name(), format!("{}{}", card.name, short_id)));
+                                    if !preview.is_empty() {
+                                        parts.push(Span::raw(" "));
+                                        parts.push(style_s(c_muted(), preview));
+                                    }
+                                    parts.push(style_s(c_dim(), format!(" ({})", human_duration(elapsed))));
+                                    body.push(Line::from(parts));
+                                    // Tool output: tail window below the
+                                    // header (errors / key lines live at
+                                    // the end of long outputs).
+                                    if card.has_result {
+                                        const RESULT_WINDOW: usize = 12;
+                                        let mut wrapped: Vec<String> = Vec::new();
+                                        for raw in card.result.as_deref().unwrap_or("").split('\n') {
+                                            for wl in wrap_str(raw, body_w) {
+                                                wrapped.push(wl);
+                                            }
+                                        }
+                                        let text_style = if card.is_error { c_error() } else { c_thinking_text() };
+                                        if wrapped.is_empty() {
+                                            body.push(Line::from(vec![
+                                                rail(),
+                                                style_s(text_style, "(empty)".to_string()),
+                                            ]));
+                                        } else {
+                                            let start = wrapped.len().saturating_sub(RESULT_WINDOW);
+                                            for wl in &wrapped[start..] {
+                                                body.push(Line::from(vec![
+                                                    rail(),
+                                                    style_s(text_style, wl.clone()),
+                                                ]));
+                                            }
+                                            if start > 0 {
+                                                body.push(Line::from(vec![
+                                                    rail(),
+                                                    style_s(c_dim(), format!("({} lines above · {} total)", start, wrapped.len())),
+                                                ]));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if body.is_empty() {
                             let placeholder = if *done { "·" } else { "▋" };
                             rows.push(Line::from(vec![
-                                Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                rail(),
                                 style_s(c_thinking_text(), placeholder.to_string()),
                             ]));
                         } else {
-                            let body_w = inner_w.saturating_sub(6).max(20);
-                            // Wrap ALL lines first — both collapsed and
-                            // expanded paths need the wrapped form.
-                            let mut wrapped: Vec<String> = Vec::new();
-                            for raw in text.split('\n') {
-                                for wl in wrap_str(raw, body_w) {
-                                    wrapped.push(wl);
-                                }
-                            }
-                            let total = wrapped.len();
+                            let total = body.len();
 
                             if is_latest_turn {
                                 // ── Latest turn: auto-scroll + Ctrl+O ──
                                 // Auto-scroll to bottom when streaming
                                 // (not done) so the user always sees the
-                                // latest reasoning. Once done, respect
-                                // the user's manual scroll position.
+                                // latest reasoning / tool output. Once
+                                // done, respect the manual scroll position.
                                 if !done {
                                     let max_scroll = total.saturating_sub(12);
                                     thinking_scroll_clamp = Some(max_scroll as u16);
                                 }
 
                                 if thinking_expanded {
-                                    // Expanded: full CoT inline
-                                    for wl in &wrapped {
-                                        rows.push(Line::from(vec![
-                                            Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                            style_s(c_thinking_text(), wl.clone()),
-                                        ]));
+                                    // Expanded: full CoT + tool trace inline
+                                    for line in &body {
+                                        rows.push(line.clone());
                                     }
                                     rows.push(Line::from(vec![
-                                        Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                        rail(),
                                         style_s(c_dim(), "(Ctrl+O collapse)"),
                                     ]));
                                 } else {
@@ -1114,11 +1184,8 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                                     thinking_scroll_clamp = Some(scroll as u16);
 
                                     let end = (scroll + COLLAPSED_HEIGHT).min(total);
-                                    for wl in &wrapped[scroll..end] {
-                                        rows.push(Line::from(vec![
-                                            Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                            style_s(c_thinking_text(), wl.clone()),
-                                        ]));
+                                    for line in &body[scroll..end] {
+                                        rows.push(line.clone());
                                     }
                                     // Hint line
                                     if total > COLLAPSED_HEIGHT {
@@ -1128,29 +1195,24 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                                             total
                                         );
                                         rows.push(Line::from(vec![
-                                            Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                            rail(),
                                             style_s(c_dim(), hint),
                                         ]));
                                     } else {
                                         rows.push(Line::from(vec![
-                                            Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                            rail(),
                                             style_s(c_dim(), "(Ctrl+O expand)"),
                                         ]));
                                     }
                                 }
                             } else {
                                 // ── Older turns: always compact ──────────
-                                // Show a fixed-height window of the LAST
-                                // N lines (no expand, no scroll controls).
-                                // The user can Ctrl+O on the latest turn
-                                // to see its full reasoning.
+                                // Fixed-height window of the LAST N lines
+                                // (no expand, no scroll controls).
                                 const COMPACT_HEIGHT: usize = 5;
                                 let start = total.saturating_sub(COMPACT_HEIGHT);
-                                for wl in &wrapped[start..] {
-                                    rows.push(Line::from(vec![
-                                        Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
-                                        style_s(c_thinking_text(), wl.clone()),
-                                    ]));
+                                for line in &body[start..] {
+                                    rows.push(line.clone());
                                 }
                                 let hidden = start;
                                 let hint = if hidden > 0 {
@@ -1159,7 +1221,7 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                                     format!("({} lines)", total)
                                 };
                                 rows.push(Line::from(vec![
-                                    Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                    rail(),
                                     style_s(c_dim(), hint),
                                 ]));
                             }
@@ -1173,8 +1235,6 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                         // 背景，Assistant 使用默认透明背景 + Tool/Thinking 各
                         // 自有彩色 rail（黄/紫 rail 本身就是「模型侧输出」的
                         // 视觉锚点），所以即使不带文字标签也能一目了然。
-                        let _ = assistant_header_rendered;
-                        assistant_header_rendered = true; // mark so turn-foot tool summary won't add an extra header line
                         if text.is_empty() {
                             let placeholder = if *done { "·" } else { "▋" };
                             rows.push(Line::from(vec![
@@ -1197,41 +1257,113 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                         rows.push(Line::from(vec![Span::raw("")]));
                     }
 
-                    ChatMessage::Tool { name, call_id, args, result: _, is_error, done, has_result, started_at, finished_at } => {
-                        // For completed tools, freeze the duration at the
-                        // moment of completion (finished_at) so the number
-                        // doesn't keep ticking on every render frame.
-                        // For in-flight tools, keep using started_at.elapsed()
-                        // so the live counter advances as expected.
+                    ChatMessage::Subagent {
+                        label,
+                        task_preview,
+                        lines,
+                        done,
+                        ok,
+                        started_at,
+                        finished_at,
+                        ..
+                    } => {
+                        // ── Sub-agent card (tool-block style) ──────────
+                        // Header line like the turn-foot tool summary +
+                        // a collapsible Thought-style execution log.
+                        // Ctrl+E (subagent_expanded) expands the log of
+                        // the latest turn; older turns stay compact.
                         let elapsed = match finished_at {
                             Some(end) => end.duration_since(*started_at),
                             None => started_at.elapsed(),
                         };
-                        // NOTE: completed tools (both ok and error) are
-                        // NO-OPs for inline rendering. Both are reflected
-                        // in the single turn-foot summary line as counts,
-                        // so the transcript stays clean — exactly Claude's
-                        // behaviour where completed tools vanish from the
-                        // "currently executing" sublist and only show in
-                        // the aggregate "N done / M failed" line.
-                        if *has_result && *is_error {
-                            completed_err.push((name.clone(), elapsed));
-                        } else if *has_result && *done {
-                            completed_ok.push((name.clone(), elapsed));
+                        let (tag, tag_style) = if !*done {
+                            ("▶ Running", c_thinking_label())
+                        } else if *ok {
+                            ("✓ Done", c_tool_ok())
                         } else {
-                            // In-flight: calling (no args yet) or running
-                            // (has args, agent waiting for result).
-                            let is_running = *done || !args.trim().is_empty();
-                            let short_id = match call_id.as_ref().filter(|s| !s.is_empty()) {
-                                Some(id) => {
-                                    let s: String = id.chars().take(8).collect();
-                                    format!("{name}(#{s})")
-                                }
-                                None => format!("{name}()"),
-                            };
-                            let preview = tool_preview(name, args);
-                            in_flight.push((short_id, elapsed, preview, is_running));
+                            ("✗ Failed", c_error())
+                        };
+                        rows.push(Line::from(vec![
+                            Span::raw("  "),
+                            style_s(
+                                if *done && !*ok { c_error() } else { c_accent() },
+                                "⏺ ",
+                            ),
+                            style_s(c_thinking_label(), "Subagent ".to_string()),
+                            style_s(
+                                c_fg().add_modifier(Modifier::BOLD),
+                                format!("'{label}' "),
+                            ),
+                            style_s(tag_style, format!("{tag} ")),
+                            style_s(c_dim(), human_duration(elapsed)),
+                        ]));
+
+                        let body_w = inner_w.saturating_sub(6).max(20);
+                        let rail = Span::styled(
+                            "  ╎ ",
+                            Style::default().fg(c_thinking_rail()),
+                        );
+
+                        // Task preview: single dimmed line.
+                        if !task_preview.is_empty() {
+                            if let Some(first) = wrap_str(task_preview, body_w).into_iter().next() {
+                                rows.push(Line::from(vec![
+                                    Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                    style_s(c_dim(), first),
+                                ]));
+                            }
                         }
+
+                        // Execution log: wrap all lines, then window them.
+                        let mut wrapped: Vec<String> = Vec::new();
+                        for raw in lines {
+                            for wl in wrap_str(raw, body_w) {
+                                wrapped.push(wl);
+                            }
+                        }
+                        let total = wrapped.len();
+                        let expanded = is_latest_turn && subagent_expanded;
+                        const COLLAPSED_LINES: usize = 3;
+                        const EXPANDED_CAP: usize = 40;
+                        let start = if expanded {
+                            total.saturating_sub(EXPANDED_CAP)
+                        } else {
+                            total.saturating_sub(COLLAPSED_LINES)
+                        };
+                        for wl in &wrapped[start..] {
+                            rows.push(Line::from(vec![
+                                rail.clone(),
+                                style_s(c_muted(), wl.clone()),
+                            ]));
+                        }
+                        if !*done {
+                            rows.push(Line::from(vec![
+                                Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                style_s(c_thinking_text(), "▋".to_string()),
+                            ]));
+                        }
+                        // Collapse/expand hint (latest turn only — older
+                        // turns always render compact).
+                        if total > COLLAPSED_LINES {
+                            let hint = if is_latest_turn {
+                                if expanded {
+                                    format!(
+                                        "(Ctrl+E 收起 · 显示最近 {}/{} 行)",
+                                        total - start,
+                                        total
+                                    )
+                                } else {
+                                    format!("(Ctrl+E 展开执行过程 · 共 {} 行)", total)
+                                }
+                            } else {
+                                format!("(共 {} 行)", total)
+                            };
+                            rows.push(Line::from(vec![
+                                Span::styled("  ╎ ", Style::default().fg(c_thinking_rail())),
+                                style_s(c_dim(), hint),
+                            ]));
+                        }
+                        rows.push(Line::from(vec![Span::raw("")]));
                     }
 
                     ChatMessage::System { text, is_error } => {
@@ -1270,134 +1402,9 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
                 }
             }
 
-            // ── Turn-foot tool summary (Claude-style) ────────────────
-            //
-            // Example layout:
-            //   ⏺ Working 29s · 17 done · 1 failed · 3 running
-            //     ⎿ $ cargo check --workspace (12s)
-            //     ⎿ src/main.rs:1080-1095 (4s)
-            //
-            // If everything finished cleanly → single line with no
-            // sub-items. Only IN-FLIGHT tools get the expanded list;
-            // completed tools (both ok AND failed) contribute only to
-            // the aggregate counters — exactly matching Claude where
-            // "currently executing" is a transient-only view.
-
-            let n_ok = completed_ok.len();
-            let n_err = completed_err.len();
-            let n_flying = in_flight.len();
-
-            if n_ok == 0 && n_err == 0 && n_flying == 0 {
-                continue; // turn has no tools, nothing to summarise
-            }
-
-            // ── Guarantee Grodex header renders BEFORE tool summary ─
-            //
-            // The classic "tool summary above Grodex title" race: model
-            // can emit ToolCallStart BEFORE the first TextDelta token.
-            // Without this guard, turn-foot would fire with
-            // `assistant_header_rendered == false`, then the next render
-            // frame (when Assistant text arrives) prints "Grodex" BELOW
-            // the already-flushed summary. Fix: if the turn has ANY tool
-            // activity to report but no header was drawn yet, emit a
-            // transient `Grodex  ⏳ working…` header first. This also
-            // covers the "tools-only turn" edge case where the model
-            // just calls agents without answering.
-            if !assistant_header_rendered {
-                // Tools-only turn (no Assistant text yet) still needs a
-                // visual anchor so the tool summary isn't confused with
-                // the user's input. Instead of the word "Grodex" we emit
-                // only the "⏳ working…" / "⚙ tools…" indicator, matching
-                // the no-label visual style.
-                let any_work_left = n_flying > 0;
-                if any_work_left {
-                    rows.push(Line::from(vec![
-                        Span::raw("  "),
-                        style_s(c_dim(), "⏳ working…"),
-                    ]));
-                    rows.push(Line::from(vec![Span::raw("")]));
-                }
-                assistant_header_rendered = true;
-            }
-
-            // ── Summary line pieces ────────────────────────────────
-            let mut pieces: Vec<Span> = Vec::with_capacity(8);
-            pieces.push(Span::styled("  ", Style::default()));
-            pieces.push(match n_flying > 0 {
-                true  => style_s(c_thinking_label(), "⏺ "),
-                false => style_s(c_tool_ok(), "⏺ "),
-            });
-
-            // Optional thinking/working label + total time. For thinking
-            // time we pick max(started_at.elapsed) across all in-flight
-            // tools as a rough proxy; completed-only turns just say
-            // "Tools completed in Xs".
-            let now = std::time::Instant::now();
-            let span_total = if !in_flight.is_empty() {
-                in_flight.iter().map(|t| t.1).max().unwrap_or_default()
-            } else if !completed_ok.is_empty() {
-                completed_ok.iter().map(|t| t.1).max().unwrap_or_default()
-            } else {
-                std::time::Duration::ZERO
-            };
-            let _ = now; // keep Instant::now side effects deterministic (we don't use it today)
-            let tag = match n_flying {
-                0 if n_err > 0 => "Done (with errors)",
-                0 => "Tools",
-                _ => "Working",
-            };
-            pieces.push(style_s(c_thinking_label(), format!("{tag} ")));
-            if span_total.as_millis() > 0 {
-                pieces.push(style_s(c_dim(), format!("{} · ", human_duration(span_total))));
-            } else if n_flying > 0 {
-                pieces.push(style_s(c_dim(), "· ".to_string()));
-            }
-
-            if n_ok > 0 {
-                let total_span = completed_ok.iter().map(|t| t.1.as_millis() as u64).sum::<u64>();
-                let sum = std::time::Duration::from_millis(total_span);
-                pieces.push(style_s(c_tool_ok(), format!("{n_ok} done")));
-                // Only print aggregate span if it's noticeable to avoid
-                // 17 tools × <1ms each turning into a wall of "(0ms)"
-                if sum.as_millis() >= 200 {
-                    pieces.push(style_s(c_dim(), format!("({}) ", human_duration(sum))));
-                } else {
-                    pieces.push(Span::raw(" "));
-                }
-            }
-            if n_err > 0 {
-                pieces.push(style_s(c_tool_err(), format!("{n_err} failed")));
-                pieces.push(Span::raw(" "));
-            }
-            if n_flying > 0 {
-                pieces.push(style_s(c_tool_run(), format!("{n_flying} running")));
-            }
-            // Trim trailing space spans (cosmetic)
-            while let Some(last) = pieces.last() {
-                if last.content.chars().all(|c| c == ' ') {
-                    pieces.pop();
-                } else {
-                    break;
-                }
-            }
-            rows.push(Line::from(pieces));
-
-            // ── In-flight detail lines ─────────────────────────────
-            // Ordered by elapsed (oldest first) so long-running work
-            // stays at the top of the list — users can tell what the
-            // bottleneck is at a glance.
-            in_flight.sort_by(|a, b| b.1.cmp(&a.1));
-            for (title, elapsed, preview, _is_running) in in_flight.iter() {
-                let mut line_parts: Vec<Span> = Vec::with_capacity(6);
-                line_parts.push(Span::styled("    ⎿ ", Style::default().fg(c_tool_rail())));
-                line_parts.push(style_s(c_tool_name(), format!("{title} ")));
-                if !preview.is_empty() {
-                    line_parts.push(style_s(c_fg(), preview.clone()));
-                    line_parts.push(Span::raw(" "));
-                }
-                line_parts.push(style_s(c_dim(), format!("({})", human_duration(*elapsed))));
-                rows.push(Line::from(line_parts));
-            }
+            // Tool calls render INSIDE the Thinking block (see the
+            // Thinking arm above) — no standalone tool cards or
+            // aggregated turn-foot summary.
             rows.push(Line::from(vec![Span::raw("")]));
         }
         // Write back the clamped Thinking scroll offset so that

@@ -47,6 +47,32 @@ const DISABLE_ALL_MOUSE: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l"
 /// 参考 codex-rs tui/src/tui.rs:240-280 的 EnableAlternateScroll。
 const ENABLE_ALT_SCROLL: &[u8] = b"\x1b[?1007h";
 
+/// 触控板滚轮突发识别参数（配合 DECSET 1007，不捕获鼠标）。
+/// 1007 把滚轮翻译成 ↑/↓ 方向键：触控板轻轻一划会在极短时间内爆发几十个箭头键。
+/// 人手按键（含长按重复）最快也只有 ~30Hz；因此“短窗口内 ≥ 阈值个裸箭头键”判为滚轮手势，
+/// 直接转成正文滚动（不劫持选择），并经限流封顶避免惯性失控。
+const ARROW_BURST_WINDOW: Duration = Duration::from_millis(60);
+const ARROW_BURST_THRESHOLD: u32 = 2;
+/// 滚轮手势已确认后的惯性延续窗口：触控板惯性事件随衰减越来越稀疏（间隔远超 BURST_WINDOW），
+/// 只要距上一个箭头事件不超过该窗口就仍按滚轮处理，绝不泄漏成真实按键去触发选择/历史导航。
+/// 窗口沿箭头事件自延长，直到彻底静默超过该值才认定手势结束。
+const ARROW_BURST_CONTINUE: Duration = Duration::from_millis(700);
+/// 单个滚轮手势的总时长上限：防止真实方向键持续按压把延续窗口无限延长的病态场景（惯性最长也就 2-3s）。
+const ARROW_GESTURE_MAX_DUR: Duration = Duration::from_secs(3);
+
+/// 滚轮阻尼参数（防触控板惯性尾巴塞）：窗口限速 + 单手势封顶。
+/// 手离开触控板后系统惯性仍会持续发事件，但单个手势（相邻事件间隔 ≤ GAP）的总滚动量被封顶在
+/// GESTURE_MAX 行，超出后的惯性事件全部丢弃；停顿超过 GAP 后再次滑动视为新手势。
+const WHEEL_WINDOW_MS: u64 = 30;
+const WHEEL_WINDOW_MAX: u32 = 4;
+const WHEEL_GESTURE_MAX: u32 = 60;
+const WHEEL_GESTURE_GAP: Duration = Duration::from_millis(150);
+
+/// 鼠标上报（仅 macOS Terminal.app 兜底用）：普通跟踪 (1000) + SGR 扩展 (1006)。
+/// Terminal.app 不实现 DECSET 1007，滚轮不会被翻译成方向键；不开上报时滚轮会滚动终端自己的回滚缓冲，
+/// 把整个 TUI 从 alternate screen “卷走”。只有在这个终端里才开启，且只消费滚轮事件、忽略点击/拖拽。
+const ENABLE_MOUSE_CAPTURE: &[u8] = b"\x1b[?1006h\x1b[?1000h";
+
 fn hard_terminal_reset() {
     // 不用 crossterm Command：panic context 里不能分配/unwrap。
     // 直接写裸字节 + flush，失败也不处理（进程即将死亡）。
@@ -93,6 +119,33 @@ pub struct GrodexTui {
     terminal: Terminal<CrosstermBackend<io::Stderr>>,
     state: TuiAppState,
     transport: Box<dyn TransportAdapter>,
+    /// 滚轮手势累计量（行数，正 = 向下）。突发箭头键/滚轮事件只累加，
+    /// 由主循环在限流窗口里统一应用，避免触控板惯性失控。
+    wheel_accum: i32,
+    /// 上一次应用滚轮累计值的时间戳。
+    wheel_last_apply: std::time::Instant,
+    /// 上一个裸箭头键到达时间（滚轮突发识别用）。
+    arrow_last_at: Option<std::time::Instant>,
+    /// 当前连续箭头键计数（滚轮突发识别用）。
+    arrow_burst: u32,
+    /// 当前手势是否已确认为滚轮（用于惯性尾部的延续判定）。
+    burst_confirmed: bool,
+    /// 当前滚轮手势的确认时刻（延续窗口的总时长上限用）。
+    burst_started_at: Option<std::time::Instant>,
+    /// 暂存待判定的箭头键：突发确认前不派发，避免滚轮手势的前几个箭头键
+    /// 误触发选择/历史导航。超时未续发则还原为真实按键派发。
+    held_arrows: Vec<crossterm::event::KeyEvent>,
+    /// 待派发队列：还原的暂存箭头键按原顺序逐个消费，优先于终端新事件。
+    queued_keys: std::collections::VecDeque<crossterm::event::KeyEvent>,
+    /// 当前迭代的事件来自待派发队列：直接派发，跳过突发检测（避免重复计数）。
+    queued_dispatch: bool,
+    /// 鼠标上报（滚轮）是否开启：仅 macOS Terminal.app 自动开启（它不支持 1007），
+    /// 其他终端保持关闭以保留终端原生选择。不提供用户开关。
+    mouse_capture: bool,
+    /// 当前手势已应用的滚动行数（手势封顶计数）。
+    gesture_lines: u32,
+    /// 上一次滚轮事件（突发箭头键/真实滚轮）到达时间，用于手势间隔判定。
+    wheel_last_event: Option<std::time::Instant>,
 }
 
 impl GrodexTui {
@@ -131,7 +184,34 @@ impl GrodexTui {
             terminal,
             state,
             transport: Box::new(transport),
+            wheel_accum: 0,
+            // 倒推 1 秒，保证首个滚轮事件无需等待限流窗口。
+            wheel_last_apply: std::time::Instant::now() - Duration::from_secs(1),
+            arrow_last_at: None,
+            arrow_burst: 0,
+            burst_confirmed: false,
+            burst_started_at: None,
+            held_arrows: Vec::new(),
+            queued_keys: std::collections::VecDeque::new(),
+            queued_dispatch: false,
+            mouse_capture: false,
+            gesture_lines: 0,
+            wheel_last_event: None,
         })
+    }
+
+    /// 滚轮累加统一入口（突发箭头键与 Terminal.app 真实滚轮共用）。
+    /// 与上一事件间隔超过 WHEEL_GESTURE_GAP 视为新手势，重置封顶计数。
+    fn add_wheel(&mut self, lines: i32) {
+        let now = std::time::Instant::now();
+        if self
+            .wheel_last_event
+            .is_some_and(|t| now.duration_since(t) > WHEEL_GESTURE_GAP)
+        {
+            self.gesture_lines = 0;
+        }
+        self.wheel_last_event = Some(now);
+        self.wheel_accum += lines;
     }
 
     pub fn run_blocking(mut self) -> Result<()> {
@@ -156,9 +236,22 @@ impl GrodexTui {
         let _ = io::Write::write_all(&mut stderr, DISABLE_ALL_MOUSE);
         let _ = io::Write::flush(&mut stderr);
         // 启用 DECSET 1007 (Alternate Scroll Mode)：滚轮 → 方向键。
-        // 不捕获鼠标，终端原生的文本选择始终可用。参考 codex-rs 的设计。
+        // 不捕获鼠标，终端原生的文本选择（拖拽选中 + 右键复制）始终可用，
+        // 参考 codex-rs 的设计。触控板惯性爆发由主循环的箭头突发识别限流。
         let _ = io::Write::write_all(&mut stderr, ENABLE_ALT_SCROLL);
         let _ = io::Write::flush(&mut stderr);
+        // macOS 自带 Terminal.app 不实现 DECSET 1007：滚轮不会被翻译成方向键，
+        // 反而会滚动终端自己的回滚缓冲，把整个 TUI 从屏幕上“卷走”。
+        // 只有在这个终端里才开启最小鼠标上报（只消费滚轮、忽略点击），
+        // 其他终端（iTerm2/WezTerm/Alacritty 等）保持零捕获，原生选择不受影响。
+        // 前提：Terminal.app 菜单 “显示 > 允许鼠标报告” 处于勾选状态（默认勾选）。
+        let is_apple_terminal =
+            std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal");
+        if is_apple_terminal {
+            let _ = io::Write::write_all(&mut stderr, ENABLE_MOUSE_CAPTURE);
+            let _ = io::Write::flush(&mut stderr);
+            self.mouse_capture = true;
+        }
         // 开启 bracketed paste：用户在输入框 Ctrl-V/Cmd-V 粘贴时，终端会
         // 发送 `CrosstermEvent::Paste(String)`，我们把它追加到输入框光标
         // 位置，而不是把一大段原始 CSI 文本塞进 input_buffer。
@@ -239,10 +332,45 @@ impl GrodexTui {
                             });
                         }
                         "thinking" => {
-                            restored.push(crate::ui::state::ChatMessage::Thinking {
-                                text: item.content.clone(),
-                                done: item.complete,
-                            });
+                            // ONE Thinking block per turn — merge into the
+                            // existing Thinking block of the current turn
+                            // (scan backward, skip Assistant/Subagent/
+                            // System, stop at User) as a Text segment.
+                            // Mirrors the ThoughtDelta accumulation logic
+                            // in push_event so resume produces the same
+                            // single-block output as live streaming.
+                            let mut merged_at: Option<usize> = None;
+                            for (i, m) in restored.iter().enumerate().rev() {
+                                match m {
+                                    crate::ui::state::ChatMessage::Thinking { .. } => {
+                                        merged_at = Some(i);
+                                        break;
+                                    }
+                                    crate::ui::state::ChatMessage::User { .. } => {
+                                        break; // turn boundary
+                                    }
+                                    _ => {} // skip Assistant/Subagent/System
+                                }
+                            }
+                            match merged_at {
+                                Some(i) => {
+                                    if let crate::ui::state::ChatMessage::Thinking { segments, .. } = &mut restored[i] {
+                                        match segments.last_mut() {
+                                            Some(crate::ui::state::ThinkingSegment::Text(t)) => {
+                                                t.push('\n');
+                                                t.push_str(&item.content);
+                                            }
+                                            _ => segments.push(crate::ui::state::ThinkingSegment::Text(item.content.clone())),
+                                        }
+                                    }
+                                }
+                                None => {
+                                    restored.push(crate::ui::state::ChatMessage::Thinking {
+                                        segments: vec![crate::ui::state::ThinkingSegment::Text(item.content.clone())],
+                                        done: item.complete,
+                                    });
+                                }
+                            }
                         }
                         "tool_call" => {
                             match serde_json::from_str::<serde_json::Value>(&item.content) {
@@ -261,7 +389,7 @@ impl GrodexTui {
                                         .cloned()
                                         .unwrap_or(serde_json::Value::Null)
                                         .to_string();
-                                    restored.push(crate::ui::state::ChatMessage::Tool {
+                                    let card = crate::ui::state::ToolCard {
                                         name,
                                         call_id,
                                         args,
@@ -270,8 +398,35 @@ impl GrodexTui {
                                         done: item.complete,
                                         has_result: false,
                                         started_at: base,
-                                        finished_at: None,
-                                    });
+                                        finished_at: if item.complete { Some(base) } else { None },
+                                    };
+                                    // Route into the current turn's
+                                    // Thinking block (create one if the
+                                    // journal holds no thought for it).
+                                    let mut at: Option<usize> = None;
+                                    for (i, m) in restored.iter().enumerate().rev() {
+                                        match m {
+                                            crate::ui::state::ChatMessage::Thinking { .. } => {
+                                                at = Some(i);
+                                                break;
+                                            }
+                                            crate::ui::state::ChatMessage::User { .. } => break,
+                                            _ => {}
+                                        }
+                                    }
+                                    match at {
+                                        Some(i) => {
+                                            if let crate::ui::state::ChatMessage::Thinking { segments, .. } = &mut restored[i] {
+                                                segments.push(crate::ui::state::ThinkingSegment::Tool(card));
+                                            }
+                                        }
+                                        None => {
+                                            restored.push(crate::ui::state::ChatMessage::Thinking {
+                                                segments: vec![crate::ui::state::ThinkingSegment::Tool(card)],
+                                                done: item.complete,
+                                            });
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     self.state.push_log(format!(
@@ -285,7 +440,7 @@ impl GrodexTui {
                             match serde_json::from_str::<serde_json::Value>(&item.content) {
                                 Ok(v) => {
                                     let call_id =
-                                        v.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
+                                        v.get("call_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
                                     let content_v =
                                         v.get("content").cloned().unwrap_or(serde_json::Value::Null);
                                     // tool result payload is stored as
@@ -301,43 +456,66 @@ impl GrodexTui {
                                         .and_then(|x| x.as_bool())
                                         .unwrap_or(false);
                                     // Pair the result with the matching
-                                    // prior tool_call via call_id. Fallback:
-                                    // append a synthetic Tool card with no
-                                    // args but result filled (can happen if
-                                    // journal missed the prepared entry
-                                    // because it was filtered out).
-                                    let paired = restored.iter_mut().rev().find(|m| {
-                                        matches!(m, crate::ui::state::ChatMessage::Tool {
-                                            call_id: Some(c), ..
-                                        } if c == call_id)
-                                    });
-                                    match paired {
-                                        Some(crate::ui::state::ChatMessage::Tool {
-                                            result: slot,
-                                            is_error: err_slot,
-                                            has_result: hr_slot,
-                                            finished_at: fa_slot,
-                                            ..
-                                        }) => {
-                                            *slot = Some(text);
-                                            *err_slot = is_error;
-                                            *hr_slot = true;
-                                            *fa_slot = Some(base);
+                                    // Tool segment inside a Thinking block
+                                    // (backward scan, exact call_id match).
+                                    let mut paired = false;
+                                    'blocks: for m in restored.iter_mut().rev() {
+                                        match m {
+                                            crate::ui::state::ChatMessage::Thinking { segments, .. } => {
+                                                for seg in segments.iter_mut().rev() {
+                                                    if let crate::ui::state::ThinkingSegment::Tool(card) = seg {
+                                                        if !call_id.is_empty()
+                                                            && card.call_id.as_deref() == Some(call_id.as_str())
+                                                        {
+                                                            card.result = Some(text.clone());
+                                                            card.is_error = is_error;
+                                                            card.has_result = true;
+                                                            card.done = true;
+                                                            card.finished_at = Some(base);
+                                                            paired = true;
+                                                            break 'blocks;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            crate::ui::state::ChatMessage::User { .. } => break,
+                                            _ => {}
                                         }
-                                        _ => {
-                                            restored.push(
-                                                crate::ui::state::ChatMessage::Tool {
-                                                    name: String::new(),
-                                                    call_id: Some(call_id.to_string()),
-                                                    args: String::new(),
-                                                    result: Some(text),
-                                                    is_error,
-                                                    done: true,
-                                                    has_result: true,
-                                                    started_at: base,
-                                                    finished_at: Some(base),
-                                                },
-                                            );
+                                    }
+                                    if !paired {
+                                        // Fallback: synthetic Tool segment
+                                        // with no matching call entry (can
+                                        // happen if the journal missed the
+                                        // prepared entry because it was
+                                        // filtered out).
+                                        let card = crate::ui::state::ToolCard {
+                                            name: String::new(),
+                                            call_id: Some(call_id.clone()),
+                                            args: String::new(),
+                                            result: Some(text),
+                                            is_error,
+                                            done: true,
+                                            has_result: true,
+                                            started_at: base,
+                                            finished_at: Some(base),
+                                        };
+                                        let mut pushed = false;
+                                        for m in restored.iter_mut().rev() {
+                                            match m {
+                                                crate::ui::state::ChatMessage::Thinking { segments, .. } => {
+                                                    segments.push(crate::ui::state::ThinkingSegment::Tool(card.clone()));
+                                                    pushed = true;
+                                                    break;
+                                                }
+                                                crate::ui::state::ChatMessage::User { .. } => break,
+                                                _ => {}
+                                            }
+                                        }
+                                        if !pushed {
+                                            restored.push(crate::ui::state::ChatMessage::Thinking {
+                                                segments: vec![crate::ui::state::ThinkingSegment::Tool(card)],
+                                                done: true,
+                                            });
                                         }
                                     }
                                 }
@@ -359,17 +537,19 @@ impl GrodexTui {
                 }
                 // Diagnostics: when item count does not match restored, some
                 // items were dropped via the `other` branch (e.g. a typo in
-                // the item_type string sent by the agent). This log lets the
-                // user immediately see "expected 9, got 0" without guessing
-                // why the chat pane stays empty after a resume.
-                if restored.len() != snap.items.len() {
+                // the item_type string sent by the agent). Thinking items
+                // are intentionally merged into a single block per turn, so
+                // restored.len() < snap.items.len() is expected when a turn
+                // had multiple reasoning steps — only warn when restored is
+                // unexpectedly empty despite having snapshot items.
+                if restored.is_empty() && !snap.items.is_empty() {
                     self.state.push_log(format!(
-                        "[snapshot] 警告：snap.items.len()={}，仅解析出 {} 条 ChatMessage（其余因未知 item_type 被忽略，见上方日志）",
-                        snap.items.len(),
-                        restored.len()
+                        "[snapshot] 警告：snap.items.len()={} 但解析出 0 条 ChatMessage（未知 item_type？）",
+                        snap.items.len()
                     ));
                 }
                 if !restored.is_empty() {
+                    let restored_len = restored.len();
                     // ── Full state reconciliation (Claude/Codex-style attach) ─
                     //
                     // The snapshot represents a complete UI snapshot — not
@@ -402,6 +582,16 @@ impl GrodexTui {
                     // cleanly to a simple replace.
                     let mut local_messages: Vec<crate::ui::state::ChatMessage> =
                         std::mem::take(&mut self.state.messages);
+                    if !local_messages.is_empty() {
+                        // Drop ephemeral System log messages (e.g. the
+                        // stale "[resume] 正在恢复会话…" toast emitted when
+                        // the command was issued). Keeping them would pin
+                        // the toast BELOW the restored history — it then
+                        // looks like resume fires again after finishing.
+                        local_messages.retain(|m| {
+                            !matches!(m, crate::ui::state::ChatMessage::System { .. })
+                        });
+                    }
                     if local_messages.is_empty() {
                         // Fast path (common): clean attach with no prior
                         // local state. Since we're replacing the messages
@@ -439,6 +629,14 @@ impl GrodexTui {
                     // assistant / tool 输出，与 codex attach 体验一致。
                     self.state.scroll_follow_bottom = true;
                     self.state.scroll_conversation = u16::MAX;
+                    // Completion toast — replaces the stale "正在恢复会话…"
+                    // line dropped above, so the user gets one clear
+                    // confirmation at the bottom of the restored history.
+                    self.state.push_log(format!(
+                        "[resume] 已恢复 {} 条历史消息（会话 {}）",
+                        restored_len,
+                        snap.session_id
+                    ));
                 } else {
                     // Previously silent. If a snapshot *claimed* to have
                     // items but 0 produced ChatMessages, we yell about it
@@ -448,6 +646,53 @@ impl GrodexTui {
                         "[snapshot] 警告：items.len()={}，但 restored=0 → 没有解析出任何可显示的聊天消息，请检查 agent 发送的 item_type",
                         snap.items.len()
                     ));
+                }
+            }
+
+            // ── 暂存箭头键超时还原：窗口内没有后续箭头键跟随，说明是真实按键（不是滚轮），
+            // 放入待派发队列，下一轮迭代按原顺序消费。
+            if !self.held_arrows.is_empty()
+                && self
+                    .arrow_last_at
+                    .is_some_and(|t| t.elapsed() > ARROW_BURST_WINDOW)
+            {
+                self.queued_keys.extend(self.held_arrows.drain(..));
+                self.arrow_burst = 0;
+                self.arrow_last_at = None;
+                self.burst_confirmed = false;
+                self.burst_started_at = None;
+            }
+
+            // ── 滚轮手势限流应用：把突发箭头键累计量折算成滚动行数。两层阻尼防止“手离开触控板后还在跑”：
+            // 1）窗口限速：每 WHEEL_WINDOW_MS 最多应用 WHEEL_WINDOW_MAX 行，溢出丢弃；
+            // 2）手势封顶：单个手势总滚动量 ≤ WHEEL_GESTURE_MAX 行，封顶后剩余惯性事件全部丢弃，
+            // 停顿超过 WHEEL_GESTURE_GAP 再滑视为新手势。方向用带符号累计，反向滑动立即抵消。
+            if self.wheel_accum != 0 {
+                let now = std::time::Instant::now();
+                if now.duration_since(self.wheel_last_apply)
+                    >= Duration::from_millis(WHEEL_WINDOW_MS)
+                {
+                    self.wheel_last_apply = now;
+                    let mut step = self
+                        .wheel_accum
+                        .clamp(-(WHEEL_WINDOW_MAX as i32), WHEEL_WINDOW_MAX as i32);
+                    let remaining = WHEEL_GESTURE_MAX as i32 - self.gesture_lines as i32;
+                    if remaining <= 0 {
+                        step = 0;
+                    } else {
+                        step = step.clamp(-remaining, remaining);
+                    }
+                    self.wheel_accum = 0;
+                    if step != 0 {
+                        self.gesture_lines += step.unsigned_abs();
+                        for _ in 0..step.unsigned_abs() {
+                            if step > 0 {
+                                self.state.scroll_down(None);
+                            } else {
+                                self.state.scroll_up();
+                            }
+                        }
+                    }
                 }
             }
 
@@ -482,24 +727,116 @@ impl GrodexTui {
             // 10ms is fine and saves CPU. Previously the fixed 10ms timeout
             // added noticeable latency to each streaming chunk.
             let poll_ms = if self.state.is_streaming() { 1 } else { 10 };
-            // 参考 grok event_loop.rs:1472-1517：poll/read 错误不能直接 ? 退出，
-            // 否则 VTE 终端 / macOS Terminal.app 鼠标滚轮产生的序列被 crossterm
-            // 解析失败时，? 会传播错误导致整个 TUI 直接关闭。
-            // grok 的做法是跳过错误继续，只在连续 50 次错误后才放弃。
-            let poll_ok = event::poll(Duration::from_millis(poll_ms)).unwrap_or(false);
-            if !poll_ok {
-                continue;
-            }
-            let ev = match event::read() {
-                Ok(ev) => ev,
-                Err(e) => {
-                    // 跳过解析错误（垃圾序列、不完整鼠标事件等），不杀 TUI。
-                    self.state.push_log(format!("[crossterm] 事件读取错误（已跳过）：{e}"));
+            // 优先消费突发识别还原的待派发按键，其次才从终端读新事件。
+            let ev: CrosstermEvent = if let Some(k) = self.queued_keys.pop_front() {
+                // 队列里是突发识别还原的真实按键：本迭代直接派发，不再参与检测。
+                self.queued_dispatch = true;
+                CrosstermEvent::Key(k)
+            } else {
+                // 参考 grok event_loop.rs:1472-1517：poll/read 错误不能直接 ? 退出，
+                // 否则 VTE 终端 / macOS Terminal.app 鼠标滚轮产生的序列被 crossterm
+                // 解析失败时，? 会传播错误导致整个 TUI 直接关闭。
+                // grok 的做法是跳过错误继续，只在连续 50 次错误后才放弃。
+                let poll_ok = event::poll(Duration::from_millis(poll_ms)).unwrap_or(false);
+                if !poll_ok {
                     continue;
+                }
+                match event::read() {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        // 跳过解析错误（垃圾序列、不完整鼠标事件等），不杀 TUI。
+                        self.state.push_log(format!("[crossterm] 事件读取错误（已跳过）：{e}"));
+                        continue;
+                    }
                 }
             };
             match ev {
                     CrosstermEvent::Key(key) => {
+                        // 待派发队列还原的按键直接派发，跳过突发检测（防止重复计数死循环）。
+                        let bypass_burst = self.queued_dispatch;
+                        self.queued_dispatch = false;
+                        // ── 触控板滚轮突发识别（不捕获鼠标，参考 codex）──
+                        // DECSET 1007 把滚轮翻译成 ↑/↓：触控板一划会在几十毫秒内爆发大量箭头键，
+                        // 而人手按键（含长按重复）最快也只有 ~30Hz。短窗口内 ≥ 阈值个裸箭头键判为
+                        // 滚轮手势 → 只累加进 wheel_accum 滚动正文，不进 handle_key：
+                        //   · 不会误改 slash 菜单 / 审批的选中项（选择只认真实按键）；
+                        //   · 不会误触发输入历史导航；
+                        //   · 经限流封顶后，轻轻一划不会一直跑。
+                        // 突发确认前的箭头键先暂存不派发，超时还原为真实按键，
+                        // 避免滚轮手势的前几个箭头键误触发选择/历史导航。
+                        if !bypass_burst {
+                        let is_plain_arrow = matches!(
+                            key.code,
+                            crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Down
+                        ) && key.modifiers == crossterm::event::KeyModifiers::NONE
+                            && !matches!(key.kind, crossterm::event::KeyEventKind::Release);
+                        if is_plain_arrow {
+                            let now = std::time::Instant::now();
+                            let gap = self.arrow_last_at.map(|t| now.duration_since(t));
+                            let within = gap.is_some_and(|d| d <= ARROW_BURST_WINDOW);
+                            // 惯性延续：手势已确认、距上一个箭头事件在延续窗口内、且手势总时长未超限。
+                            // 触控板惯性尾部间隔会衰减到几百 ms，窗口沿箭头事件自延长，
+                            // 直到彻底静默超过 CONTINUE 才认定手势结束、真实方向键才重新生效。
+                            // 注意：不能只因为间隔落在 (60, 700]ms 就重置 burst_confirmed，
+                            // 否则稀疏尾部箭头会交替泄漏成真实按键 → 审批/菜单选择“延迟移动”。
+                            let continuing = self.burst_confirmed
+                                && gap.is_some_and(|d| d <= ARROW_BURST_CONTINUE)
+                                && self
+                                    .burst_started_at
+                                    .is_some_and(|t| now.duration_since(t) <= ARROW_GESTURE_MAX_DUR);
+                            self.arrow_last_at = Some(now);
+                            if continuing {
+                                if matches!(key.code, crossterm::event::KeyCode::Up) {
+                                    self.add_wheel(-2);
+                                } else {
+                                    self.add_wheel(2);
+                                }
+                                continue;
+                            }
+                            if !within {
+                                // 彻底静默超过延续窗口（或此前没有箭头事件）：上一个手势已确定结束，
+                                // 暂存箭头是真实按键，还原派发。
+                                self.queued_keys.extend(self.held_arrows.drain(..));
+                                self.arrow_burst = 0;
+                                self.burst_confirmed = false;
+                                self.burst_started_at = None;
+                            }
+                            self.arrow_burst += 1;
+                            if self.arrow_burst >= ARROW_BURST_THRESHOLD {
+                                // 突发确认：暂存的箭头键也是滚轮手势的一部分，全部丢弃；
+                                // 当前键也丢弃，只累加滚动量（经限流窗口应用）。
+                                self.burst_confirmed = true;
+                                if self.burst_started_at.is_none() {
+                                    self.burst_started_at = Some(now);
+                                }
+                                self.held_arrows.clear();
+                                if matches!(key.code, crossterm::event::KeyCode::Up) {
+                                    self.add_wheel(-2);
+                                } else {
+                                    self.add_wheel(2);
+                                }
+                                continue;
+                            }
+                            // 尚不能确认：暂存当前箭头键，等后续事件判定。
+                            self.held_arrows.push(key);
+                            continue;
+                        }
+                        // 非箭头键：先把暂存箭头键还原为真实按键（排在当前键之前，
+                        // 保持顺序），下一轮迭代起逐个派发。
+                        if !self.held_arrows.is_empty() {
+                            self.queued_keys.extend(self.held_arrows.drain(..));
+                            self.queued_keys.push_back(key);
+                            self.arrow_burst = 0;
+                            self.arrow_last_at = None;
+                            self.burst_confirmed = false;
+                            self.burst_started_at = None;
+                            continue;
+                        }
+                        self.arrow_burst = 0;
+                        self.arrow_last_at = None;
+                        self.burst_confirmed = false;
+                        self.burst_started_at = None;
+                        }
                         let action = handle_key(key, &mut self.state);
                         if let Some(action) = action {
                             match action {
@@ -507,6 +844,8 @@ impl GrodexTui {
                             TuiAction::SubmitPrompt { text } => {
                                 // Show user message in chat view immediately.
                                 self.state.push_user_message(&text);
+                                // 记入输入历史，供 ↑/↓ 自动填充。
+                                self.state.record_input_history(&text);
                                 // Reset cancel flag for the new turn.
                                 self.state.cancel_sent = false;
                                 let sid = self
@@ -573,6 +912,7 @@ impl GrodexTui {
                             TuiAction::SwitchApprovalSelection(_) => {}
                             TuiAction::ToggleMode(_) => {}
                             TuiAction::ToggleThinkingExpansion => {}
+                            TuiAction::ToggleSubagentExpansion => {}
                             TuiAction::CopyLastAssistant => {
                                 // Walk messages in reverse and grab the
                                 // most-recent Assistant text. If the
@@ -750,13 +1090,6 @@ impl GrodexTui {
                                         self.state.input_cursor = 0;
                                         self.state.recompute_slash_menu();
                                     }
-                                    SlashLocalKind::Mouse { .. } => {
-                                        // 不再捕获鼠标，改用 DECSET 1007 alternate scroll mode。
-                                        // 滚轮和文本选择始终同时可用，无需切换。
-                                        self.state.push_log(
-                                            "鼠标模式（始终可用，无需切换）：\n  · 滚轮上下滑动 → 滚动对话（终端翻译为方向键）\n  · 鼠标拖拽选中文本 → 终端原生处理\n  · 右键复制 → 终端原生处理\n  · 键盘 j/k 或 Ctrl-PageUp/Down 也可滚动".to_string()
-                                        );
-                                    }
                                     SlashLocalKind::Help => {
                                         let _ = args;
                                         let help = concat!(
@@ -777,7 +1110,6 @@ impl GrodexTui {
 "  /exit /quit /q         退出 TUI\n",
 "  /delete /clear         清空当前会话聊天记录\n",
 "  /reset                 清空当前输入框（会话记录保留）\n",
-"  /mouse                 显示鼠标模式（滚轮+选择始终同时可用）\n",
 "  /help /? /welcome      显示本帮助\n",
 "\n",
 "会话/ACP 命令 ◈（本地占位，绝不发送给 LLM）：\n",
@@ -879,8 +1211,7 @@ impl GrodexTui {
                                             } else {
                                                 self.state.session_id = Some(sid.to_string());
                                                 self.state.push_log(format!(
-                                                    "[ACP] 已发送 ResumeSession → {sid_str}\n\
-                                                     ReplayMode = SnapshotThenLive，若后端持有该 session，会通过 Event 流重放历史 turn。"
+                                                    "[resume] 正在恢复会话 {sid_str}…"
                                                 ));
                                             }
                                         }
@@ -1003,13 +1334,20 @@ impl GrodexTui {
                                             match m {
                                                 ui::state::ChatMessage::User { text } |
                                                 ui::state::ChatMessage::Assistant { text, .. } |
-                                                ui::state::ChatMessage::Thinking { text, .. } |
                                                 ui::state::ChatMessage::System { text, .. }
                                                     => text.split_whitespace().count(),
-                                                ui::state::ChatMessage::Tool { args, result, .. }
+                                                ui::state::ChatMessage::Thinking { segments, .. }
+                                                    => segments.iter().map(|s| match s {
+                                                        ui::state::ThinkingSegment::Text(t) => t.split_whitespace().count(),
+                                                        ui::state::ThinkingSegment::Tool(c) => {
+                                                            c.args.split_whitespace().count()
+                                                                + c.result.as_ref().map(|r| r.split_whitespace().count()).unwrap_or(0)
+                                                        }
+                                                    }).sum(),
+                                                ui::state::ChatMessage::Subagent { task_preview, lines, .. }
                                                     => {
-                                                        args.split_whitespace().count()
-                                                            + result.as_ref().map(|r| r.split_whitespace().count()).unwrap_or(0)
+                                                        task_preview.split_whitespace().count()
+                                                            + lines.iter().map(|l| l.split_whitespace().count()).sum::<usize>()
                                                     }
                                             }
                                         }).sum();
@@ -1800,16 +2138,37 @@ impl GrodexTui {
                                                 let searchable: String = match m {
                                                     ui::state::ChatMessage::User { text } => text.clone(),
                                                     ui::state::ChatMessage::Assistant { text, .. } => text.clone(),
-                                                    ui::state::ChatMessage::Thinking { text, .. } => text.clone(),
+                                                    ui::state::ChatMessage::Thinking { segments, .. } => {
+                                                        let mut buf = String::new();
+                                                        for s in segments {
+                                                            match s {
+                                                                ui::state::ThinkingSegment::Text(t) => {
+                                                                    buf.push_str(t);
+                                                                    buf.push(' ');
+                                                                }
+                                                                ui::state::ThinkingSegment::Tool(c) => {
+                                                                    buf.push_str(&c.name);
+                                                                    buf.push(' ');
+                                                                    buf.push_str(&c.args);
+                                                                    if let Some(r) = &c.result {
+                                                                        buf.push(' ');
+                                                                        buf.push_str(r);
+                                                                    }
+                                                                    buf.push(' ');
+                                                                }
+                                                            }
+                                                        }
+                                                        buf
+                                                    }
                                                     ui::state::ChatMessage::System { text, .. } => text.clone(),
-                                                    ui::state::ChatMessage::Tool { name, args, result, .. } => {
-                                                        let mut buf = String::with_capacity(name.len() + args.len() + 8);
-                                                        buf.push_str(name);
+                                                    ui::state::ChatMessage::Subagent { label, task_preview, lines, .. } => {
+                                                        let mut buf = String::with_capacity(label.len() + task_preview.len() + 8);
+                                                        buf.push_str(label);
                                                         buf.push(' ');
-                                                        buf.push_str(args);
-                                                        if let Some(r) = result {
+                                                        buf.push_str(task_preview);
+                                                        for l in lines {
                                                             buf.push(' ');
-                                                            buf.push_str(r);
+                                                            buf.push_str(l);
                                                         }
                                                         buf
                                                     }
@@ -2060,23 +2419,22 @@ impl GrodexTui {
                                                     let p: String = text.chars().take(80).collect();
                                                     format!("       [ AST] msg[{i:<3}] {p}")
                                                 }
-                                                ui::state::ChatMessage::Thinking { text, .. } => {
-                                                    let p: String = text.chars().take(80).collect();
-                                                    format!("       [THNK] msg[{i:<3}] {p}")
-                                                }
-                                                ui::state::ChatMessage::Tool { name, args, result, is_error, .. } => {
-                                                    let tag = if *is_error { " T✗" } else { "TOOL" };
-                                                    let combined = if let Some(r) = result {
-                                                        format!("({name}) args={args:?} out={r:?}")
-                                                    } else {
-                                                        format!("({name}) args={args:?}")
-                                                    };
-                                                    let p: String = combined.chars().take(80).collect();
-                                                    format!("       [{tag:>4}] msg[{i:<3}] {p}")
+                                                ui::state::ChatMessage::Thinking { segments, .. } => {
+                                                    let tools = segments.iter().filter(|s| matches!(s, ui::state::ThinkingSegment::Tool(_))).count();
+                                                    let chars: usize = segments.iter().map(|s| match s {
+                                                        ui::state::ThinkingSegment::Text(t) => t.chars().count(),
+                                                        ui::state::ThinkingSegment::Tool(_) => 0,
+                                                    }).sum();
+                                                    format!("       [THNK] msg[{i:<3}] segs={} tools={tools} chars={chars}", segments.len())
                                                 }
                                                 ui::state::ChatMessage::System { text, is_error } => {
                                                     let tag = if *is_error { "SYS✗" } else { " SYS" };
                                                     let p: String = text.chars().take(80).collect();
+                                                    format!("       [{tag:>4}] msg[{i:<3}] {p}")
+                                                }
+                                                ui::state::ChatMessage::Subagent { label, done, ok, lines, .. } => {
+                                                    let tag = if !*done { "SUB▶" } else if *ok { "SUB✓" } else { "SUB✗" };
+                                                    let p: String = format!("({label}) {} steps", lines.len()).chars().take(80).collect();
                                                     format!("       [{tag:>4}] msg[{i:<3}] {p}")
                                                 }
                                             };
@@ -2205,15 +2563,6 @@ impl GrodexTui {
                                             ));
                                         }
                                     }
-                                    SlashLocalKind::AcpToggleMouse => {
-                                        self.state.push_log(format!(
-                                            "🖱️  toggle-mouse-reporting {args:?}（本地）\n━━━━━━━━━━━━━━━━━━\n\
-                                             · crossterm 本身支持 mouse event（MouseDown/Up/Scroll/Drag），TUI 的 scroll_up/down 已接入滚轮事件（一次滚 3 行）。\n\
-                                             · 完整 mouse reporting = 允许点击跳转审批、拖动输入框大小等。当前未完整绑定交互回调。\n\
-                                             · 若要临时开启：修改 crossterm Terminal 初始化时 enable_mouse_capture() 即可。\n\
-                                             · ACP ToggleMouse 帧接入后将支持：客户端发状态 → 后端按鼠标事件模拟 keystroke。"
-                                        ));
-                                    }
                                     SlashLocalKind::AcpPrivacy => {
                                         use std::path::Path;
                                         let arg = args.trim().to_lowercase();
@@ -2293,12 +2642,22 @@ impl GrodexTui {
                                             Some(ed) => {
                                                 // 取当前输入框内容作为 seed
                                                 let seed = self.state.draft_text();
-                                                let tmp = std::env::temp_dir().join(format!("grodex-prompt-{}.md",
-                                                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
+                                                // 文件名：秒级时间戳 + PID + 纳秒随机后缀，避免同一秒内两次编辑互相覆盖。
+                                                let ts = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default();
+                                                let tmp = std::env::temp_dir().join(format!(
+                                                    "grodex-prompt-{}-{}-{}.md",
+                                                    ts.as_secs(),
+                                                    std::process::id(),
+                                                    ts.subsec_nanos()
+                                                ));
                                                 if let Err(e) = std::fs::write(&tmp, &seed) {
                                                     self.state.push_log(format!("✗ 写临时草稿失败：{e}"));
                                                 } else {
-                                                    match std::process::Command::new(&ed).arg(&tmp).status() {
+                                                    // 无论编辑器成功/失败/启动失败/读回失败，临时文件都统一清理，
+                                                    // 不再只在“成功+读回成功”单一路径上删除。
+                                                    let outcome = match std::process::Command::new(&ed).arg(&tmp).status() {
                                                         Ok(st) if st.success() => {
                                                             match std::fs::read_to_string(&tmp) {
                                                                 Ok(new_text) => {
@@ -2307,17 +2666,25 @@ impl GrodexTui {
                                                                     let n_old = seed.chars().count();
                                                                     let n_new = cleaned.chars().count();
                                                                     self.state.set_draft_text(cleaned);
-                                                                    let _ = std::fs::remove_file(&tmp);
-                                                                    self.state.push_log(format!(
-                                                                        "✓ 草稿已回填：{n_old} → {n_new} 字符（临时文件已删）。\n\
+                                                                    Ok(format!(
+                                                                        "✓ 草稿已回填：{n_old} → {n_new} 字符。\n\
                                                                          现在输入框中就是编辑后的内容，按 Enter 发送。\n编辑器：{ed}"
-                                                                    ));
+                                                                    ))
                                                                 }
-                                                                Err(e) => self.state.push_log(format!("✗ 读回填文件失败：{e}")),
+                                                                Err(e) => Err(format!("✗ 读回填文件失败：{e}")),
                                                             }
                                                         }
-                                                        Ok(st) => self.state.push_log(format!("编辑器 {ed} 非零退出 {st:?}，保持原草稿不变。临时文件：{}", tmp.display())),
-                                                        Err(e) => self.state.push_log(format!("✗ 启动编辑器 {ed} 失败：{e}")),
+                                                        Ok(st) => Err(format!("编辑器 {ed} 非零退出 {st:?}，保持原草稿不变。")),
+                                                        Err(e) => Err(format!("✗ 启动编辑器 {ed} 失败：{e}")),
+                                                    };
+                                                    if let Err(e) = std::fs::remove_file(&tmp) {
+                                                        self.state.push_log(format!(
+                                                            "[edit-prompt] 临时文件删除失败 {}: {e}",
+                                                            tmp.display()
+                                                        ));
+                                                    }
+                                                    match outcome {
+                                                        Ok(msg) | Err(msg) => self.state.push_log(msg),
                                                     }
                                                 }
                                             }
@@ -2353,11 +2720,38 @@ impl GrodexTui {
                                         let trust = if self.state.workspace_trusted { "trusted ⚠" } else { "untrusted ✓" };
                                         self.state.push_log(format!(
                                             "📊 仪表板 Dashboard（本地）\n━━━━━━━━━━━━━━━━━━\n\
-                                             会话\n  标题      : {title}\n  session_id: {sid}\n  turn 数   : {turns}\n  gen       : G={capability_gen}\n\
-                                             资源\n  provider  : {prov}\n  model     : {model}\n  trust     : {trust}\n  cwd       : {cwd}\n\
-                                             实时\n  messages  : {msgs}\n  events    : {evs}\n  tools     : {tools}\n  approvals  : {appr} (pending)\n\
-                                             模式开关\n  always-approve : {aa}\n  yolo / auto    : {yolo}\n  compact-ui     : {compact}\n  timestamps     : {ts}\n  tasks          : {tasks_done}/{tasks_total}\n\
-                                             快捷入口\n  /info       同当前视图（更简洁版）\n  /doctor     环境自检\n  /debug      TUI 运行时诊断日志\n  /timeline   turn 时间线\n\n\
+                                             会话
+  标题      : {title}
+  session_id: {sid}
+  turn 数   : {turns}
+  gen       : G={capability_gen}
+\
+                                             资源
+  provider  : {prov}
+  model     : {model}
+  trust     : {trust}
+  cwd       : {cwd}
+\
+                                             实时
+  messages  : {msgs}
+  events    : {evs}
+  tools     : {tools}
+  approvals  : {appr} (pending)
+\
+                                             模式开关
+  always-approve : {aa}
+  yolo / auto    : {yolo}
+  compact-ui     : {compact}
+  timestamps     : {ts}
+  tasks          : {tasks_done}/{tasks_total}
+\
+                                             快捷入口
+  /info       同当前视图（更简洁版）
+  /doctor     环境自检
+  /debug      TUI 运行时诊断日志
+  /timeline   turn 时间线
+
+\
                                              说明：ACP Dashboard 帧接入后会替换为远端聚合（全局会话量、token usage、credential 租约健康度、rollout 进度）。\nargs={args:?}"
                                         ));
                                     }
@@ -2460,7 +2854,11 @@ impl GrodexTui {
                                         let model = if self.state.model_label.is_empty()    { "<未配置>" } else { self.state.model_label.as_str() };
                                         let mut out = format!(
                                             "🧠 Grodex 模型列表 models（本地）\n━━━━━━━━━━━━━━━━━━\n\
-                                             当前 provider : {prov}\n 当前 model    : {model}\n\n常见供应商模型名（仅参考，实际可用性以你的 API Key 权限为准）：\n"
+                                             当前 provider : {prov}
+ 当前 model    : {model}
+
+常见供应商模型名（仅参考，实际可用性以你的 API Key 权限为准）：
+"
                                         );
                                         match prov.to_ascii_lowercase().as_str() {
                                             "deepseek" => {
@@ -2651,10 +3049,19 @@ impl GrodexTui {
                             }
                         }
                     }
-                    // 不处理 Mouse 事件：不捕获鼠标（用 DECSET 1007 alternate
-                    // scroll mode 让滚轮变成方向键），终端原生的文本选择和滚
-                    // 轮滚动同时可用。参考 codex-rs tui/src/tui/event_stream.rs
-                    // 第 250-286 行：mouse events 被 `_ => None` 显式丢弃。
+                    CrosstermEvent::Mouse(me) => {
+                        // 默认不捕获鼠标（对齐 codex）：滚轮走 DECSET 1007 翻译成方向键，
+                        // 由上方 Key 分支的突发识别处理。唯一例外是 macOS Terminal.app（不支持 1007）：
+                        // 只在那里开了鼠标上报，此时只消费滚轮事件，点击/拖拽一律忽略。
+                        if self.mouse_capture {
+                            use crossterm::event::MouseEventKind;
+                            match me.kind {
+                                MouseEventKind::ScrollUp => self.add_wheel(-2),
+                                MouseEventKind::ScrollDown => self.add_wheel(2),
+                                _ => {}
+                            }
+                        }
+                    }
                     _ => {}
                 }
         }
@@ -3020,47 +3427,60 @@ fn export_conversation_md(state: &ui::state::TuiAppState) -> Result<std::path::P
                 writeln!(f, "{}", if text.is_empty() { "_（空）_" } else { text.as_str() })?;
                 writeln!(f)?;
             }
-            ui::state::ChatMessage::Thinking { text, done } => {
+            ui::state::ChatMessage::Thinking { segments, done } => {
                 writeln!(f, "## Thinking [{i}]{}", if *done { "" } else { " (streaming)" })?;
                 writeln!(f)?;
-                if text.is_empty() {
+                if segments.is_empty() {
                     writeln!(f, "> _（空）_")?;
-                } else {
-                    for line in text.split('\n') {
-                        writeln!(f, "> {line}")?;
+                }
+                for seg in segments {
+                    match seg {
+                        ui::state::ThinkingSegment::Text(text) => {
+                            if text.is_empty() {
+                                writeln!(f, "> _（空）_")?;
+                            } else {
+                                for line in text.split('\n') {
+                                    writeln!(f, "> {line}")?;
+                                }
+                            }
+                        }
+                        ui::state::ThinkingSegment::Tool(card) => {
+                            let status = match (card.done, card.has_result, card.is_error) {
+                                (_, true, true)  => "Tool ✗",
+                                (_, true, false) => "Tool ✓",
+                                (true, false, _) => "Tool ⏳",
+                                (false, _, _)    => "Tool 🟡",
+                            };
+                            writeln!(f, "> **{status}: `{}`**", card.name)?;
+                            if let Some(cid) = &card.call_id { writeln!(f, "> call_id: `{cid}`")?; }
+                            if !card.args.is_empty() {
+                                writeln!(f, "> args: `{}`", card.args)?;
+                            }
+                            if let Some(r) = &card.result {
+                                for line in r.split('\n') {
+                                    writeln!(f, "> │ {line}")?;
+                                }
+                            }
+                        }
                     }
                 }
                 writeln!(f)?;
             }
-            ui::state::ChatMessage::Tool { name, call_id, args, result, is_error, done, has_result, started_at: _, finished_at: _ } => {
-                let status = match (*done, *has_result, *is_error) {
-                    (_, true, true)  => "Tool ✗",
-                    (_, true, false) => "Tool ✓",
-                    (true, false, _) => "Tool ⏳",
-                    (false, _, _)    => "Tool 🟡",
-                };
-                writeln!(f, "### {status}: `{name}` [{i}]")?;
-                if let Some(cid) = call_id { writeln!(f, "- call_id: `{cid}`")?; }
-                writeln!(f, "- state: done={done} has_result={has_result}")?;
-                writeln!(f)?;
-                if !args.is_empty() {
-                    writeln!(f, "**args:**")?;
-                    writeln!(f, "```json")?;
-                    writeln!(f, "{args}")?;
-                    writeln!(f, "```")?;
-                    writeln!(f)?;
-                }
-                if let Some(r) = result {
-                    writeln!(f, "**result:**")?;
-                    writeln!(f, "```")?;
-                    writeln!(f, "{r}")?;
-                    writeln!(f, "```")?;
-                    writeln!(f)?;
-                }
-            }
             ui::state::ChatMessage::System { text, is_error } => {
                 let tag = if *is_error { "System ✗" } else { "System" };
                 writeln!(f, "> **{tag}** [{i}]: {text}")?;
+                writeln!(f)?;
+            }
+            ui::state::ChatMessage::Subagent { label, task_preview, lines, done, ok, started_at: _, finished_at: _, .. } => {
+                let status = if !*done { "Subagent ▶" } else if *ok { "Subagent ✓" } else { "Subagent ✗" };
+                writeln!(f, "### {status}: `{label}` [{i}]")?;
+                if !task_preview.is_empty() {
+                    writeln!(f, "- task: {task_preview}")?;
+                }
+                writeln!(f)?;
+                for l in lines {
+                    writeln!(f, "> {l}")?;
+                }
                 writeln!(f)?;
             }
         }

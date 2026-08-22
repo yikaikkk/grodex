@@ -591,6 +591,54 @@ pub fn replay_journal_strict(
     Ok(out)
 }
 
+/// Stream raw journal lines (one per event, in physical append order)
+/// to `f`, starting from the first line. Unlike [`replay_journal_strict`]
+/// this does NOT parse the events — the caller decides per line whether a
+/// full `serde_json` parse is worth it.
+///
+/// Motivation: `ContextRestored` events snapshot the ENTIRE restored
+/// context (tens of MB on long sessions) and are redundant when replaying
+/// a journal that also contains the original events. Callers rebuilding
+/// state via `SessionReducer` can detect that redundancy from the reduced
+/// state and skip parsing those multi-MB payloads entirely, turning a
+/// multi-hundred-MB parse into a cheap byte scan.
+///
+/// Empty lines fail closed with `JournalCorrupt`, matching
+/// [`replay_journal_strict`].
+pub fn for_each_journal_line(
+    jsonl_path: &Path,
+    mut f: impl FnMut(&str) -> Result<(), GrodexError>,
+) -> Result<(), GrodexError> {
+    use std::io::{BufRead, BufReader};
+
+    if !jsonl_path.exists() {
+        return Ok(());
+    }
+    let file = File::open(jsonl_path).map_err(|e| {
+        GrodexError::Internal(anyhow::anyhow!(
+            "replay: cannot open journal {:?}: {e}",
+            jsonl_path
+        ))
+    })?;
+    let reader = BufReader::new(file);
+    for (line_no, line_res) in reader.lines().enumerate() {
+        let line = line_res.map_err(|e| GrodexError::JournalCorrupt {
+            path: jsonl_path.to_string_lossy().into_owned(),
+            line: line_no as u64,
+            reason: format!("io error reading line: {e}"),
+        })?;
+        if line.trim().is_empty() {
+            return Err(GrodexError::JournalCorrupt {
+                path: jsonl_path.to_string_lossy().into_owned(),
+                line: line_no as u64,
+                reason: "empty line in journal".into(),
+            });
+        }
+        f(&line)?;
+    }
+    Ok(())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]

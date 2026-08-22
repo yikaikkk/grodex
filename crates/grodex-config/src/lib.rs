@@ -19,7 +19,7 @@ pub mod values;
 pub use error::ConfigError;
 pub use generation::{ConfigGeneration, LoadedConfig};
 pub use layer::{ConfigLayer, ConfigLayerSource, MergeTrace};
-pub use loader::ConfigPaths;
+pub use loader::{expand_user_path, ConfigPaths};
 pub use migration::{migrate, MigrationResult, CURRENT_SCHEMA_VERSION};
 pub use resolver::ConfigResolver;
 pub use trust::WorkspaceTrustBinding;

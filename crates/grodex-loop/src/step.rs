@@ -31,6 +31,10 @@ pub struct TurnOutcome {
     pub steps: Vec<StepResult>,
     pub final_text: String,
     pub usage: Option<SettledUsage>,
+    /// True when the turn ended because the per-turn step budget was
+    /// exhausted (a wrap-up summary was forced) instead of a natural
+    /// model stop. Lets the supervisor surface a visible notice.
+    pub steps_exhausted: bool,
 }
 
 /// Executes sampling steps with tool call handling.
@@ -73,6 +77,7 @@ impl StepRunner {
         let mut context = initial_context.to_vec();
         let mut steps = Vec::new();
         let max_steps = 10;
+        let mut finished = false;
 
         for _ in 0..max_steps {
             // ── Compaction check ──────────────────────────────────────
@@ -150,6 +155,7 @@ impl StepRunner {
             }
 
             if is_terminal {
+                finished = true;
                 break;
             }
         }
@@ -163,6 +169,7 @@ impl StepRunner {
                 .to_string(),
             usage: steps.last().and_then(|s| s.usage.clone()),
             steps,
+            steps_exhausted: !finished,
         }
     }
 
@@ -184,12 +191,35 @@ impl StepRunner {
                 };
             }
             PermissionResult::ApprovalRequired { decision_rx, .. } => {
-                match tokio::time::timeout(std::time::Duration::from_secs(5), decision_rx).await {
+                // Wait up to 5 minutes for user approval. The previous
+                // 5-second timeout was far too aggressive: the TUI needs
+                // time to render the approval card, the user needs to
+                // read the tool call details, and stdio transport adds
+                // backpressure latency. 5 minutes matches the UX of
+                // Codex / Claude Code where approvals never time out
+                // during normal interactive use.
+                match tokio::time::timeout(std::time::Duration::from_secs(300), decision_rx).await {
                     Ok(Ok(decision)) if decision.permits_execution() => {}
-                    _ => {
+                    Ok(Ok(_decision)) => {
+                        // User explicitly denied.
                         return ContextItem::ToolResult {
                             call_id: cid,
-                            content: "Approval timeout".into(),
+                            content: "Denied by user".into(),
+                            is_error: true,
+                        };
+                    }
+                    Ok(Err(_)) => {
+                        // Channel dropped — permission manager shut down.
+                        return ContextItem::ToolResult {
+                            call_id: cid,
+                            content: "Approval channel closed".into(),
+                            is_error: true,
+                        };
+                    }
+                    Err(_) => {
+                        return ContextItem::ToolResult {
+                            call_id: cid,
+                            content: "Approval timeout (5 min)".into(),
                             is_error: true,
                         };
                     }

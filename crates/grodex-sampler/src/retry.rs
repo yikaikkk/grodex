@@ -130,6 +130,15 @@ pub fn classify_error(
         return RetryDecision::Fatal(err.clone_error());
     }
 
+    // Step 2.5: Semantic commit fence. Once any semantic content (text /
+    // tool-call start) has been streamed to the caller, a retry or
+    // failover would duplicate or silently replace already-visible
+    // output. Fail fast — Turn-level recovery decides what to do with
+    // the partial content.
+    if progress.has_crossed_semantic_fence() {
+        return RetryDecision::Fatal(err.clone_error());
+    }
+
     // Step 3: Check retry budget.
     if budget.max_attempts == 0 || attempt >= budget.max_attempts {
         // Budget exhausted.
@@ -370,6 +379,22 @@ mod tests {
         let d = retry_backoff(10);
         let ms = d.as_millis() as u64;
         assert!(ms >= 24000 && ms <= 36000, "got {ms}ms");
+    }
+
+    #[test]
+    fn retryable_error_after_fence_is_fatal() {
+        // After the semantic fence, even normally-retryable transport
+        // errors must not be retried (would duplicate streamed content).
+        let err = SamplingError::transport("stream cut", Some(TransportSource::Connect));
+        let decision = classify_error(&err, 0, &RetryBudget::default(), progress_fenced());
+        assert!(matches!(decision, RetryDecision::Fatal(_)));
+    }
+
+    #[test]
+    fn rate_limit_after_fence_is_fatal() {
+        let err = SamplingError::rate_limited(Some(5), "slow down");
+        let decision = classify_error(&err, 0, &RetryBudget::default(), progress_fenced());
+        assert!(matches!(decision, RetryDecision::Fatal(_)));
     }
 
     #[test]

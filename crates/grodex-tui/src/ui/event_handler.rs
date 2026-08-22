@@ -43,6 +43,10 @@ pub enum TuiAction {
     /// normal conversation scroll). When collapsed, truncated to
     /// MAX_LINES=12 / MAX_CHARS=1400 with a hint.
     ToggleThinkingExpansion,
+    /// Toggle the expansion of the most-recent Subagent card's
+    /// execution log. Independent of the Thinking panel toggle
+    /// (Ctrl+O); bound to Ctrl+E.
+    ToggleSubagentExpansion,
     /// A slash-command was resolved locally. The main loop applies this
     /// immediately (no round-trip through the agent).
     RunSlashLocal { kind: SlashLocalKind, args: String },
@@ -274,6 +278,10 @@ fn handle_normal(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             state.thinking_expanded = !state.thinking_expanded;
             Some(TuiAction::ToggleThinkingExpansion)
         }
+        (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+            state.subagent_expanded = !state.subagent_expanded;
+            Some(TuiAction::ToggleSubagentExpansion)
+        }
         _ => None,
     }
 }
@@ -453,6 +461,8 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
         }
         // ————— Deletion —————————————————————————————————————————————————
         KeyCode::Backspace => {
+            // 编辑动作：退出历史导航，避免下一次 ↑/↓ 覆盖刚编辑的内容。
+            state.cancel_history_navigation();
             if state.input_cursor > 0 {
                 let cur = state.input_cursor;
                 let mut byte = cur - 1;
@@ -495,11 +505,16 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             None
         }
         KeyCode::Up => {
-            // 单行输入时 ↑ 滚动对话（alternate scroll mode 把滚轮翻译成 ↑/↓）。
-            // 多行输入时 ↑ 移动光标到上一行。
+            // 多行输入：↑ 移动光标到上一行。
+            // 单行输入：优先在输入历史里导航（自动填充之前提交过的输入）；
+            // 历史为空时才回退到滚动对话。触控板滚轮的突发方向键被主循环识别为滚轮手势，不会到达这里。
             let total_lines = state.input_buffer.chars().filter(|c| *c == '\n').count() + 1;
             if total_lines <= 1 {
-                for _ in 0..3 { state.scroll_up(); }
+                if !state.input_history.is_empty() {
+                    state.history_prev();
+                } else {
+                    for _ in 0..3 { state.scroll_up(); }
+                }
                 None
             } else {
                 move_cursor_up(state);
@@ -507,10 +522,15 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             }
         }
         KeyCode::Down => {
-            // 单行输入时 ↓ 滚动对话；多行时移动光标。
+            // 单行输入：优先历史导航（越过最新一条恢复原草稿）；历史为空才滚动。
+            // 多行时移动光标。
             let total_lines = state.input_buffer.chars().filter(|c| *c == '\n').count() + 1;
             if total_lines <= 1 {
-                for _ in 0..3 { state.scroll_down(None); }
+                if state.input_history_cursor.is_some() || !state.input_history.is_empty() {
+                    state.history_next();
+                } else {
+                    for _ in 0..3 { state.scroll_down(None); }
+                }
                 None
             } else {
                 move_cursor_down(state);
@@ -573,6 +593,12 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             state.thinking_expanded = !state.thinking_expanded;
             Some(TuiAction::ToggleThinkingExpansion)
         }
+        // Ctrl-E = toggle Subagent execution-log expansion. Same
+        // rationale as Ctrl-O: works without leaving Prompt mode.
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.subagent_expanded = !state.subagent_expanded;
+            Some(TuiAction::ToggleSubagentExpansion)
+        }
         // Ctrl-N / Ctrl-P = scroll the collapsed Thinking (CoT) block.
         // Only active when the slash menu is closed (the slash-menu
         // capture layer above already handles these when the menu is
@@ -607,6 +633,8 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             }
             insert_at_cursor(&mut state.input_buffer, &mut state.input_cursor,
                 &c.to_string());
+            // 编辑动作：退出历史导航。
+            state.cancel_history_navigation();
             None
         }
         _ => None,
@@ -646,16 +674,6 @@ pub(crate) fn try_parse_local_slash(text: &str) -> Option<(SlashLocalKind, Strin
         return Some((SlashLocalKind::Unsupported, String::new()));
     }
     let args = splitn.next().unwrap_or("").to_string();
-    // Special-case: `/mouse on|off|toggle|''` — the sub-command lives in
-    // `args` and must be encoded inside the `SlashLocalKind::Mouse`
-    // variant itself. BUILTIN_SLASH_COMMANDS still carries a placeholder
-    // Mouse entry (with empty sub) so the menu lists the command; but
-    // dispatch here overrides with a properly-populated variant so the
-    // RunSlashLocal handler actually knows which direction to flip.
-    if name.eq_ignore_ascii_case("mouse") {
-        let sub = args.trim().to_lowercase();
-        return Some((SlashLocalKind::Mouse { sub }, args));
-    }
     for cmd in BUILTIN_SLASH_COMMANDS.iter() {
         if cmd.name.eq_ignore_ascii_case(name) {
             // EVERY recognized command is handled locally — the `Forward`
@@ -1049,5 +1067,94 @@ mod tests {
         handle_prompt(ctrl_u, &mut s);
         assert_eq!(s.input_buffer, " world");
         assert_eq!(s.input_cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_e_toggles_subagent_expansion_independently_of_thinking() {
+        // Prompt mode: Ctrl+E toggles subagent_expanded only.
+        let mut s = TuiAppState::new();
+        s.input_mode = InputMode::Prompt;
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        match handle_prompt(ctrl_e, &mut s) {
+            Some(TuiAction::ToggleSubagentExpansion) => {}
+            other => panic!("expected ToggleSubagentExpansion, got {other:?}"),
+        }
+        assert!(s.subagent_expanded);
+        assert!(!s.thinking_expanded, "Ctrl+E must not touch the Thinking panel");
+
+        // Ctrl+O still toggles Thinking only.
+        match handle_prompt(ctrl_o, &mut s) {
+            Some(TuiAction::ToggleThinkingExpansion) => {}
+            other => panic!("expected ToggleThinkingExpansion, got {other:?}"),
+        }
+        assert!(s.thinking_expanded);
+        assert!(s.subagent_expanded, "Ctrl+O must not touch the Subagent log");
+
+        // Second Ctrl+E collapses again.
+        handle_prompt(ctrl_e, &mut s);
+        assert!(!s.subagent_expanded);
+
+        // Normal mode: same binding via handle_normal.
+        let mut n = TuiAppState::new();
+        n.input_mode = InputMode::Normal;
+        match handle_normal(ctrl_e, &mut n) {
+            Some(TuiAction::ToggleSubagentExpansion) => {}
+            other => panic!("expected ToggleSubagentExpansion, got {other:?}"),
+        }
+        assert!(n.subagent_expanded);
+    }
+
+    #[test]
+    fn up_down_fill_input_history_when_single_line() {
+        let mut s = TuiAppState::new();
+        s.input_mode = InputMode::Prompt;
+        s.record_input_history("first question");
+        s.record_input_history("second question");
+        // 当前正在编辑一份新草稿。
+        s.input_buffer = "draft".into();
+        s.input_cursor = s.input_buffer.len();
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+
+        // ↑ 填充最近一条历史。
+        handle_prompt(up, &mut s);
+        assert_eq!(s.input_buffer, "second question");
+        // ↑ 再往更早一条。
+        handle_prompt(up, &mut s);
+        assert_eq!(s.input_buffer, "first question");
+        // 到顶后再 ↑ 不变。
+        handle_prompt(up, &mut s);
+        assert_eq!(s.input_buffer, "first question");
+        // ↓ 回到较新一条，再 ↓ 越过最新一条恢复原草稿。
+        handle_prompt(down, &mut s);
+        assert_eq!(s.input_buffer, "second question");
+        handle_prompt(down, &mut s);
+        assert_eq!(s.input_buffer, "draft");
+    }
+
+    #[test]
+    fn editing_cancels_history_navigation() {
+        let mut s = TuiAppState::new();
+        s.input_mode = InputMode::Prompt;
+        s.record_input_history("old input");
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_prompt(up, &mut s);
+        assert_eq!(s.input_buffer, "old input");
+        // 输入一个字符 = 编辑动作，退出历史导航。
+        press_char(&mut s, 'x');
+        assert!(s.input_history_cursor.is_none());
+        assert_eq!(s.input_buffer, "old inputx");
+    }
+
+    #[test]
+    fn duplicate_and_blank_inputs_are_not_recorded() {
+        let mut s = TuiAppState::new();
+        s.record_input_history("hello");
+        s.record_input_history("hello");
+        s.record_input_history("   ");
+        assert_eq!(s.input_history, vec!["hello".to_string()]);
     }
 }

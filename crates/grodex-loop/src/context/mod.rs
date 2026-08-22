@@ -64,6 +64,13 @@ impl CompactionManager {
         self.context_window = window;
     }
 
+    /// Update the trigger threshold (percentage of the context window at
+    /// which auto-compaction fires). Clamped to 1..=100. Configurable via
+    /// `compaction_threshold_percent` in config (default 85).
+    pub fn set_threshold_percent(&mut self, percent: u8) {
+        self.trigger.threshold_percent = percent.clamp(1, 100);
+    }
+
     /// Whether compaction should be triggered now.
     pub fn should_compact(&self, current_tokens: u64) -> bool {
         if self.suppressed {

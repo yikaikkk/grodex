@@ -20,8 +20,8 @@ use grodex_rollout::event::{RolloutEvent};
 use grodex_rollout::store::{FileRolloutStore, RolloutStore};
 use std::sync::Arc;
 
-fn store(dir: &tempfile::TempDir, sid: SessionId) -> Arc<dyn RolloutStore> {
-    Arc::new(FileRolloutStore::new(dir.path(), &sid.to_string()).unwrap())
+async fn store(dir: &tempfile::TempDir, sid: SessionId) -> Arc<dyn RolloutStore> {
+    Arc::new(FileRolloutStore::new_session(dir.path(), &sid.to_string()).await.unwrap())
 }
 
 /// Replay `events` through a fresh reducer for `sid`.
@@ -38,7 +38,7 @@ fn replay(sid: SessionId, events: &[RolloutEvent]) -> Result<Vec<grodex_core::co
 async fn crash_1_before_sampling() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
-    let writer = RolloutWriter::new(store(&dir, sid), sid);
+    let writer = RolloutWriter::new(store(&dir, sid).await, sid);
     let turn = grodex_core::id::TurnId::new();
     writer.write_user_input(turn, "please summarize the file").await.unwrap();
 
@@ -56,7 +56,7 @@ async fn crash_1_before_sampling() {
 async fn crash_2_mid_stream() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
-    let writer = RolloutWriter::new(store(&dir, sid), sid);
+    let writer = RolloutWriter::new(store(&dir, sid).await, sid);
     let turn = grodex_core::id::TurnId::new();
     writer.write_user_input(turn, "hello").await.unwrap();
     writer
@@ -86,7 +86,7 @@ async fn crash_2_mid_stream() {
 async fn crash_3_before_tool_result() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
-    let writer = RolloutWriter::new(store(&dir, sid), sid);
+    let writer = RolloutWriter::new(store(&dir, sid).await, sid);
     let turn = grodex_core::id::TurnId::new();
     let step = grodex_core::id::StepId::new();
     let cap_gen = grodex_core::id::StepGeneration::new(1);
@@ -116,7 +116,7 @@ async fn crash_3_before_tool_result() {
 async fn crash_3_orphaned_tool_call_rejected_on_turn_complete() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
-    let writer = RolloutWriter::new(store(&dir, sid), sid);
+    let writer = RolloutWriter::new(store(&dir, sid).await, sid);
     let turn = grodex_core::id::TurnId::new();
     let step = grodex_core::id::StepId::new();
     let cap_gen = grodex_core::id::StepGeneration::new(1);
@@ -148,7 +148,7 @@ async fn crash_3_orphaned_tool_call_rejected_on_turn_complete() {
 async fn crash_4_after_tool_result_before_turn_complete() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
-    let writer = RolloutWriter::new(store(&dir, sid), sid);
+    let writer = RolloutWriter::new(store(&dir, sid).await, sid);
     let turn = grodex_core::id::TurnId::new();
     let step = grodex_core::id::StepId::new();
     let cap_gen = grodex_core::id::StepGeneration::new(1);
@@ -164,7 +164,7 @@ async fn crash_4_after_tool_result_before_turn_complete() {
         .await
         .unwrap();
     writer
-        .write_tool_finished(turn, step, cap_gen, &call_id.to_string(), "contents", false)
+        .write_tool_finished(turn, step, cap_gen, &call_id.to_string(), None, "contents", false)
         .await
         .unwrap();
     // TurnCompleted never written — crash between commit and turn marker.
@@ -184,7 +184,7 @@ async fn crash_4_after_tool_result_before_turn_complete() {
 async fn crash_5_before_compaction_replace() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
-    let writer = RolloutWriter::new(store(&dir, sid), sid);
+    let writer = RolloutWriter::new(store(&dir, sid).await, sid);
     let turn = grodex_core::id::TurnId::new();
     writer.write_user_input(turn, "long conversation").await.unwrap();
     writer
@@ -220,7 +220,7 @@ async fn crash_5_before_compaction_replace() {
 async fn crash_6_before_turn_completed_persisted() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
-    let writer = RolloutWriter::new(store(&dir, sid), sid);
+    let writer = RolloutWriter::new(store(&dir, sid).await, sid);
     let turn = grodex_core::id::TurnId::new();
     writer.write_user_input(turn, "say hi").await.unwrap();
     writer
@@ -249,7 +249,7 @@ async fn crash_6_before_turn_completed_persisted() {
 async fn clean_shutdown_full_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
-    let writer = RolloutWriter::new(store(&dir, sid), sid);
+    let writer = RolloutWriter::new(store(&dir, sid).await, sid);
     let turn = grodex_core::id::TurnId::new();
     let step = grodex_core::id::StepId::new();
     let cap_gen = grodex_core::id::StepGeneration::new(1);
@@ -264,7 +264,7 @@ async fn clean_shutdown_full_round_trip() {
         )
         .await
         .unwrap();
-    writer.write_tool_finished(turn, step, cap_gen, &call_id.to_string(), "contents", false).await.unwrap();
+    writer.write_tool_finished(turn, step, cap_gen, &call_id.to_string(), None, "contents", false).await.unwrap();
     writer.write_turn_completed(turn).await.unwrap();
 
     let events = writer.store().replay_from(0).await.unwrap();

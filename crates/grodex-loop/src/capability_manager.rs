@@ -432,7 +432,13 @@ impl TurnCapabilityOverlay {
         for name in &overlay.removals {
             specs.remove(name);
         }
-        specs.into_values().collect()
+        // Sort by name for a DETERMINISTIC tools array across requests.
+        // HashMap iteration order is random — an unstable tools order
+        // changes the request prefix every step and defeats provider-side
+        // prompt caching (cache hit rate → ~0).
+        let mut out: Vec<ToolSpec> = specs.into_values().collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     /// Resolve a tool runtime: check overlay first, then base.

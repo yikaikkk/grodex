@@ -110,12 +110,103 @@ pub struct WorkspaceManager {
 
 impl WorkspaceManager {
     pub fn new(root: PathBuf) -> Self {
-        Self {
+        let mgr = Self {
             root_workspace: root,
             leases: HashMap::new(),
             path_locks: HashMap::new(),
             tempdir_handles: HashMap::new(),
             worktree_entries: HashMap::new(),
+        };
+        // A previous process may have been killed mid-flight, leaving
+        // orphan worktrees + stale git registrations. Sweep them before
+        // granting any new lease. Fail-soft, never blocks startup.
+        mgr.prune_stale_worktrees();
+        mgr
+    }
+
+    /// Sweep leftover worktrees from crashed/killed previous processes.
+    ///
+    /// At construction time no leases are outstanding, so every entry
+    /// under `.agent-worktrees/` is by definition orphaned:
+    ///   1. `git worktree prune` drops stale git-side registrations
+    ///      (without this, `git worktree add` refuses paths git still
+    ///      believes are live worktrees).
+    ///   2. Each remaining directory is removed via
+    ///      `git worktree remove --force`, falling back to
+    ///      `remove_dir_all` when git no longer recognizes the entry.
+    /// Fail-soft: errors are logged and never abort startup.
+    pub fn prune_stale_worktrees(&self) {
+        let git_dir = self.root_workspace.join(".git");
+        let worktrees_dir = self.root_workspace.join(".agent-worktrees");
+        if !git_dir.exists() || !worktrees_dir.exists() {
+            return;
+        }
+
+        let prune = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.root_workspace)
+            .arg("worktree")
+            .arg("prune")
+            .output();
+        match prune {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                tracing::warn!(
+                    "[WorkspaceManager] git worktree prune failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Err(e) => {
+                tracing::warn!("[WorkspaceManager] failed to spawn git worktree prune: {e}");
+            }
+        }
+
+        let entries = match std::fs::read_dir(&worktrees_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(
+                    "[WorkspaceManager] failed to read {}: {e}",
+                    worktrees_dir.display()
+                );
+                return;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let git_removed = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.root_workspace)
+                .arg("worktree")
+                .arg("remove")
+                .arg("--force")
+                .arg(&path)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !git_removed || path.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    tracing::warn!(
+                        "[WorkspaceManager] failed to remove stale worktree {}: {e}",
+                        path.display()
+                    );
+                    continue;
+                }
+            }
+            tracing::info!(
+                "[WorkspaceManager] removed stale agent worktree {}",
+                path.display()
+            );
+        }
+
+        // Drop the container dir if the sweep emptied it.
+        if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
+            if entries.count() == 0 {
+                let _ = std::fs::remove_dir(&worktrees_dir);
+            }
         }
     }
 
@@ -276,7 +367,7 @@ impl WorkspaceManager {
     /// 1. Removes any path_locks held by the agent.
     /// 2. For Worktree: runs `git worktree remove --force <path>`, then
     ///    tries to remove the empty worktree parent directory entries.
-    ///    Fail-soft: errors are printed via eprintln and do not abort.
+    ///    Fail-soft: errors are logged and do not abort.
     /// 3. For Ephemeral: drops the TempDir handle (cleans up the temp dir).
     /// 4. Removes the lease from the map.
     pub fn revoke_lease(&mut self, agent_id: &AgentId) -> Result<(), WorkspaceError> {
@@ -312,14 +403,14 @@ impl WorkspaceManager {
                         Ok(output) if output.status.success() => {}
                         Ok(output) => {
                             let stderr = String::from_utf8_lossy(&output.stderr);
-                            eprintln!(
+                            tracing::warn!(
                                 "[WorkspaceManager] git worktree remove --force {} failed: {}",
                                 worktree_path.display(),
                                 stderr
                             );
                         }
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[WorkspaceManager] failed to spawn git worktree remove for {}: {}",
                                 worktree_path.display(),
                                 e
@@ -329,7 +420,7 @@ impl WorkspaceManager {
 
                     if worktree_path.exists() {
                         if let Err(e) = std::fs::remove_dir_all(worktree_path) {
-                            eprintln!(
+                            tracing::warn!(
                                 "[WorkspaceManager] failed to remove worktree dir {}: {}",
                                 worktree_path.display(),
                                 e
@@ -342,7 +433,7 @@ impl WorkspaceManager {
                         if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
                             if entries.count() == 0 {
                                 if let Err(e) = std::fs::remove_dir(&worktrees_dir) {
-                                    eprintln!(
+                                    tracing::warn!(
                                         "[WorkspaceManager] failed to remove empty worktrees dir {}: {}",
                                         worktrees_dir.display(),
                                         e
@@ -628,6 +719,44 @@ mod tests {
         m.grant_lease(b, WorkspaceMode::SharedWrite, None).unwrap();
         assert!(!m.can_write(&a, &PathBuf::from("/x")));
         assert!(m.can_write(&b, &PathBuf::from("/x")));
+    }
+
+    /// Simulate a crash: a worktree registered in git + its directory are
+    /// left behind; a fresh WorkspaceManager must sweep both so the next
+    /// `git worktree add` succeeds.
+    #[test]
+    fn startup_sweep_removes_orphan_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Minimal git repo with one commit.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git spawn")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        std::fs::write(root.join("f.txt"), "x").unwrap();
+        assert!(git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "."]).status.success());
+        assert!(git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]).status.success());
+
+        // Orphan worktree left by a "crashed" previous process.
+        let orphan = root.join(".agent-worktrees").join("orphan-1");
+        assert!(git(&["worktree", "add", orphan.to_str().unwrap(), "--detach"]).status.success());
+        assert!(orphan.exists());
+
+        // Construction must sweep it (dir + git registration).
+        let _m = WorkspaceManager::new(root.to_path_buf());
+        assert!(!orphan.exists(), "orphan worktree dir must be swept");
+
+        // git registration gone → a new lease at the same path works.
+        let mut m = WorkspaceManager::new(root.to_path_buf());
+        m.grant_lease(aid(), WorkspaceMode::Worktree, None).unwrap();
     }
 
     #[test]

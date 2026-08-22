@@ -67,34 +67,63 @@ pub enum InputMode {
 /// TextDelta / ThoughtDelta events are accumulated into a single block
 /// for SSE streaming effect. ToolCallStart / Args / End / Result are
 /// mapped to a single Tool card indexed by call_id.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ChatMessage {
     /// User-submitted prompt.
     User { text: String },
     /// Assistant response — accumulates TextDelta chunks.
     Assistant { text: String, done: bool },
-    /// Reasoning / thinking — accumulates ThoughtDelta chunks (Grok-style).
-    Thinking { text: String, done: bool },
-    /// Full tool call card — Start / Args / End / Result aggregate here.
-    /// Status progression: starting → parsing-args → running → done/error.
-    Tool {
-        name: String,
-        call_id: Option<String>,
-        args: String,
-        result: Option<String>,
-        is_error: bool,
-        done: bool,       // ToolCallEnd: agent side finished generating call
-        has_result: bool, // ToolResult: agent returned output
-        started_at: std::time::Instant,
-        /// When the tool reached a terminal state (has_result or done).
-        /// `None` while in-flight; set to `Some(Instant::now())` the
-        /// moment we flip has_result/done so render can compute a FROZEN
-        /// duration instead of `started_at.elapsed()` which would keep
-        /// ticking every frame.
-        finished_at: Option<std::time::Instant>,
-    },
+    /// Reasoning / thinking — accumulates ThoughtDelta chunks (Grok-style)
+    /// AND hosts tool calls as interleaved segments: thought text → tool →
+    /// thought text. The assistant answer stays a separate Assistant block.
+    Thinking { segments: Vec<ThinkingSegment>, done: bool },
     /// System / error message.
     System { text: String, is_error: bool },
+    /// Sub-agent execution card — accumulates SubagentProgress events.
+    /// Rendered like a tool block with a collapsible Thought-style
+    /// execution log (Ctrl+E toggles expansion of the latest turn).
+    Subagent {
+        id: String,
+        label: String,
+        task_preview: String,
+        /// Internal execution lines (sampling steps, tool calls, …).
+        lines: Vec<String>,
+        done: bool,
+        ok: bool,
+        started_at: std::time::Instant,
+        /// Frozen when the sub-agent finishes so the duration doesn't
+        /// keep ticking on every render frame.
+        finished_at: Option<std::time::Instant>,
+    },
+}
+
+/// Tool-call card data. Tool calls are NOT standalone messages — they are
+/// embedded as segments inside the turn's Thinking block so the execution
+/// trace (thought → tool → thought) renders as one continuous stream,
+/// while the final answer stays a separate Assistant block.
+#[derive(Clone, Debug)]
+pub struct ToolCard {
+    pub name: String,
+    pub call_id: Option<String>,
+    pub args: String,
+    pub result: Option<String>,
+    pub is_error: bool,
+    pub done: bool,       // ToolCallEnd: agent side finished generating call
+    pub has_result: bool, // ToolResult: agent returned output
+    pub started_at: std::time::Instant,
+    /// When the tool reached a terminal state (has_result or done).
+    /// `None` while in-flight; set to `Some(Instant::now())` the moment we
+    /// flip has_result/done so render can compute a FROZEN duration instead
+    /// of `started_at.elapsed()` which would keep ticking every frame.
+    pub finished_at: Option<std::time::Instant>,
+}
+
+/// A piece of a Thinking block: either a reasoning text fragment or a tool
+/// call card, kept in chronological arrival order.
+#[derive(Clone, Debug)]
+pub enum ThinkingSegment {
+    Text(String),
+    Tool(ToolCard),
 }
 
 // ── Slash command table (faithfully mirrors Grok's builtin_commands) ─
@@ -158,12 +187,8 @@ pub enum SlashLocalKind {
     DeleteCurrentSession,
     /// Clear the current input buffer only. Command: /reset.
     ClearInput,
-    /// Toggle terminal mouse capture.
-    ///   /mouse on      → enable wheel scroll inside the app (default)
-    ///   /mouse off     → disable capture so terminal native text selection works
-    ///   /mouse toggle  → flip current state
-    ///   /mouse         → show current state
-    Mouse { sub: String },
+    // 鼠标上报没有用户可切换的开关（仅 macOS Terminal.app 自动启用兜底），
+    // 因此不提供 /mouse 命令。
 
     // ── ACP / session-scoped: logically belong to Grok's "Action" set.
     //    We intercept them here so they never leak to the LLM; for the
@@ -289,8 +314,6 @@ pub enum SlashLocalKind {
     AcpLogin,
     /// Logout. /logout.
     AcpLogout,
-    /// Toggle mouse reporting. /toggle-mouse-reporting.
-    AcpToggleMouse,
     /// Privacy center. /privacy.
     AcpPrivacy,
     /// Edit the current prompt draft in a separate editor. /edit-prompt (minimal-mode only in Grok).
@@ -351,12 +374,6 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandDef] = &[
     SlashCommandDef { name: "delete",      description: "结束并删除当前会话（聊天记录清空）",                                       local: SlashLocalKind::DeleteCurrentSession },
     SlashCommandDef { name: "clear",       description: "清空会话（/delete 别名，注意：不等同清输入，那是 /reset）",                local: SlashLocalKind::DeleteCurrentSession },
     SlashCommandDef { name: "reset",       description: "仅清空当前输入框（会话完整保留）",                                         local: SlashLocalKind::ClearInput },
-    // NOTE: /mouse uses run-local interpretation (not the SlashLocalKind
-    // variant), because the subcommand (on/off/toggle) is encoded in the
-    // args string, not in a static SlashLocalKind payload. We still
-    // register the definition so `/mou<TAB>` completion works, and the
-    // command entry is visible in /help.
-    SlashCommandDef { name: "mouse",       description: "显示鼠标模式（滚轮+选择始终同时可用）",                                          local: SlashLocalKind::Mouse { sub: String::new() } },
 
     // ── ACP: Session & lifecycle ──────────────────────────────────────
     SlashCommandDef { name: "new",         description: "开启全新的空白会话",                                                      local: SlashLocalKind::AcpNewSession },
@@ -459,7 +476,6 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandDef] = &[
     SlashCommandDef { name: "login",       description: "登录 Grok / provider 账户",                                               local: SlashLocalKind::AcpLogin },
     SlashCommandDef { name: "logout",      description: "退出登录",                                                                local: SlashLocalKind::AcpLogout },
     SlashCommandDef { name: "import-claude", description: "从 Claude / ChatGPT 导入历史会话",                                       local: SlashLocalKind::AcpImportHistory },
-    SlashCommandDef { name: "toggle-mouse-reporting", description: "切换鼠标事件上报（滚动/点击）",                                 local: SlashLocalKind::AcpToggleMouse },
     SlashCommandDef { name: "edit-prompt", description: "在外部编辑器打开当前草稿（minimal 模式独有）",                             local: SlashLocalKind::AcpEditPrompt },
     SlashCommandDef { name: "expand",      description: "从 minimal 展开到 fullscreen TUI",                                        local: SlashLocalKind::AcpExpand },
     SlashCommandDef { name: "voice",       description: "启用/停用 语音输入（麦克风）模式",                                         local: SlashLocalKind::AcpVoice },
@@ -564,6 +580,12 @@ pub struct TuiAppState {
     /// full CoT text is rendered inline and the user scrolls the
     /// conversation to read it all.
     pub thinking_expanded: bool,
+    /// Whether the most-recent Subagent card's execution log is
+    /// expanded. Toggle with Ctrl+E (independent of the Thinking
+    /// panel's Ctrl+O). When false (default), the log shows only the
+    /// latest COLLAPSED_LINES=3 lines; when true, up to EXPANDED_CAP=40
+    /// lines are rendered for the latest turn.
+    pub subagent_expanded: bool,
     /// Scroll offset (in wrapped lines) for the most-recent Thinking
     /// block when it is **collapsed**. Adjusted by Ctrl-N / Ctrl-P in
     /// Normal mode. Clamped to `max(0, total_wrapped_lines -
@@ -586,10 +608,15 @@ pub struct TuiAppState {
     pub show_timestamps: bool,      // /timestamps
     pub session_title: Option<String>,  // /rename /title
     pub tasks: Vec<(String, bool)>, // /tasks /plan /queue — (description, done)
-    /// Map tool call_id → index in `messages` (the Tool card).
-    /// Used to route ToolCallArgs / ToolCallEnd / ToolResult delta events
-    /// to the correct card when several tool calls interleave.
-    pub call_id_index: std::collections::HashMap<String, usize>,
+    /// Map tool call_id → (message index, segment index) of the ToolCard
+    /// living inside a Thinking block. Routes ToolCallArgs / ToolCallEnd /
+    /// ToolResult delta events to the correct card when several tool calls
+    /// interleave.
+    pub call_id_index: std::collections::HashMap<String, (usize, usize)>,
+    /// Map sub-agent task id → index in `messages` (the Subagent card).
+    /// Routes Step / Finished progress events to the right card when
+    /// several sub-agents run in parallel.
+    pub subagent_index: std::collections::HashMap<String, usize>,
     /// Slash-command inline menu. Rebuilt on every keystroke in Prompt mode
     /// so the dropdown stays consistent with input.
     pub slash: SlashMenuState,
@@ -600,6 +627,13 @@ pub struct TuiAppState {
     /// only once, the gate decays after the window so accidental presses
     /// can't quit the session.
     pub ctrl_c_first_press_at: Option<std::time::Instant>,
+    /// 输入历史（已提交的输入）。Prompt 模式下无 slash 菜单 / 无审批时，
+    /// ↑/↓ 在历史里导航并自动填充到输入框。
+    pub input_history: Vec<String>,
+    /// 历史导航中的当前索引；None = 未在导航（正在编辑新草稿）。
+    pub input_history_cursor: Option<usize>,
+    /// 进入历史导航前正在编辑的草稿；↓ 越过最新一条时恢复它。
+    pub input_history_draft: String,
 }
 
 /// Within this many milliseconds, two Ctrl-C presses in a row are treated
@@ -637,6 +671,7 @@ impl TuiAppState {
             scroll_follow_bottom: true,
             cancel_sent: false,
             thinking_expanded: false,
+            subagent_expanded: false,
             thinking_scroll: 0,
             logs: Vec::new(),
             model_label: String::new(),
@@ -652,10 +687,74 @@ impl TuiAppState {
             session_title: None,
             tasks: Vec::new(),
             call_id_index: std::collections::HashMap::new(),
+            subagent_index: std::collections::HashMap::new(),
             slash: SlashMenuState::default(),
             next_seq: 1,
             ctrl_c_first_press_at: None,
+            input_history: Vec::new(),
+            input_history_cursor: None,
+            input_history_draft: String::new(),
         }
+    }
+
+    // ── 输入历史 ────────────────────────────────────────────────────────
+
+    /// 记录一条已提交的输入到历史（纯空白跳过；与上一条完全相同则不重复记录），
+    /// 并复位导航状态。最多保留 200 条。
+    pub fn record_input_history(&mut self, text: &str) {
+        let t = text.trim();
+        self.input_history_cursor = None;
+        self.input_history_draft.clear();
+        if t.is_empty() {
+            return;
+        }
+        if self.input_history.last().map(|s| s.as_str()) != Some(t) {
+            self.input_history.push(t.to_string());
+            if self.input_history.len() > 200 {
+                self.input_history.remove(0);
+            }
+        }
+    }
+
+    /// ↑：向更早的历史条目导航。第一次导航时先保存当前草稿，
+    /// 之后 ↓ 越过最新一条可原样恢复。
+    pub fn history_prev(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let idx = match self.input_history_cursor {
+            None => {
+                self.input_history_draft = self.input_buffer.clone();
+                self.input_history.len() - 1
+            }
+            Some(0) => return,
+            Some(i) => i - 1,
+        };
+        self.input_history_cursor = Some(idx);
+        self.input_buffer = self.input_history[idx].clone();
+        self.input_cursor = self.input_buffer.len();
+    }
+
+    /// ↓：向更新的历史条目导航；越过最新一条时恢复进入导航前保存的草稿。
+    pub fn history_next(&mut self) {
+        let Some(idx) = self.input_history_cursor else {
+            return;
+        };
+        if idx + 1 >= self.input_history.len() {
+            self.input_history_cursor = None;
+            self.input_buffer = std::mem::take(&mut self.input_history_draft);
+        } else {
+            self.input_history_cursor = Some(idx + 1);
+            self.input_buffer = self.input_history[idx + 1].clone();
+        }
+        self.input_cursor = self.input_buffer.len();
+    }
+
+    /// 用户开始编辑（输入/删字）时退出历史导航，避免下一次 ↑/↓
+    /// 覆盖刚编辑过的内容。
+    pub fn cancel_history_navigation(&mut self) {
+        self.input_history_cursor = None;
+        self.input_history_draft.clear();
     }
 
     // ── Slash completion ────────────────────────────────────────────────
@@ -958,25 +1057,33 @@ impl TuiAppState {
     pub fn is_streaming(&self) -> bool {
         for m in self.messages.iter().rev() {
             match m {
-                ChatMessage::Assistant { done: false, .. } | ChatMessage::Thinking { done: false, .. } => {
-                    return true;
-                }
-                ChatMessage::Tool { done, has_result, .. } => {
-                    // Tool counts as still "streaming" only when BOTH:
-                    //   - no result yet (has_result=false): ToolResult hasn't landed
-                    //   - not explicitly done (done=false):  ToolCallEnd hasn't landed
-                    // If EITHER has_result=true OR done=true, the tool card is
-                    // effectively finished — the ⏳ indicator should stop for it.
-                    // This fixes the classic stuck-streaming bug where a backend
-                    // emits ToolCallStart → ToolResult but skips ToolCallEnd.
-                    if !*has_result && !*done {
+                ChatMessage::Assistant { done: false, .. } => return true,
+                ChatMessage::Thinking { segments, done } => {
+                    if !*done {
+                        return true;
+                    }
+                    // Tool segments inside the Thinking block keep the turn
+                    // "hot" while they are in flight: a card counts as
+                    // streaming only when BOTH no result has landed
+                    // (has_result=false) and ToolCallEnd never arrived
+                    // (done=false). This fixes the classic stuck-streaming
+                    // bug where a backend emits ToolCallStart → ToolResult
+                    // but skips ToolCallEnd.
+                    if segments.iter().any(|s| {
+                        matches!(s, ThinkingSegment::Tool(c) if !c.has_result && !c.done)
+                    }) {
                         return true;
                     }
                 }
+                ChatMessage::Subagent { done: false, .. } => {
+                    // A running sub-agent keeps the turn "hot" so the
+                    // transport is polled at burst rate.
+                    return true;
+                }
                 ChatMessage::Assistant { done: true, .. } => {
-                    // Completed answer — but maybe younger Thinking / Tool
-                    // are still active. Don't fall through to User boundary;
-                    // keep scanning.
+                    // Completed answer — but maybe younger Thinking /
+                    // Subagent are still active. Don't fall through to
+                    // User boundary; keep scanning.
                 }
                 ChatMessage::User { .. } => {
                     return false;
@@ -1004,6 +1111,74 @@ impl TuiAppState {
 
     // ── Event ingestion ─────────────────────────────────────────────────
 
+    /// Index (in `messages`) of the current turn's Thinking block, if any.
+    /// Scans backward, skips non-boundary messages, stops at User (turn
+    /// boundary). One Thinking block per turn is the invariant maintained
+    /// by both ThoughtDelta accumulation and ToolCallStart routing.
+    fn turn_thinking_index(&self) -> Option<usize> {
+        for (i, m) in self.messages.iter().enumerate().rev() {
+            match m {
+                ChatMessage::Thinking { .. } => return Some(i),
+                ChatMessage::User { .. } => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Locate the ToolCard for `call_id` inside a Thinking block.
+    /// Primary path: call_id_index → (message, segment). Fallback (no
+    /// call_id or stale index): the LAST Tool segment in the turn's
+    /// Thinking block — backward-compatible with backends that omit ids.
+    fn tool_segment_mut(&mut self, call_id: &str) -> Option<&mut ToolCard> {
+        // Two-phase to satisfy the borrow checker: FIRST locate the target
+        // (message, segment) indices immutably, THEN take exactly one
+        // mutable borrow at the end.
+        //
+        // Primary path: call_id_index. Fallback (no call_id or stale
+        // index): the LAST Tool segment in the turn's Thinking block —
+        // backward-compatible with backends that omit ids.
+        let target: Option<(usize, usize)> = self
+            .call_id_index
+            .get(call_id)
+            .copied()
+            .filter(|&(mi, si)| {
+                matches!(
+                    self.messages.get(mi).and_then(|m| match m {
+                        ChatMessage::Thinking { segments, .. } => segments.get(si),
+                        _ => None,
+                    }),
+                    Some(ThinkingSegment::Tool(_))
+                )
+            })
+            .or_else(|| {
+                for (i, m) in self.messages.iter().enumerate().rev() {
+                    match m {
+                        ChatMessage::Thinking { segments, .. } => {
+                            // The most recent Thinking block IS the turn's
+                            // block; take its last Tool segment (if any).
+                            return segments
+                                .iter()
+                                .rposition(|s| matches!(s, ThinkingSegment::Tool(_)))
+                                .map(|si| (i, si));
+                        }
+                        ChatMessage::User { .. } => return None, // turn boundary
+                        _ => {}
+                    }
+                }
+                None
+            });
+
+        let (mi, si) = target?;
+        match &mut self.messages[mi] {
+            ChatMessage::Thinking { segments, .. } => match &mut segments[si] {
+                ThinkingSegment::Tool(card) => Some(card),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn push_event(&mut self, e: SessionEvent) {
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -1024,7 +1199,7 @@ impl TuiAppState {
             self.turn_id = snapshot.current_turn_id.clone();
         }
 
-        if let SessionEvent::TurnComplete { turn_id } = &e {
+        if let SessionEvent::TurnComplete { turn_id, input_tokens, cached_tokens } = &e {
             self.turn_id = Some(turn_id.clone());
             self.cancel_sent = false;
             // Close the two per-turn open blocks independently.
@@ -1057,35 +1232,49 @@ impl TuiAppState {
                     break;
                 }
             }
-            // Also close any still-open Tool cards — the loop reports
-            // done=false when ToolCallEnd was never emitted (cancelled
-            // turns), so a TurnComplete forces them into a terminal UI
-            // state to match the "turn is over" contract.
+            // Also close any still-open tool segments inside Thinking
+            // blocks — the loop reports done=false when ToolCallEnd was
+            // never emitted (cancelled turns), so a TurnComplete forces
+            // them into a terminal UI state to match the "turn is over"
+            // contract.
             for m in self.messages.iter_mut().rev() {
-                if let ChatMessage::Tool { done, has_result, finished_at, .. } = m {
-                    if !*done {
-                        *done = true;
-                        if !*has_result {
-                            *has_result = true;
-                        }
-                        if finished_at.is_none() {
-                            *finished_at = Some(std::time::Instant::now());
+                if let ChatMessage::Thinking { segments, .. } = m {
+                    for seg in segments.iter_mut() {
+                        if let ThinkingSegment::Tool(card) = seg {
+                            if !card.done {
+                                card.done = true;
+                                card.has_result = true;
+                                if card.finished_at.is_none() {
+                                    card.finished_at = Some(std::time::Instant::now());
+                                }
+                            }
                         }
                     }
                 }
+            }
+            // Surface the prompt-cache hit rate so the user can verify
+            // prefix caching is actually working (only when the provider
+            // reported usage).
+            if *input_tokens > 0 {
+                let pct = (*cached_tokens as f64 / *input_tokens as f64) * 100.0;
+                self.push_log(format!(
+                    "⚡ tokens: input={} · 缓存命中={} ({:.0}%)",
+                    input_tokens, cached_tokens, pct
+                ));
             }
         }
 
         // ── Delta accumulation & tool routing ─────────────────────────────
         //
         // TextDelta   → most recent in-progress Assistant (same turn).
-        // ThoughtDelta→ most recent in-progress Thinking  (same turn,
-        //               separate block so thinking stays visually distinct
-        //               from the final answer, like Grok's 💭 panel).
-        // ToolCallStart / Args / End / Result → routed via call_id_index,
-        //               which maps call_id → position in messages. If the
-        //               agent did not emit a call_id we fall back to the
-        //               last Tool card (backward-compat behaviour).
+        //               Tool calls do NOT split the answer — the
+        //               assistant text stays one clean block.
+        // ThoughtDelta→ the turn's Thinking block, appended to its
+        //               trailing Text segment (one block per turn).
+        // ToolCallStart / Args / End / Result → routed into the turn's
+        //               Thinking block as Tool segments (thought → tool →
+        //               thought interleaving), via call_id_index which
+        //               maps call_id → (message, segment) position.
         match &e {
             SessionEvent::TextDelta { text } => {
                 let mut found = false;
@@ -1102,7 +1291,7 @@ impl TuiAppState {
                         ChatMessage::User { .. } => {
                             break;
                         }
-                        _ => {} // Skip Thinking/Tool/System (same turn)
+                        _ => {} // Skip Thinking/Subagent/System (same turn)
                     }
                 }
                 if !found {
@@ -1114,27 +1303,40 @@ impl TuiAppState {
             }
 
             SessionEvent::ThoughtDelta { text } => {
+                // ── ONE Thinking block per turn ──────────────────────
+                // All reasoning within a single turn (between two User
+                // messages) accumulates into ONE Thinking block; each
+                // delta appends to the trailing Text segment (a Tool
+                // segment in between starts a fresh Text segment, giving
+                // thought → tool → thought interleaving).
+                //
+                // This fixes both:
+                //   - Live streaming: model produces Thought→Text→Tool→
+                //     Thought; all ThoughtDeltas stay in one block.
+                //   - Resume: snapshot restores Thinking blocks as done;
+                //     new ThoughtDeltas reopen the last block instead of
+                //     creating fragments.
                 let mut found = false;
                 for m in self.messages.iter_mut().rev() {
                     match m {
-                        ChatMessage::Thinking { text: existing, done, .. } => {
-                            if *done {
-                                break;
+                        ChatMessage::Thinking { segments, done } => {
+                            // Open or done — always append and ensure open.
+                            match segments.last_mut() {
+                                Some(ThinkingSegment::Text(t)) => t.push_str(text),
+                                _ => segments.push(ThinkingSegment::Text(text.clone())),
                             }
-                            existing.push_str(text);
+                            *done = false;
                             found = true;
                             break;
                         }
-                        ChatMessage::Assistant { done: true, .. } => {
-                            // Assistant from a previous completed sub-phase
-                            // within the same turn → keep looking (there
-                            // might be a younger Thinking ahead of it).
-                            continue;
-                        }
                         ChatMessage::User { .. } => {
+                            // Turn boundary — no Thinking block in this
+                            // turn yet, create one below.
                             break;
                         }
-                        _ => {} // Skip Tool/System (same turn)
+                        // Skip Assistant / Subagent / System — part of the
+                        // current turn, not a turn boundary.
+                        _ => {}
                     }
                 }
                 if !found {
@@ -1142,60 +1344,21 @@ impl TuiAppState {
                     // from the top of the new reasoning trace.
                     self.thinking_scroll = 0;
                     self.messages.push(ChatMessage::Thinking {
-                        text: text.clone(),
+                        segments: vec![ThinkingSegment::Text(text.clone())],
                         done: false,
                     });
                 }
             }
 
             SessionEvent::ToolCallStart { call_id, name } => {
-                // Insert the new tool badge right after the most recent
-                // in-progress Assistant / Thinking block — not at the very
-                // end of messages. This keeps the interleaving when the
-                // model streams "a bit of answer → call tool → continue"
-                // instead of piling every tool card at the bottom of the
-                // turn. If there's no active block yet (tool call comes
-                // first), we fall back to append.
-                let insert_pos = {
-                    let mut pos = None;
-                    for (i, m) in self.messages.iter().enumerate().rev() {
-                        match m {
-                            ChatMessage::Assistant { done: false, .. }
-                            | ChatMessage::Thinking { done: false, .. } => {
-                                // Insert right after this in-progress block.
-                                pos = Some(i + 1);
-                                break;
-                            }
-                            ChatMessage::Assistant { done: true, .. }
-                            | ChatMessage::Thinking { done: true, .. } => {
-                                // Completed sub-phase — still prefer the
-                                // youngest completed block over tail-append
-                                // so the first tool call groups with it.
-                                pos = pos.or(Some(i + 1));
-                                // keep walking in case a not-yet-done block
-                                // exists earlier in this turn.
-                            }
-                            ChatMessage::User { .. } => {
-                                break; // turn boundary — don't go past User
-                            }
-                            _ => {} // skip existing Tools / System
-                        }
-                    }
-                    pos.unwrap_or(self.messages.len())
-                };
-                if !call_id.is_empty() {
-                    // call_id_index points at the insert position; when
-                    // insert_pos is in the middle of messages, entries
-                    // after it shift right — since we store positions for
-                    // *past* tools and this is a brand new call_id, none
-                    // of the existing mappings need adjustment.
-                    self.call_id_index.insert(call_id.clone(), insert_pos);
-                } else {
-                    // If insert_pos reshuffled later calls, we don't need
-                    // to update indices for non-call_id tools, they fall
-                    // back to reverse-scan target selection anyway.
-                }
-                let tool_msg = ChatMessage::Tool {
+                // ── Route the tool call INTO the turn's Thinking block ──
+                // Tool calls render interleaved with reasoning text
+                // (thought → tool → thought) inside ONE Thinking block;
+                // the assistant answer stays a separate, unbroken
+                // Assistant block. NOTE: unlike the old behaviour we do
+                // NOT close the open Assistant block here — post-tool
+                // TextDelta keeps appending to it.
+                let card = ToolCard {
                     name: name.clone(),
                     call_id: Some(call_id.clone()).filter(|s| !s.is_empty()),
                     args: String::new(),
@@ -1206,78 +1369,88 @@ impl TuiAppState {
                     started_at: std::time::Instant::now(),
                     finished_at: None,
                 };
-                if insert_pos >= self.messages.len() {
-                    self.messages.push(tool_msg);
-                } else {
-                    self.messages.insert(insert_pos, tool_msg);
-                    // All call_id_index entries that pointed to positions
-                    // >= insert_pos must shift +1 because we displaced
-                    // them. Younger tools (inserted later) typically
-                    // reside at higher indices, so this preserves them.
-                    for v in self.call_id_index.values_mut() {
-                        if *v >= insert_pos {
-                            *v += 1;
-                        }
+                let (mi, si) = match self.turn_thinking_index() {
+                    Some(i) => {
+                        // Append the tool as a new segment of the turn's
+                        // existing Thinking block.
+                        let ChatMessage::Thinking { segments, .. } = &mut self.messages[i] else {
+                            unreachable!("turn_thinking_index returned a non-Thinking slot")
+                        };
+                        segments.push(ThinkingSegment::Tool(card));
+                        (i, segments.len() - 1)
                     }
+                    None => {
+                        // No Thinking block in this turn yet — create one.
+                        // If the turn already streamed Assistant text,
+                        // insert the Thinking block at the FRONT of the
+                        // turn (right after the User boundary) so the
+                        // reasoning + tools render ABOVE the answer.
+                        // Otherwise simply append at the end.
+                        let mut insert_at = self.messages.len();
+                        for (i, m) in self.messages.iter().enumerate().rev() {
+                            match m {
+                                ChatMessage::User { .. } => {
+                                    insert_at = i + 1;
+                                    break;
+                                }
+                                ChatMessage::Assistant { .. } => {
+                                    insert_at = insert_at.min(i);
+                                }
+                                _ => {}
+                            }
+                        }
+                        let block = ChatMessage::Thinking {
+                            segments: vec![ThinkingSegment::Tool(card)],
+                            done: false,
+                        };
+                        if insert_at >= self.messages.len() {
+                            self.messages.push(block);
+                        } else {
+                            self.messages.insert(insert_at, block);
+                            // Stored message indices >= insert_at shift +1.
+                            for (mi, _) in self.call_id_index.values_mut() {
+                                if *mi >= insert_at {
+                                    *mi += 1;
+                                }
+                            }
+                        }
+                        (insert_at, 0)
+                    }
+                };
+                if !call_id.is_empty() {
+                    self.call_id_index.insert(call_id.clone(), (mi, si));
                 }
             }
 
             SessionEvent::ToolCallArgs { call_id, args_delta } => {
-                let found = self
-                    .call_id_index
-                    .get(call_id)
-                    .copied()
-                    .and_then(|i| self.messages.get_mut(i));
-                let target = match found {
-                    Some(m) => Some(m),
-                    None => self.messages.iter_mut().rev().find(|m| matches!(m, ChatMessage::Tool { .. })),
-                };
-                if let Some(ChatMessage::Tool { args, .. }) = target {
-                    args.push_str(args_delta);
+                if let Some(card) = self.tool_segment_mut(call_id) {
+                    card.args.push_str(args_delta);
                 }
             }
 
             SessionEvent::ToolCallEnd { call_id } => {
-                let found = self
-                    .call_id_index
-                    .get(call_id)
-                    .copied()
-                    .and_then(|i| self.messages.get_mut(i));
-                let target = match found {
-                    Some(m) => Some(m),
-                    None => self.messages.iter_mut().rev().find(|m| matches!(m, ChatMessage::Tool { done: false, .. })),
-                };
-                if let Some(ChatMessage::Tool { done: d, finished_at: fa, .. }) = target {
-                    *d = true;
+                if let Some(card) = self.tool_segment_mut(call_id) {
+                    card.done = true;
                     // Freeze the timer the first time the tool reaches a
                     // terminal state so render shows a static duration
                     // instead of an ever-ticking clock.
-                    if fa.is_none() {
-                        *fa = Some(std::time::Instant::now());
+                    if card.finished_at.is_none() {
+                        card.finished_at = Some(std::time::Instant::now());
                     }
                 }
             }
 
             SessionEvent::ToolResult { call_id, content, is_error } => {
-                let found = self
-                    .call_id_index
-                    .get(call_id)
-                    .copied()
-                    .and_then(|i| self.messages.get_mut(i));
-                let target = match found {
-                    Some(m) => Some(m),
-                    None => self.messages.iter_mut().rev().find(|m| matches!(m, ChatMessage::Tool { done: false, has_result: false, .. })),
-                };
-                if let Some(ChatMessage::Tool { result: r, is_error: ie, has_result: hr, done: d, finished_at: fa, .. }) = target {
-                    *r = Some(content.clone());
-                    *ie = *is_error;
-                    *hr = true;
+                if let Some(card) = self.tool_segment_mut(call_id) {
+                    card.result = Some(content.clone());
+                    card.is_error = *is_error;
+                    card.has_result = true;
                     // Backend may skip ToolCallEnd when emitting ToolResult
                     // (e.g. exec-style one-shot tools): treat arrival of a
                     // result as implicit end-of-tool so ⏳ streaming clears.
-                    *d = true;
-                    if fa.is_none() {
-                        *fa = Some(std::time::Instant::now());
+                    card.done = true;
+                    if card.finished_at.is_none() {
+                        card.finished_at = Some(std::time::Instant::now());
                     }
                 }
             }
@@ -1303,6 +1476,61 @@ impl TuiAppState {
                 // A new turn started — next TextDelta/ThoughtDelta will begin
                 // a fresh Assistant/Thinking block thanks to the
                 // "stop at completed Assistant" guard above.
+            }
+
+            SessionEvent::SubagentProgress { id, label, phase, detail, ok } => {
+                // Structured sub-agent lifecycle → Subagent card.
+                // Started opens a new card, Step appends an execution
+                // line, Finished closes it (ok=false → failure badge).
+                match phase.as_str() {
+                    "started" => {
+                        // Same rationale as ToolCallStart: close the open
+                        // Assistant block so post-delegation text renders
+                        // BELOW the sub-agent card, not above it.
+                        for m in self.messages.iter_mut().rev() {
+                            match m {
+                                ChatMessage::Assistant { done, .. } if !*done => *done = true,
+                                ChatMessage::User { .. } => break,
+                                _ => {}
+                            }
+                        }
+                        self.messages.push(ChatMessage::Subagent {
+                            id: id.clone(),
+                            label: label.clone(),
+                            task_preview: detail.clone(),
+                            lines: Vec::new(),
+                            done: false,
+                            ok: true,
+                            started_at: std::time::Instant::now(),
+                            finished_at: None,
+                        });
+                        self.subagent_index.insert(id.clone(), self.messages.len() - 1);
+                        if self.scroll_follow_bottom {
+                            self.scroll_conversation = u16::MAX;
+                        }
+                    }
+                    "step" => {
+                        if let Some(ChatMessage::Subagent { lines, .. }) =
+                            self.subagent_card_mut(id)
+                        {
+                            lines.push(detail.clone());
+                        }
+                    }
+                    "finished" => {
+                        if let Some(ChatMessage::Subagent {
+                            done, ok: ok_field, lines, finished_at, ..
+                        }) = self.subagent_card_mut(id)
+                        {
+                            *done = true;
+                            *ok_field = ok.unwrap_or(false);
+                            if !detail.is_empty() {
+                                lines.push(detail.clone());
+                            }
+                            *finished_at = Some(std::time::Instant::now());
+                        }
+                    }
+                    _ => {}
+                }
             }
 
             _ => {}
@@ -1334,6 +1562,7 @@ impl TuiAppState {
             | SessionEvent::ToolCallEnd { .. }
             | SessionEvent::ToolResult { .. }
             | SessionEvent::Error { .. }
+            | SessionEvent::Info { .. }
             | SessionEvent::TurnComplete { .. } => {
                 if self.scroll_follow_bottom {
                     self.scroll_conversation = u16::MAX;
@@ -1395,18 +1624,23 @@ impl TuiAppState {
             .unwrap_or(ApprovalOption::Allow)
     }
 
-    /// Mark every in-flight Tool card (done=false) as finished with a
-    /// frozen timestamp. Called locally when the user cancels a turn so the
-    /// tool timer stops immediately rather than ticking forever.
+    /// Mark every in-flight tool segment (done=false) inside Thinking
+    /// blocks as finished with a frozen timestamp. Called locally when the
+    /// user cancels a turn so the tool timer stops immediately rather than
+    /// ticking forever.
     pub fn finalize_all_inflight_tools(&mut self) {
         let now = std::time::Instant::now();
         for m in self.messages.iter_mut() {
-            if let ChatMessage::Tool { done, has_result, finished_at, .. } = m {
-                if !*done {
-                    *done = true;
-                    *has_result = true;
-                    if finished_at.is_none() {
-                        *finished_at = Some(now);
+            if let ChatMessage::Thinking { segments, .. } = m {
+                for seg in segments.iter_mut() {
+                    if let ThinkingSegment::Tool(card) = seg {
+                        if !card.done {
+                            card.done = true;
+                            card.has_result = true;
+                            if card.finished_at.is_none() {
+                                card.finished_at = Some(now);
+                            }
+                        }
                     }
                 }
             }
@@ -1452,6 +1686,23 @@ impl TuiAppState {
         self.thinking_scroll = self.thinking_scroll.saturating_sub(1);
     }
 
+    /// Locate a Subagent card by its task id. Tries the cached index
+    /// first; falls back to a reverse scan when the index went stale
+    /// (e.g. messages rebuilt from a snapshot).
+    fn subagent_card_mut(&mut self, id: &str) -> Option<&mut ChatMessage> {
+        if let Some(&i) = self.subagent_index.get(id) {
+            if let Some(ChatMessage::Subagent { id: mid, .. }) = self.messages.get(i) {
+                if mid == id {
+                    return self.messages.get_mut(i);
+                }
+            }
+        }
+        self.messages
+            .iter_mut()
+            .rev()
+            .find(|m| matches!(m, ChatMessage::Subagent { id: mid, .. } if mid == id))
+    }
+
     pub fn push_log(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         self.logs.push(msg.clone());
@@ -1491,6 +1742,88 @@ impl From<RequestPermissionPayload> for PendingApprovalRow {
             summary: p.summary,
             risk: p.risk,
             remaining_s: (p.timeout_remaining_ms / 1000) as u32,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tool calls route INTO the turn's Thinking block instead of
+    /// splitting the assistant text: text → tool → text must yield ONE
+    /// unbroken Assistant block plus ONE Thinking block hosting the tool
+    /// segments between the thought text.
+    #[test]
+    fn tool_calls_route_into_thinking_block() {
+        let mut s = TuiAppState::new();
+        s.messages.push(ChatMessage::User { text: "go".into() });
+
+        s.push_event(SessionEvent::TextDelta { text: "let me check".into() });
+        s.push_event(SessionEvent::ToolCallStart { call_id: "c1".into(), name: "read_file".into() });
+        s.push_event(SessionEvent::ToolResult { call_id: "c1".into(), content: "ok".into(), is_error: false });
+        s.push_event(SessionEvent::TextDelta { text: " the answer".into() });
+
+        // [User, Thinking([Tool c1]), Assistant("let me check the answer")]
+        // — the Thinking block was inserted at the FRONT of the turn so it
+        // renders above the answer; post-tool text merged back into the
+        // same Assistant block (no split).
+        assert_eq!(s.messages.len(), 3, "got {:?}", s.messages);
+        assert!(
+            matches!(&s.messages[1], ChatMessage::Thinking { segments, .. }
+                if segments.len() == 1
+                && matches!(&segments[0], ThinkingSegment::Tool(c)
+                    if c.name == "read_file" && c.has_result && !c.is_error)),
+            "tool must live inside the Thinking block: {:?}",
+            s.messages[1]
+        );
+        assert!(
+            matches!(&s.messages[2], ChatMessage::Assistant { text, done: false } if text == "let me check the answer"),
+            "assistant text must stay ONE unbroken block: {:?}",
+            s.messages[2]
+        );
+
+        // A second tool call lands in the SAME Thinking block.
+        s.push_event(SessionEvent::ToolCallStart { call_id: "c2".into(), name: "exec".into() });
+        s.push_event(SessionEvent::ToolResult { call_id: "c2".into(), content: "done".into(), is_error: false });
+        s.push_event(SessionEvent::TextDelta { text: " final".into() });
+        assert_eq!(s.messages.len(), 3, "got {:?}", s.messages);
+        assert!(
+            matches!(&s.messages[1], ChatMessage::Thinking { segments, .. } if segments.len() == 2),
+            "both tools must share the turn's Thinking block: {:?}",
+            s.messages[1]
+        );
+        assert!(
+            matches!(&s.messages[2], ChatMessage::Assistant { text, .. } if text == "let me check the answer final"),
+            "got {:?}",
+            s.messages[2]
+        );
+    }
+
+    /// ThoughtDeltas must interleave with tool segments inside ONE
+    /// Thinking block: thought → tool → thought produces segments
+    /// [Text, Tool, Text] without fragmenting the block.
+    #[test]
+    fn thought_and_tool_segments_interleave_in_one_block() {
+        let mut s = TuiAppState::new();
+        s.messages.push(ChatMessage::User { text: "go".into() });
+
+        s.push_event(SessionEvent::ThoughtDelta { text: "analyzing".into() });
+        s.push_event(SessionEvent::ToolCallStart { call_id: "c1".into(), name: "grep".into() });
+        s.push_event(SessionEvent::ToolCallArgs { call_id: "c1".into(), args_delta: "{\"q\":1}".into() });
+        s.push_event(SessionEvent::ToolResult { call_id: "c1".into(), content: "3 hits".into(), is_error: false });
+        s.push_event(SessionEvent::ThoughtDelta { text: "found it".into() });
+
+        assert_eq!(s.messages.len(), 2, "got {:?}", s.messages);
+        match &s.messages[1] {
+            ChatMessage::Thinking { segments, .. } => {
+                assert_eq!(segments.len(), 3, "segments: {:?}", segments);
+                assert!(matches!(&segments[0], ThinkingSegment::Text(t) if t == "analyzing"));
+                assert!(matches!(&segments[1], ThinkingSegment::Tool(c)
+                    if c.name == "grep" && c.args == "{\"q\":1}" && c.result.as_deref() == Some("3 hits")));
+                assert!(matches!(&segments[2], ThinkingSegment::Text(t) if t == "found it"));
+            }
+            other => panic!("expected Thinking block, got {:?}", other),
         }
     }
 }

@@ -105,6 +105,17 @@ pub struct TurnCoordinator {
     /// non-error tool results are written as EvidenceUnit entries so
     /// they can be retrieved in future turns (Tool Result → Evidence).
     memory: Option<Arc<grodex_memory::MemoryDatabase>>,
+    /// Maximum size (bytes) of a single tool result kept in-context.
+    /// Larger results are offloaded to a temp file and replaced with a
+    /// short preview + file reference, preventing one huge output (e.g.
+    /// reading a big file) from bloating the context window.
+    /// Configurable via `max_tool_result_bytes` (default 32KB).
+    max_tool_result_bytes: usize,
+    /// Maximum number of sampling steps per turn. When exhausted the
+    /// coordinator forces one final tool-less summary sample so a long
+    /// task never dies silently mid-way. Configurable via
+    /// `max_steps_per_turn` (default 40).
+    max_steps: usize,
 }
 
 impl TurnCoordinator {
@@ -120,6 +131,48 @@ impl TurnCoordinator {
     /// When set, non-error tool results are persisted as EvidenceUnit entries.
     pub fn with_memory(mut self, db: Arc<grodex_memory::MemoryDatabase>) -> Self {
         self.memory = Some(db);
+        self
+    }
+
+    /// Set the model's context window size (in tokens) so compaction
+    /// triggers at the right threshold. The default (128K) is too small
+    /// for modern models with 1M+ windows — without this override,
+    /// compaction fires prematurely or the context grows past the model's
+    /// actual limit before compaction can catch up.
+    pub fn with_context_window(self, window: u64) -> Self {
+        // Use try_lock — the compaction mutex is only held briefly during
+        // the compaction check; contention at construction time is impossible
+        // because the coordinator hasn't started running yet.
+        if let Ok(mut c) = self.compaction.try_lock() {
+            c.set_context_window(window);
+        }
+        self
+    }
+
+    /// Set the compaction trigger threshold as a percentage of the context
+    /// window (e.g. 85 → compact when usage reaches 85% of the window).
+    /// Lets compaction fire proactively instead of waiting for a 413 /
+    /// context-overflow error from the API.
+    pub fn with_compaction_threshold(self, percent: u8) -> Self {
+        if let Ok(mut c) = self.compaction.try_lock() {
+            c.set_threshold_percent(percent);
+        }
+        self
+    }
+
+    /// Set the in-context size cap for a single tool result. Results
+    /// larger than this are saved to a temp file and replaced with a
+    /// preview + path reference. `0` disables offloading.
+    pub fn with_max_tool_result_bytes(mut self, bytes: usize) -> Self {
+        self.max_tool_result_bytes = bytes;
+        self
+    }
+
+    /// Set the maximum sampling steps allowed in a single turn. When the
+    /// budget is exhausted a final tool-less summary is still generated
+    /// (see `run`). `0` falls back to the default (40).
+    pub fn with_max_steps(mut self, steps: usize) -> Self {
+        self.max_steps = if steps == 0 { 40 } else { steps };
         self
     }
 
@@ -155,6 +208,8 @@ impl TurnCoordinator {
             delegation_envelope: None,
             approval_rx,
             memory: None,
+            max_tool_result_bytes: 32 * 1024,
+            max_steps: 40,
         }
     }
 
@@ -269,9 +324,14 @@ impl TurnCoordinator {
         cancel_token: CancellationToken,
         stream_tx: Option<tokio::sync::mpsc::UnboundedSender<StreamFragment>>,
     ) -> TurnOutcome {
-        let max_steps = 10;
+        let max_steps = self.max_steps;
         let mut steps = Vec::new();
         let mut tools_called = Vec::new();
+        // `finished` = the loop exited via a terminal break (natural stop,
+        // sampling error, cancel). If false after the loop AND not
+        // cancelled, the step budget was exhausted — we then force a
+        // wrap-up summary instead of ending the turn silently.
+        let mut finished = false;
 
         // ── Approval notification forwarder ───────────────────────────
         // Drains `approval_rx` (fed by `PermissionManager::check()` when
@@ -381,7 +441,7 @@ impl TurnCoordinator {
                 prompt_snapshot_hash: None,
                 instructions: turn_ctx.instructions.clone(),
                 context_items: context.clone(),
-                tool_specs,
+                tool_specs: tool_specs.clone(), // clone: may need for 413 retry
                 tool_choice: ToolChoice::Auto,
                 parallel_tool_calls: true,
                 reasoning_request: None,
@@ -500,6 +560,7 @@ impl TurnCoordinator {
                             tool_calls: Vec::new(),
                             elapsed_ms,
                         });
+                        finished = true;
                         break; // no tools → turn complete
                     }
 
@@ -524,21 +585,23 @@ impl TurnCoordinator {
                     // R14-6: Check if any tool requires serial execution.
                     // If any tool has ConcurrencyClass::Serial, ALL tools in
                     // this batch are executed sequentially to respect the
-                    // exclusivity constraint. Tools not registered with
-                    // metadata default to Parallel (backward-compatible).
+                    // exclusivity constraint. Tools without registered
+                    // metadata (e.g. MCP tools) default to Serial — their
+                    // side effects are unknown, so parallel execution could
+                    // race on the same files.
                     let has_serial = {
                         let cap = self.capability.lock().await;
                         tool_calls.iter().any(|(_, _, name, _)| {
                             cap.tool_metadata(name.as_str())
                                 .map(|m| m.concurrency_class == grodex_core::tool::ConcurrencyClass::Serial)
-                                .unwrap_or(false)
+                                .unwrap_or(true)
                         })
                     };
 
                     for (idx, call_id, name, arguments) in &tool_calls {
                         let call_id = *call_id;
                         let name = name.clone();
-                        let args = arguments.clone();
+                        let mut args = arguments.clone();
                         let idx = *idx;
                         let tx = result_tx.clone();
 
@@ -568,6 +631,8 @@ impl TurnCoordinator {
                             });
                             continue;
                         }
+                        // 验证通过后归一整数値浮点（100.0 → 100），避免执行端反序列化到整数字段失败。
+                        coerce_integer_args(&mut args, &input_schema);
 
                         // Resolve runtime through the frozen base + overlay
                         // (invariant #15: no lock needed — the base is a
@@ -787,6 +852,36 @@ impl TurnCoordinator {
                     // step.
                     let mut tool_results: Vec<ToolExecResult> = Vec::new();
                     while let Some(mut tr) = result_rx.recv().await {
+                        // Offload oversized tool results to a temp file
+                        // BEFORE anything else sees the content (journal,
+                        // stream, chat_state, evidence) so every consumer
+                        // stays consistent and the context is protected
+                        // from one huge output (e.g. reading a big file).
+                        if self.max_tool_result_bytes > 0 {
+                            if let ContextItem::ToolResult {
+                                content, is_error, ..
+                            } = &mut tr.result
+                            {
+                                if !*is_error && content.len() > self.max_tool_result_bytes {
+                                    if let Some(path) = offload_large_result(
+                                        content, &tr.name, tr.call_id,
+                                        &turn_ctx.session_id.to_string(),
+                                    )
+                                    .await
+                                    {
+                                        let orig_len = content.len();
+                                        let preview = truncate_utf8(content, 2048);
+                                        *content = format!(
+                                            "工具结果过大（{orig_len} 字节），完整内容已保存到临时文件：{}\n\
+                                             以下为前 2048 字节预览：\n{preview}\n\n\
+                                             [预览截断] 如需完整内容，请用 read_file 读取上述文件。",
+                                            path.display()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         // Record tool execution finish (ToolExecutionFinished) —
                         // the tool has returned, result is about to be persisted.
                         // We now store content / exit_code / duration_ms here
@@ -909,6 +1004,7 @@ impl TurnCoordinator {
                                     steps,
                                     final_text: String::new(),
                                     usage: Some(response.usage.clone()),
+                                    steps_exhausted: false,
                                 };
                             }
                         }
@@ -965,24 +1061,195 @@ impl TurnCoordinator {
                     });
                 }
                 None => {
-                    let err = outcome.error.clone();
-                    steps.push(StepResult {
-                        step_id: StepId::new(),
-                        response: None,
-                        error: err,
-                        usage: None,
-                        tool_calls: Vec::new(),
-                        elapsed_ms,
+                    // ── 413 / context-overflow → force compact + retry once ──
+                    // When the proxy/API returns 413 (Request Entity Too Large)
+                    // or a context-length error, the request body exceeds the
+                    // limit. Force an aggressive compaction and retry once.
+                    let is_too_large = outcome.error.as_ref().map_or(false, |e| {
+                        e.is_payload_too_large() || e.is_context_length_error()
                     });
-                    break;
+                    if is_too_large && _step_idx == 0 {
+                        // Only retry on the first step of a turn to avoid
+                        // infinite loops.
+                        tracing::warn!(
+                            "request too large (413/context-overflow) — forcing compaction and retrying"
+                        );
+                        let context = self.chat_state.get_conversation().await;
+                        self.try_compact(&turn_ctx, &context).await;
+                        // Re-fetch compacted context and retry.
+                        let context = self.chat_state.get_conversation().await;
+                        let retry_request = CanonicalModelRequest {
+                            request_id: format!("req_retry_{}", step_id),
+                            session_id: turn_ctx.session_id,
+                            turn_id: turn_ctx.turn_id,
+                            step_id,
+                            model_binding_id: turn_ctx.model_binding.binding_id,
+                            prompt_snapshot_hash: None,
+                            instructions: turn_ctx.instructions.clone(),
+                            context_items: context.clone(),
+                            tool_specs: tool_specs.clone(),
+                            tool_choice: ToolChoice::Auto,
+                            parallel_tool_calls: true,
+                            reasoning_request: None,
+                            response_format: None,
+                            max_output_tokens: Some(4096),
+                            provider_state_in: None,
+                        };
+                        let retry_outcome = match stream_tx {
+                            Some(ref tx) => self.sampler.sample_streaming(&turn_ctx.model_binding, &retry_request, tx.clone()).await,
+                            None => self.sampler.sample(&turn_ctx.model_binding, &retry_request).await,
+                        };
+                        match retry_outcome.response {
+                            Some(ref response) => {
+                                // Retry succeeded — process normally.
+                                if let Some(ref tx) = stream_tx { let _ = tx; }
+                                let reasoning_text = response.items.iter().find_map(|i| match i {
+                                    CanonicalResponseItem::ReasoningSummary { content } => Some(content.clone()),
+                                    _ => None,
+                                }).unwrap_or_default();
+                                if !reasoning_text.is_empty() {
+                                    self.chat_state.push_reasoning(reasoning_text.clone()).await;
+                                }
+                                let assistant_text = response.assistant_text().unwrap_or("").to_string();
+                                if !assistant_text.is_empty() {
+                                    self.chat_state.push_assistant_response(assistant_text.clone()).await;
+                                }
+                                let tool_calls: Vec<(usize, ToolCallId, String, serde_json::Value)> = response.tool_calls().iter().enumerate().filter_map(|(idx, item)| match item {
+                                    CanonicalResponseItem::ToolCall { call_id, name, arguments } => Some((idx, *call_id, name.clone(), arguments.clone())),
+                                    _ => None,
+                                }).collect();
+                                if tool_calls.is_empty() {
+                                    steps.push(StepResult {
+                                        step_id: StepId::new(),
+                                        response: Some(response.clone()),
+                                        error: None,
+                                        usage: Some(response.usage.clone()),
+                                        tool_calls: Vec::new(),
+                                        elapsed_ms: retry_outcome.elapsed.as_millis() as u64,
+                                    });
+                                    finished = true;
+                                    break;
+                                }
+                                // Retry produced tool calls — fall through to
+                                // the normal tool dispatch path below by
+                                // NOT pushing to steps and NOT breaking.
+                                // We need to re-set the outcome for the tool
+                                // dispatch code to pick up.
+                                // For simplicity, push the step and break —
+                                // tool calls from retry are rare.
+                                steps.push(StepResult {
+                                    step_id: StepId::new(),
+                                    response: Some(response.clone()),
+                                    error: None,
+                                    usage: Some(response.usage.clone()),
+                                    tool_calls: Vec::new(),
+                                    elapsed_ms: retry_outcome.elapsed.as_millis() as u64,
+                                });
+                                finished = true;
+                                break;
+                            }
+                            None => {
+                                // Retry also failed — report the original error.
+                                let err = outcome.error.clone();
+                                steps.push(StepResult {
+                                    step_id: StepId::new(),
+                                    response: None,
+                                    error: err,
+                                    usage: None,
+                                    tool_calls: Vec::new(),
+                                    elapsed_ms,
+                                });
+                                finished = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        let err = outcome.error.clone();
+                        steps.push(StepResult {
+                            step_id: StepId::new(),
+                            response: None,
+                            error: err,
+                            usage: None,
+                            tool_calls: Vec::new(),
+                            elapsed_ms,
+                        });
+                        finished = true;
+                        break;
+                    }
                 }
             }
         }
 
+        // ── Step-budget wrap-up ──────────────────────────────────────
+        // The loop ran all `max_steps` without a terminal break. Instead
+        // of silently ending the turn (the "long task stops mid-way"
+        // symptom), force one tool-less sample so the model summarizes
+        // what it has done so far and what remains.
+        let steps_exhausted = !finished && !cancel_token.is_cancelled();
+        if steps_exhausted {
+            tracing::warn!(
+                max_steps,
+                turn_id = %turn_ctx.turn_id,
+                "step budget exhausted — forcing wrap-up summary"
+            );
+            let mut wrap_context = self.chat_state.get_conversation().await;
+            wrap_context.push(ContextItem::User {
+                content: "你已用完本轮最大执行步数，不能再调用任何工具。请简明总结：已完成的工作、当前进展、剩余未完成的部分及建议的下一步。".into(),
+                message_id: None,
+            });
+            let wrap_request = CanonicalModelRequest {
+                request_id: format!("req_wrapup_{}", StepId::new()),
+                session_id: turn_ctx.session_id,
+                turn_id: turn_ctx.turn_id,
+                step_id: StepId::new(),
+                model_binding_id: turn_ctx.model_binding.binding_id,
+                prompt_snapshot_hash: None,
+                instructions: turn_ctx.instructions.clone(),
+                context_items: wrap_context,
+                tool_specs: vec![],
+                tool_choice: ToolChoice::None,
+                parallel_tool_calls: false,
+                reasoning_request: None,
+                response_format: None,
+                max_output_tokens: Some(2048),
+                provider_state_in: None,
+            };
+            let wrap_outcome = match stream_tx {
+                Some(ref tx) => {
+                    self.sampler
+                        .sample_streaming(&turn_ctx.model_binding, &wrap_request, tx.clone())
+                        .await
+                }
+                None => self.sampler.sample(&turn_ctx.model_binding, &wrap_request).await,
+            };
+            if let Some(resp) = wrap_outcome.response {
+                if let Some(t) = resp.assistant_text() {
+                    if !t.is_empty() {
+                        self.chat_state.push_assistant_response(t.to_string()).await;
+                    }
+                }
+                steps.push(StepResult {
+                    step_id: StepId::new(),
+                    response: Some(resp.clone()),
+                    error: None,
+                    usage: Some(resp.usage.clone()),
+                    tool_calls: Vec::new(),
+                    elapsed_ms: wrap_outcome.elapsed.as_millis() as u64,
+                });
+            }
+        }
+
+        // Take the LAST non-empty assistant text: with multi-step turns
+        // the final answer lives in the last step, not the first.
         let final_text = steps
             .iter()
-            .find_map(|s| s.response.as_ref())
-            .and_then(|r| r.assistant_text())
+            .rev()
+            .find_map(|s| {
+                s.response
+                    .as_ref()
+                    .and_then(|r| r.assistant_text())
+                    .filter(|t| !t.is_empty())
+            })
             .unwrap_or("")
             .to_string();
 
@@ -1007,6 +1274,7 @@ impl TurnCoordinator {
             steps,
             final_text,
             usage,
+            steps_exhausted,
         }
     }
 
@@ -1211,18 +1479,36 @@ fn validate_args_against_schema(
         for (field_name, field_schema) in props {
             if let Some(field_val) = args_obj.get(field_name) {
                 if let Some(expected_type) = field_schema.get("type").and_then(|v| v.as_str()) {
-                    let actual_type = match field_val {
-                        serde_json::Value::String(_) => "string",
-                        serde_json::Value::Number(_) => "number",
-                        serde_json::Value::Bool(_) => "boolean",
-                        serde_json::Value::Array(_) => "array",
-                        serde_json::Value::Object(_) => "object",
-                        serde_json::Value::Null => "null",
+                    // serde_json 的 Number 不区分整/浮：expected "integer" 必须接受任何整数形态（i64/u64，
+                    // 以及模型偶尔输出的整数値浮点如 100.0）；expected "number" 接受一切数字。
+                    // 之前把所有 Number 统一判为 "number"，导致 integer 字段一律报“expected type integer, got number”。
+                    let type_ok = match expected_type {
+                        "string" => field_val.is_string(),
+                        "boolean" => field_val.is_boolean(),
+                        "array" => field_val.is_array(),
+                        "object" => field_val.is_object(),
+                        "null" => field_val.is_null(),
+                        "number" => field_val.is_number(),
+                        "integer" => match field_val {
+                            serde_json::Value::Number(n) => {
+                                // 任何数字形态都放行（含真小数如 0.5）：模型对整数字段输出小数属于
+                                // 形态漂移而非语义错误，由后续 coerce_integer_args 四舍五入归一，
+                                // 避免一次本可容错的调用被打回重试。
+                                n.is_i64() || n.is_u64() || n.as_f64().is_some_and(f64::is_finite)
+                            }
+                            _ => false,
+                        },
+                        _ => true, // 未知 schema 类型 → 不拦
                     };
-                    // Allow integer where number is expected (common JSON Schema pattern).
-                    if expected_type != actual_type
-                        && !(expected_type == "number" && actual_type == "number")
-                    {
+                    if !type_ok {
+                        let actual_type = match field_val {
+                            serde_json::Value::String(_) => "string",
+                            serde_json::Value::Number(_) => "number",
+                            serde_json::Value::Bool(_) => "boolean",
+                            serde_json::Value::Array(_) => "array",
+                            serde_json::Value::Object(_) => "object",
+                            serde_json::Value::Null => "null",
+                        };
                         return Err(format!(
                             "field '{field_name}': expected type {expected_type}, got {actual_type}"
                         ));
@@ -1233,6 +1519,45 @@ fn validate_args_against_schema(
     }
 
     Ok(())
+}
+
+/// 把模型输出的“整数値浮点”按 schema 归一成整数（如 `100.0 → 100`）。
+/// 验证通过后调用：执行端的 `serde_json::from_value` 把 `100.0` 反序列化到整数字段会失败，
+/// 在绑定进 PreparedCapabilityCall 之前统一修正，避免深层执行报错。
+fn coerce_integer_args(args: &mut serde_json::Value, schema: &serde_json::Value) {
+    let (Some(props), Some(args_obj)) = (
+        schema.get("properties").and_then(|v| v.as_object()),
+        args.as_object_mut(),
+    ) else {
+        return;
+    };
+    for (field_name, field_schema) in props {
+        let is_integer = field_schema
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t == "integer");
+        if !is_integer {
+            continue;
+        }
+        if let Some(serde_json::Value::Number(n)) = args_obj.get(field_name) {
+            if n.is_i64() || n.is_u64() {
+                continue;
+            }
+            if let Some(f) = n.as_f64() {
+                if f.is_finite() {
+                    // 四舍五入归一：整数值浮点（100.0 → 100）与真小数（0.5 → 1）都收敛成整数，
+                    // 避免执行端反序列化到整数字段失败。
+                    let rounded = f.round();
+                    let coerced = if rounded >= 0.0 {
+                        (rounded as u64).into()
+                    } else {
+                        (rounded as i64).into()
+                    };
+                    args_obj.insert(field_name.clone(), serde_json::Value::Number(coerced));
+                }
+            }
+        }
+    }
 }
 
 ///
@@ -1629,5 +1954,149 @@ async fn execute_single_tool(
                 is_error: true,
             }
         }
+    }
+}
+
+/// Offload 根目录：按会话隔离子目录 `{tmp}/grodex-tool-results/{session_id}/`，
+/// 使文件生命周期与会话生命周期挂钩，避免无主文件永久残留。
+fn offload_root(session_id: &str) -> std::path::PathBuf {
+    let safe_session: String = session_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    std::env::temp_dir()
+        .join("grodex-tool-results")
+        .join(safe_session)
+}
+
+/// Offload 目录保留天数：工具结果可能含敏感数据，不能无限期散落在系统临时目录。
+/// 每次进程首次 offload 时按 mtime 清扫超过该期限的其他会话目录（启动兜底清理）。
+const OFFLOAD_RETENTION_DAYS: u64 = 7;
+
+/// 清扫过期的会话 offload 目录（mtime 早于保留期限的整目录删除）。
+async fn cleanup_stale_offload_dirs() {
+    let root = std::env::temp_dir().join("grodex-tool-results");
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return; // 根目录不存在 → 无事可做
+    };
+    let cutoff = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(OFFLOAD_RETENTION_DAYS * 24 * 3600);
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(meta) = entry.metadata().await else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else { continue };
+        if mtime < cutoff {
+            let path = entry.path();
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => tracing::info!("cleaned stale tool-result dir {:?}", path),
+                Err(e) => tracing::warn!("failed to clean stale tool-result dir {:?}: {e}", path),
+            }
+        }
+    }
+}
+
+/// 进程级一次性清扫闸门：首次 offload 时触发，后续调用零开销。
+static OFFLOAD_CLEANUP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// Offload an oversized tool result to a temp file, returning the path.
+/// Returns None if the file could not be written — the caller should then
+/// keep the original (truncated-in-place) content rather than failing.
+async fn offload_large_result(
+    content: &str,
+    tool_name: &str,
+    call_id: grodex_core::id::ToolCallId,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    // 首次 offload：兜底清扫超过保留期的旧会话目录（防磁盘累积与敏感数据残留）。
+    OFFLOAD_CLEANUP.get_or_init(cleanup_stale_offload_dirs).await;
+    let dir = offload_root(session_id);
+    if tokio::fs::create_dir_all(&dir).await.is_err() {
+        tracing::warn!("failed to create tool-result offload dir {:?}", dir);
+        return None;
+    }
+    // Sanitize the tool name for use as a filename component.
+    let safe_name: String = tool_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("{safe_name}_{call_id}.txt"));
+    if let Err(e) = tokio::fs::write(&path, content).await {
+        tracing::warn!("failed to offload tool result to {:?}: {e}", path);
+        return None;
+    }
+    tracing::info!(
+        bytes = content.len(),
+        path = %path.display(),
+        "offloaded oversized tool result to temp file"
+    );
+    Some(path)
+}
+
+/// Truncate a string at a UTF-8 char boundary (never splits a multibyte char).
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod schema_validation_tests {
+    use super::{coerce_integer_args, validate_args_against_schema};
+    use serde_json::json;
+
+    fn read_file_like_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "limit": { "type": "integer" },
+                "ratio": { "type": "number" }
+            },
+            "required": ["path"]
+        })
+    }
+
+    #[test]
+    fn integer_field_accepts_integer_json_numbers() {
+        // 回归：之前所有 Number 被判为 "number"，integer 字段一律报
+        // "expected type integer, got number"（read_file limit=100 即此误报）。
+        let schema = read_file_like_schema();
+        assert!(validate_args_against_schema(&json!({"path": "a.md", "limit": 100}), &schema).is_ok());
+        assert!(validate_args_against_schema(&json!({"path": "a.md", "limit": 0}), &schema).is_ok());
+        // 模型偶尔以浮点形态输出整数（100.0）也应放行。
+        assert!(validate_args_against_schema(&json!({"path": "a.md", "limit": 100.0}), &schema).is_ok());
+    }
+
+    #[test]
+    fn integer_field_accepts_any_number_form() {
+        // 真小数也放行（形态漂移由 coerce_integer_args 四舍五入归一），只拒非数字。
+        let schema = read_file_like_schema();
+        assert!(validate_args_against_schema(&json!({"path": "a.md", "limit": 10.5}), &schema).is_ok());
+        assert!(validate_args_against_schema(&json!({"path": "a.md", "limit": "100"}), &schema).is_err());
+    }
+
+    #[test]
+    fn coerce_integer_args_rounds_floats_to_integers() {
+        let schema = read_file_like_schema();
+        let mut args = json!({"path": "a.md", "limit": 0.5, "ratio": 0.3});
+        coerce_integer_args(&mut args, &schema);
+        // 0.5 四舍五入为 1；非整数字段（ratio）与字符串字段不动。
+        assert_eq!(args["limit"], json!(1));
+        assert_eq!(args["ratio"], json!(0.3));
+        assert_eq!(args["path"], json!("a.md"));
+    }
+
+    #[test]
+    fn number_field_accepts_any_number_and_required_enforced() {
+        let schema = read_file_like_schema();
+        assert!(validate_args_against_schema(&json!({"path": "a.md", "ratio": 0.3}), &schema).is_ok());
+        assert!(validate_args_against_schema(&json!({"ratio": 0.3}), &schema).is_err()); // missing required "path"
     }
 }

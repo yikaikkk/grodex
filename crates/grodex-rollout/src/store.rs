@@ -47,6 +47,14 @@ pub trait RolloutStore: Send + Sync + 'static {
     async fn write_blob_async(&self, content: &[u8], mime_type: &str) -> Result<BlobRef, GrodexError>;
     async fn read_blob_async(&self, blob_id: &BlobId) -> Result<Vec<u8>, GrodexError>;
     async fn replay_from(&self, seq: u64) -> Result<Vec<RolloutEvent>, GrodexError>;
+
+    /// On-disk path of the JSONL journal, when the store is file-backed.
+    /// Lets replay callers use streaming/lean readers (e.g.
+    /// `replay_journal_lean`) that skip multi-MB redundant payloads.
+    /// Non-file stores return `None`.
+    fn journal_path(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -188,6 +196,11 @@ impl FileRolloutStore {
         replay_journal_strict(&jsonl, from_seq)
     }
 
+    /// Absolute path of this store's JSONL journal file.
+    pub fn journal_file(&self) -> PathBuf {
+        self.session_dir.join("rollout.jsonl")
+    }
+
     /// Default store location: `~/.grodex/sessions/`
     pub fn default_dir() -> PathBuf {
         dirs::home_dir()
@@ -322,6 +335,10 @@ impl FileRolloutStore {
 
 #[async_trait::async_trait]
 impl RolloutStore for FileRolloutStore {
+    fn journal_path(&self) -> Option<PathBuf> {
+        Some(self.journal_file())
+    }
+
     async fn append_event(&self, event: RolloutEvent) -> Result<u64, GrodexError> {
         FileRolloutStore::append_event(self, event).await
     }

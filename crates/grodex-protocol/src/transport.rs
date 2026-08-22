@@ -40,6 +40,12 @@ pub enum ServerFrame {
         ping_sent_at_ms: u64,
         pong_at_ms: u64,
     },
+    /// 服务端主动心跳（长工具执行期间事件流可能长时间静默，
+    /// 周期性 Ping 防止前端把闲置连接误判为断开）。
+    /// 客户端无需回复，也不占用事件 seq / inflight 窗口。
+    Ping {
+        sent_at_ms: u64,
+    },
     /// 服务端错误（协议解析错误、命令校验失败）。注意：不是业务错误。
     ProtocolError {
         code: String,

@@ -80,6 +80,13 @@ struct MsgUsage {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+    /// Prompt-cache fields: `cache_read_input_tokens` is the cache-hit
+    /// subset; `cache_creation_input_tokens` is what was written to cache.
+    /// Both are ADDITIONAL to `input_tokens` in Anthropic accounting.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 pub struct MessagesDecoder {
@@ -260,16 +267,26 @@ impl StreamingDecoder for MessagesDecoder {
             _ => Some(StopReason::Stop),
         };
 
-        let usage = self.usage.as_ref().map(|u| SettledUsage {
-            estimated: false,
-            input_tokens: u.input_tokens.unwrap_or(0),
-            cached_input_tokens: 0,
-            cache_creation_tokens: 0,
-            output_tokens: u.output_tokens.unwrap_or(0),
-            reasoning_tokens: 0,
-            total_tokens: u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0),
-            cost_micro_units: None,
-            currency: None,
+        let usage = self.usage.as_ref().map(|u| {
+            // Anthropic reports cache tokens SEPARATELY from input_tokens
+            // (input_tokens only counts uncached input). Normalize to the
+            // SettledUsage convention where input_tokens INCLUDES the
+            // cached subset.
+            let base = u.input_tokens.unwrap_or(0);
+            let cache_read = u.cache_read_input_tokens.unwrap_or(0);
+            let cache_create = u.cache_creation_input_tokens.unwrap_or(0);
+            let input_total = base + cache_read + cache_create;
+            SettledUsage {
+                estimated: false,
+                input_tokens: input_total,
+                cached_input_tokens: cache_read,
+                cache_creation_tokens: cache_create,
+                output_tokens: u.output_tokens.unwrap_or(0),
+                reasoning_tokens: 0,
+                total_tokens: input_total + u.output_tokens.unwrap_or(0),
+                cost_micro_units: None,
+                currency: None,
+            }
         }).unwrap_or_else(|| SettledUsage {
             estimated: true,
             input_tokens: 0, cached_input_tokens: 0, cache_creation_tokens: 0,

@@ -78,11 +78,19 @@ pub enum SessionCommand {
     /// Used by the `/resume <id>` flow: the agent reads the old session's
     /// rollout journal, rebuilds the full context via SessionReducer, then
     /// sends this command so the supervisor's Session.context carries the
-    /// restored history for future prompt building. The restored items are
-    /// also persisted to the *new* session's journal as ContextRestored so
-    /// a second crash does not lose the recovered history twice.
+    /// restored history for future prompt building.
+    ///
+    /// `persist` controls whether the items are ALSO written to the
+    /// attached journal as a `ContextRestored` event:
+    ///   - `true`  — boot-restore into a FRESH session (the journal has no
+    ///     other record of the history; a second crash must not lose it).
+    ///   - `false` — same-journal resume: the writer was just rebound to
+    ///     the session whose journal we replayed, so every item already
+    ///     exists on disk. Persisting the whole context again snowballed
+    ///     journals by a full copy per resume (436 MB observed).
     RestoreContext {
         items: Vec<ContextItem>,
+        persist: bool,
     },
     /// Swap the RolloutWriter's attached store + session id AND reseed
     /// the monotonic seq counter so future journal writes append to the
@@ -133,9 +141,10 @@ impl std::fmt::Debug for SessionCommand {
                 .field("idempotency_key", idempotency_key)
                 .field("emit_snapshot_to_frontend", emit_snapshot_to_frontend)
                 .finish(),
-            SessionCommand::RestoreContext { items } => f
+            SessionCommand::RestoreContext { items, persist } => f
                 .debug_struct("RestoreContext")
                 .field("items_count", &items.len())
+                .field("persist", persist)
                 .finish(),
             // Arc<dyn RolloutStore> is not Debug; skip the opaque store handle.
             SessionCommand::RebindRolloutWriter { new_session_id, next_seq, new_store: _ } => f
@@ -179,10 +188,19 @@ pub enum SessionEvent {
     IndeterminateToolCall { call_id: String, tool_name: String, message: String },
     /// A Step completed.
     StepCompleted { turn_id: TurnId, text: String },
-    /// A Turn reached a terminal state.
-    TurnCompleted { turn_id: TurnId },
+    /// A Turn reached a terminal state. Carries aggregated token usage
+    /// so the frontend can display the prompt-cache hit rate.
+    TurnCompleted {
+        turn_id: TurnId,
+        input_tokens: u64,
+        cached_tokens: u64,
+    },
     /// An error occurred.
     Error { message: String },
+    /// Structured sub-agent lifecycle/progress event (started / internal
+    /// step / finished). The TUI renders each sub-agent as a collapsible
+    /// card driven by these events. Maps to ACP SubagentProgress.
+    SubagentProgress(crate::delegate_tool::SubagentProgress),
     /// Informational log (not an error, no UX alerting). Use this for
     /// success confirmations (resume, export, diagnostics, …) instead of
     /// abusing `Error` as a generic "toast". The frontend renders Info

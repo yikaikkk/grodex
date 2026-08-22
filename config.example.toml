@@ -17,6 +17,46 @@ wire_protocol = "responses"
 # API endpoint (optional, defaults to provider's standard endpoint)
 # endpoint = "https://api.openai.com/v1"
 
+# ── Context Window ────────────────────────────────────
+# Model context window size in tokens. If not specified, the system
+# auto-detects based on model name (see built-in table below).
+# Common models:
+#   gpt-5                            → 256K
+#   gpt-4, gpt-4-turbo, gpt-4o     → 128K
+#   gpt-4.1                          → 1M
+#   gpt-3.5-turbo                   → 16K
+#   claude-* (all current)           → 200K
+#   deepseek-chat, deepseek-coder   → 128K
+#   qwen-max, qwen-plus             → 128K
+#   qwen-turbo                      → 1M
+#   gemini-1.5-pro                  → 2M
+# Unknown models default to 1M; set context_window explicitly to override.
+# context_window = 1048576
+
+# Compaction threshold: when context usage reaches this percentage of
+# context_window, auto-compaction is triggered. Default: 85 (%).
+# Lower values trigger compaction earlier (more aggressive pruning).
+# compaction_threshold_percent = 85
+
+# ── Tool Result Limits ─────────────────────────────────
+# Maximum size (in bytes) for a single tool result before it's saved
+# to a temp file and replaced with a reference. Default: 32KB.
+# Large tool outputs (e.g. reading big files) are automatically
+# offloaded to prevent context bloat.
+# max_tool_result_bytes = 32768
+
+# Maximum sampling steps per turn. Long multi-tool tasks need a larger
+# budget; when exhausted, the model is forced to emit a progress summary
+# instead of stopping silently. Default: 40.
+# max_steps_per_turn = 40
+
+# Sub-agent caps for the delegate_task tool. `max_subagents` limits how
+# many sub-agents may run concurrently; `max_subagents_per_session` caps
+# the session total (defaults to 4x the concurrent cap). Over-cap
+# delegations are refused with a message the model can act on.
+# max_subagents = 4
+# max_subagents_per_session = 16
+
 # ── Authentication ────────────────────────────────────
 # API key can be set here or via environment variable:
 #   OPENAI_API_KEY=sk-...
@@ -38,7 +78,9 @@ wire_protocol = "responses"
 # Enable long-term memory
 # [memory]
 # enabled = true
-# path = "~/.grodex/memory.json"
+# SQLite + FTS5 database path (leading ~ is expanded to the home dir).
+# Precedence: GRODEX_MEMORY_DB env > this value > ~/.grodex/memory.db
+# path = "~/.grodex/memory.db"
 
 # ── Model Routes (failover) ───────────────────────────
 # Define multiple provider/model candidates with ordered failover.

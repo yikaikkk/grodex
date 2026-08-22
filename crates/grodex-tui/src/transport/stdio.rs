@@ -241,6 +241,11 @@ impl StdioClient {
     }
 
     fn handle_server_frame(&mut self, frame: ServerFrame) -> Option<EventEnvelope> {
+        // 服务端主动心跳：不是任何 Command 的响应，
+        // 不能扣减 inflight（否则背压窗口会被慢慢磨穿）。
+        if matches!(frame, ServerFrame::Ping { .. }) {
+            return None;
+        }
         // Each ServerFrame corresponds to exactly one inbound Command (1:1
         // pairing for ACP). **All** frame kinds decrement inflight:
         // previously only `Event` subtracted 1, so a ResumeSession command
@@ -277,6 +282,7 @@ impl StdioClient {
                 self.rtt_ms = Some(rtt);
                 None
             }
+            ServerFrame::Ping { .. } => None, // 已在函数开头提前返回，此分支不可达
             ServerFrame::ProtocolError {
                 code,
                 message,
@@ -335,7 +341,7 @@ fn truncate_str(s: &str, max: usize) -> String {
 pub fn run_with_stdio_transport(agent_cmd: &str, agent_args: &[String]) -> Result<()> {
     let args_vec: Vec<&str> = agent_args.iter().map(|s| s.as_str()).collect();
     let client = StdioClient::spawn_agent_subprocess(agent_cmd, &args_vec)
-        .map_err(|e| anyhow!("无法启动 agent，请先 cargo build -p grodex-cli 或将 grodex 加入 PATH: {e}"))?;
+        .map_err(|e| anyhow!("无法启动 agent（{agent_cmd}）。请先 cargo build -p grodex-cli，或用 --agent-cmd 指定 grodex 可执行文件路径: {e}"))?;
     let tui = crate::GrodexTui::init_with(client)?;
     tui.run_blocking()
 }

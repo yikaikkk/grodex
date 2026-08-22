@@ -23,7 +23,7 @@ async fn writer_assigns_monotonic_gap_free_seq() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
     let store: std::sync::Arc<dyn RolloutStore> =
-        std::sync::Arc::new(FileRolloutStore::new(dir.path(), &sid.to_string()).unwrap());
+        std::sync::Arc::new(FileRolloutStore::new_session(dir.path(), &sid.to_string()).await.unwrap());
     let writer = RolloutWriter::new(store, sid);
 
     let s0 = writer.write_state("idle").await.unwrap();
@@ -40,7 +40,7 @@ async fn writer_resume_from_does_not_collide_with_replayed_events() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
     let store: std::sync::Arc<dyn RolloutStore> =
-        std::sync::Arc::new(FileRolloutStore::new(dir.path(), &sid.to_string()).unwrap());
+        std::sync::Arc::new(FileRolloutStore::new_session(dir.path(), &sid.to_string()).await.unwrap());
     let writer = RolloutWriter::new(store.clone(), sid);
 
     // Write a small journal.
@@ -72,7 +72,7 @@ async fn crash_recovery_rebuilds_transcript_from_journal() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
     let store: std::sync::Arc<dyn RolloutStore> =
-        std::sync::Arc::new(FileRolloutStore::new(dir.path(), &sid.to_string()).unwrap());
+        std::sync::Arc::new(FileRolloutStore::new_session(dir.path(), &sid.to_string()).await.unwrap());
     let writer = RolloutWriter::new(store.clone(), sid);
 
     let turn = grodex_core::id::TurnId::new();
@@ -92,7 +92,7 @@ async fn crash_recovery_rebuilds_transcript_from_journal() {
     // Tool result MUST precede TurnCompleted or the reducer flags it as
     // an orphaned tool call (invariant #9). Use the writer's fenced helper.
     writer
-        .write_tool_finished(turn, step, cap_gen, &call_id.to_string(), "file contents", false)
+        .write_tool_finished(turn, step, cap_gen, &call_id.to_string(), None, "file contents", false)
         .await
         .unwrap();
     writer.write_turn_completed(turn).await.unwrap();
@@ -121,7 +121,7 @@ async fn reducer_detects_generation_regression_with_real_generation() {
     let dir = tempfile::tempdir().unwrap();
     let sid = SessionId::new();
     let store: std::sync::Arc<dyn RolloutStore> =
-        std::sync::Arc::new(FileRolloutStore::new(dir.path(), &sid.to_string()).unwrap());
+        std::sync::Arc::new(FileRolloutStore::new_session(dir.path(), &sid.to_string()).await.unwrap());
     let writer = RolloutWriter::new(store.clone(), sid);
 
     let turn = grodex_core::id::TurnId::new();

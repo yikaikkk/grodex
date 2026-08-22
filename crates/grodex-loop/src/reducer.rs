@@ -31,6 +31,8 @@ pub enum ReducerError {
     GenerationRegression { prev: u64, next: u64 },
     #[error("session mismatch: expected {expected}, got {got}")]
     SessionMismatch { expected: String, got: String },
+    #[error("journal read failed: {0}")]
+    JournalRead(String),
 }
 
 /// Rebuilds session state from a sequence of rollout events.
@@ -214,12 +216,39 @@ impl SessionReducer {
             }
             RolloutEventType::ContextRestored => {
                 // Context items restored from a prior session during resume.
-                // Deserialize and append each item so the transcript is
-                // rebuilt without needing the original journal.
+                // Two journal shapes exist:
+                //   1. Fork/boot-restore journals where ContextRestored is
+                //      the FIRST context-producing event — context is empty,
+                //      append everything.
+                //   2. Legacy journals where resume re-wrote the FULL
+                //      already-reconstructable context back into the SAME
+                //      journal (snowball bug: +1 full copy per resume).
+                //      Replaying the original events already rebuilt the
+                //      context; appending the snapshot again would duplicate
+                //      the transcript sent to the model.
+                // Heuristic: when context is non-empty the snapshot is a
+                // redundant re-write of state that the preceding events in
+                // this same journal already reproduce — drop every item the
+                // context already contains, keep anything genuinely new.
+                // Membership is checked on the serialized form (HashSet)
+                // because items can be hundreds of KB and a linear scan
+                // would dominate resume time on legacy bloated journals.
                 if let Some(items) = event.payload.get("items").and_then(|v| v.as_array()) {
+                    use std::collections::HashSet;
+                    let existing: HashSet<String> = if self.context.is_empty() {
+                        HashSet::new()
+                    } else {
+                        self.context
+                            .iter()
+                            .filter_map(|c| serde_json::to_string(c).ok())
+                            .collect()
+                    };
                     for item_val in items {
                         if let Ok(item) = serde_json::from_value::<ContextItem>(item_val.clone()) {
-                            self.context.push(item);
+                            let key = serde_json::to_string(&item).unwrap_or_default();
+                            if self.context.is_empty() || !existing.contains(&key) {
+                                self.context.push(item);
+                            }
                         }
                     }
                 }
@@ -286,6 +315,117 @@ impl SessionReducer {
     pub fn generation(&self) -> StepGeneration {
         self.current_generation
     }
+}
+
+/// Replay a session journal WITHOUT materializing redundant
+/// `ContextRestored` payloads, reducing the context in the same pass.
+///
+/// Legacy resumes re-wrote the ENTIRE restored context back into the
+/// same journal on every `/resume` (snowball: 436 MB of duplicated
+/// snapshots observed in one session). When replaying such a journal the
+/// original events already reproduce the state, so those multi-MB
+/// `items` arrays are pure waste. This reader detects them with a cheap
+/// substring check + reducer-state probe and parses only a metadata
+/// header for the skipped lines (the giant `payload` value is never
+/// materialized as a `serde_json::Value`).
+///
+/// A `ContextRestored` event IS kept (fully parsed) when the reduced
+/// context is still empty — that shape is a fork/boot-restore journal
+/// whose leading snapshot is the ONLY source of the history.
+///
+/// Returns `(events, last_seq, reduced_context)`.
+pub fn replay_journal_lean(
+    jsonl_path: &std::path::Path,
+    sid: &SessionId,
+) -> Result<(Vec<RolloutEvent>, u64, Vec<ContextItem>), ReducerError> {
+    use grodex_rollout::event::SensitivityLevel;
+
+    /// Metadata-only view of a journal line. Fields not declared here —
+    /// notably the giant `payload` — are tokenized and skipped by
+    /// serde_json WITHOUT being materialized into a `Value`.
+    #[derive(serde::Deserialize)]
+    struct EventHeader {
+        schema_version: u32,
+        seq: u64,
+        session_id: SessionId,
+        #[serde(default)]
+        turn_id: Option<TurnId>,
+        #[serde(default)]
+        step_id: Option<grodex_core::id::StepId>,
+        #[serde(default)]
+        generation: Option<StepGeneration>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        event_type: RolloutEventType,
+        #[serde(default)]
+        sensitivity: Option<SensitivityLevel>,
+    }
+
+    let mut events: Vec<RolloutEvent> = Vec::new();
+    let mut last_seq = 0u64;
+    let mut reducer = SessionReducer::new(*sid);
+
+    grodex_rollout::journal_actor::for_each_journal_line(jsonl_path, |line| {
+        use grodex_core::error::GrodexError;
+        // `event_type` serializes BEFORE the (multi-MB) `payload`, within
+        // the first ~300 bytes of the line — probing only the head keeps
+        // the skip check O(1) per line instead of scanning whole 32MB
+        // lines. Lines where the head says "not ContextRestored" never
+        // need another look.
+        let mut head_len = line.len().min(300);
+        while head_len > 0 && !line.is_char_boundary(head_len) {
+            head_len -= 1;
+        }
+        let is_context_restored = line[..head_len]
+            .contains("\"event_type\":\"ContextRestored\"");
+        if is_context_restored && !reducer.context().is_empty() {
+            // Redundant snapshot — parse metadata only so seq bookkeeping
+            // stays intact without materializing the multi-MB payload.
+            let hdr: EventHeader = serde_json::from_str(line).map_err(|e| {
+                GrodexError::Internal(anyhow::anyhow!(
+                    "resume: parse skipped ContextRestored header: {e}"
+                ))
+            })?;
+            // Belt-and-suspenders: the head probe is a heuristic — verify
+            // the real discriminant before dropping the payload.
+            if hdr.event_type != RolloutEventType::ContextRestored {
+                return Err(GrodexError::Internal(anyhow::anyhow!(
+                    "resume: head probe misidentified event_type {:?}",
+                    hdr.event_type
+                )));
+            }
+            last_seq = last_seq.max(hdr.seq);
+            let ev = RolloutEvent {
+                schema_version: hdr.schema_version,
+                seq: hdr.seq,
+                session_id: hdr.session_id,
+                turn_id: hdr.turn_id,
+                step_id: hdr.step_id,
+                generation: hdr.generation,
+                timestamp: hdr.timestamp,
+                event_type: RolloutEventType::ContextRestored,
+                payload: serde_json::json!({ "items": [] }),
+                sensitivity: hdr.sensitivity.unwrap_or(SensitivityLevel::Normal),
+            };
+            reducer
+                .apply(&ev)
+                .map_err(|e| GrodexError::Internal(anyhow::anyhow!("{e}")))?;
+            events.push(ev);
+            return Ok(());
+        }
+        let ev: RolloutEvent = serde_json::from_str(line).map_err(|e| {
+            GrodexError::Internal(anyhow::anyhow!("resume: journal parse: {e}"))
+        })?;
+        last_seq = last_seq.max(ev.seq);
+        reducer
+            .apply(&ev)
+            .map_err(|e| GrodexError::Internal(anyhow::anyhow!("{e}")))?;
+        events.push(ev);
+        Ok(())
+    })
+    .map_err(|e| ReducerError::JournalRead(e.to_string()))?;
+
+    let ctx = reducer.into_context();
+    Ok((events, last_seq, ctx))
 }
 
 #[cfg(test)]
@@ -393,5 +533,128 @@ mod tests {
         let mut reducer = SessionReducer::new(sid);
         let err = reducer.apply_all(&events).unwrap_err();
         assert!(matches!(err, ReducerError::OrphanedToolResult(_)));
+    }
+
+    /// ContextRestored written back into the SAME journal (legacy
+    /// snowball bug) must not duplicate the transcript on replay.
+    #[test]
+    fn context_restored_dedup_on_full_replay() {
+        let sid = SessionId::new();
+        let user_item = ContextItem::User {
+            content: "hello".into(),
+            message_id: None,
+        };
+        let assistant_item = ContextItem::Assistant { content: "hi there".into() };
+        let events = vec![
+            make_event(sid, 0, RolloutEventType::UserInputAccepted, serde_json::json!({"text": "hello"})),
+            make_event(sid, 1, RolloutEventType::ModelItemProduced, serde_json::json!({"assistant_text": "hi there"})),
+            make_event(sid, 2, RolloutEventType::TurnCompleted, serde_json::json!({})),
+            // Redundant snapshot of the already-reconstructable context.
+            make_event(sid, 3, RolloutEventType::ContextRestored, serde_json::json!({
+                "items": [serde_json::to_value(&user_item).unwrap(), serde_json::to_value(&assistant_item).unwrap()]
+            })),
+        ];
+
+        let mut reducer = SessionReducer::new(sid);
+        reducer.apply_all(&events).unwrap();
+        let ctx = reducer.into_context();
+        // Must stay 2 — the snapshot duplicates items 0..=1.
+        assert_eq!(ctx.len(), 2, "ContextRestored snapshot must not duplicate history");
+    }
+
+    /// Fork/boot-restore journals START with ContextRestored (context
+    /// empty) — those items are the only history source and must be kept.
+    #[test]
+    fn leading_context_restored_kept() {
+        let sid = SessionId::new();
+        let user_item = ContextItem::User {
+            content: "prior history".into(),
+            message_id: None,
+        };
+        let events = vec![
+            make_event(sid, 0, RolloutEventType::ContextRestored, serde_json::json!({
+                "items": [serde_json::to_value(&user_item).unwrap()]
+            })),
+            make_event(sid, 1, RolloutEventType::UserInputAccepted, serde_json::json!({"text": "new turn"})),
+            make_event(sid, 2, RolloutEventType::TurnCompleted, serde_json::json!({})),
+        ];
+
+        let mut reducer = SessionReducer::new(sid);
+        reducer.apply_all(&events).unwrap();
+        let ctx = reducer.into_context();
+        assert_eq!(ctx.len(), 2);
+        assert!(matches!(ctx[0], ContextItem::User { ref content, .. } if content == "prior history"));
+        assert!(matches!(ctx[1], ContextItem::User { ref content, .. } if content == "new turn"));
+    }
+
+    fn write_journal(dir: &tempfile::TempDir, sid: &SessionId, events: &[RolloutEvent]) -> std::path::PathBuf {
+        let session_dir = dir.path().join(sid.to_string());
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let jsonl = session_dir.join("rollout.jsonl");
+        let mut content = String::new();
+        for ev in events {
+            content.push_str(&serde_json::to_string(ev).unwrap());
+            content.push('\n');
+        }
+        std::fs::write(&jsonl, content).unwrap();
+        jsonl
+    }
+
+    /// End-to-end lean replay over a legacy-shaped journal file: the
+    /// redundant ContextRestored payload is skipped, context stays
+    /// duplicate-free, and last_seq still covers the skipped event.
+    #[test]
+    fn lean_replay_skips_redundant_snapshots() {
+        let sid = SessionId::new();
+        let user_item = ContextItem::User {
+            content: "hello".into(),
+            message_id: None,
+        };
+        let events = vec![
+            make_event(sid, 0, RolloutEventType::UserInputAccepted, serde_json::json!({"text": "hello"})),
+            make_event(sid, 1, RolloutEventType::ModelItemProduced, serde_json::json!({"assistant_text": "hi there"})),
+            make_event(sid, 2, RolloutEventType::TurnCompleted, serde_json::json!({})),
+            // Giant redundant snapshot (same items the events above rebuild).
+            make_event(sid, 3, RolloutEventType::ContextRestored, serde_json::json!({
+                "items": [serde_json::to_value(&user_item).unwrap()]
+            })),
+            make_event(sid, 4, RolloutEventType::UserInputAccepted, serde_json::json!({"text": "second"})),
+            make_event(sid, 5, RolloutEventType::TurnCompleted, serde_json::json!({})),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = write_journal(&dir, &sid, &events);
+
+        let (lean_events, last_seq, ctx) = replay_journal_lean(&jsonl, &sid).unwrap();
+        assert_eq!(last_seq, 5);
+        assert_eq!(lean_events.len(), 6);
+        // The skipped snapshot must carry an EMPTY payload.
+        assert_eq!(lean_events[3].payload["items"].as_array().unwrap().len(), 0);
+        // user + assistant + user — no duplicates from the snapshot.
+        assert_eq!(ctx.len(), 3);
+    }
+
+    /// Lean replay keeps a LEADING ContextRestored (fork journal shape).
+    #[test]
+    fn lean_replay_keeps_leading_context_restored() {
+        let sid = SessionId::new();
+        let user_item = ContextItem::User {
+            content: "prior history".into(),
+            message_id: None,
+        };
+        let events = vec![
+            make_event(sid, 0, RolloutEventType::ContextRestored, serde_json::json!({
+                "items": [serde_json::to_value(&user_item).unwrap()]
+            })),
+            make_event(sid, 1, RolloutEventType::UserInputAccepted, serde_json::json!({"text": "new turn"})),
+            make_event(sid, 2, RolloutEventType::TurnCompleted, serde_json::json!({})),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = write_journal(&dir, &sid, &events);
+
+        let (lean_events, last_seq, ctx) = replay_journal_lean(&jsonl, &sid).unwrap();
+        assert_eq!(last_seq, 2);
+        assert_eq!(lean_events.len(), 3);
+        assert_eq!(ctx.len(), 2);
+        assert!(matches!(ctx[0], ContextItem::User { ref content, .. } if content == "prior history"));
     }
 }

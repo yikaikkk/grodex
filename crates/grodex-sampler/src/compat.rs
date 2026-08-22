@@ -230,12 +230,18 @@ mod tests {
     use grodex_core::id::{SessionId, StepId, TurnId};
     use grodex_provider::binding::ModelBindingId;
 
+    /// ModelBindingId is an opaque UUID, so the route's canonical id and
+    /// aliases must be UUID strings that match the request's binding id.
+    const CANONICAL_BINDING: &str = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
+    const ALIAS_BINDING: &str = "1b2c3d4e-5f60-7182-93a4-b5c6d7e8f90a";
+    const MISMATCH_BINDING: &str = "2c3d4e5f-6071-8293-a4b5-c6d7e8f90a1b";
+
     fn make_route(caps: &[&str]) -> RouteEntry {
         RouteEntry {
             name: "test-route".into(),
             provider: "openai".into(),
-            canonical_model_id: "gpt-4o".into(),
-            compatible_aliases: vec!["gpt-4".into()],
+            canonical_model_id: CANONICAL_BINDING.into(),
+            compatible_aliases: vec![ALIAS_BINDING.into()],
             endpoint: "https://api.openai.com/v1".into(),
             weight: 100,
             max_rpm: None,
@@ -270,7 +276,7 @@ mod tests {
     #[test]
     fn compatible_route_no_issues() {
         let route = make_route(&["streaming", "tool_calls", "json_mode", "vision", "parallel_tools", "reasoning"]);
-        let mut req = make_request("gpt-4o");
+        let mut req = make_request(CANONICAL_BINDING);
         req.provider_state_in = Some(serde_json::json!({ "stream": true }));
         req.tool_specs.push(grodex_provider::canonical_request::ToolSpec {
             name: "t".into(),
@@ -296,7 +302,7 @@ mod tests {
     #[test]
     fn missing_streaming_capability() {
         let route = make_route(&[]);
-        let mut req = make_request("gpt-4o");
+        let mut req = make_request(CANONICAL_BINDING);
         req.provider_state_in = Some(serde_json::json!({ "stream": true }));
 
         let issues = CompatibilityGate::evaluate(&req, &route);
@@ -306,7 +312,7 @@ mod tests {
     #[test]
     fn missing_tool_calls_capability() {
         let route = make_route(&[]);
-        let mut req = make_request("gpt-4o");
+        let mut req = make_request(CANONICAL_BINDING);
         req.tool_specs.push(grodex_provider::canonical_request::ToolSpec {
             name: "t".into(),
             description: "d".into(),
@@ -321,7 +327,7 @@ mod tests {
     #[test]
     fn missing_json_mode_capability() {
         let route = make_route(&[]);
-        let mut req = make_request("gpt-4o");
+        let mut req = make_request(CANONICAL_BINDING);
         req.response_format = Some(grodex_provider::canonical_request::ResponseFormat { json_schema: None });
 
         let issues = CompatibilityGate::evaluate(&req, &route);
@@ -331,7 +337,7 @@ mod tests {
     #[test]
     fn missing_vision_capability() {
         let route = make_route(&[]);
-        let mut req = make_request("gpt-4o");
+        let mut req = make_request(CANONICAL_BINDING);
         req.context_items.push(ContextItem::ImagePlaceholder {
             mime_type: "image/png".into(),
             artifact_ref: "ref".into(),
@@ -344,7 +350,7 @@ mod tests {
     #[test]
     fn missing_parallel_tools_capability() {
         let route = make_route(&[]);
-        let mut req = make_request("gpt-4o");
+        let mut req = make_request(CANONICAL_BINDING);
         req.parallel_tool_calls = true;
 
         let issues = CompatibilityGate::evaluate(&req, &route);
@@ -354,7 +360,7 @@ mod tests {
     #[test]
     fn missing_reasoning_capability() {
         let route = make_route(&[]);
-        let mut req = make_request("gpt-4o");
+        let mut req = make_request(CANONICAL_BINDING);
         req.reasoning_request = Some(grodex_provider::canonical_request::ReasoningRequest {
             effort: Some("high".into()),
             summary: None,
@@ -367,40 +373,20 @@ mod tests {
     #[test]
     fn model_id_mismatch() {
         let route = make_route(&[]);
-        let req = make_request("different-model");
-        let binding_id = req.model_binding_id.to_string();
-        let route_clone = route.clone();
-        let result = std::panic::catch_unwind(|| {
-            CompatibilityGate::evaluate(&req, &route_clone)
-        });
-        match result {
-            Ok(issues) => {
-                assert!(issues.iter().any(|i| i.code() == "COMPAT_MODEL_ID"));
-            }
-            Err(_) => {
-                let mut route2 = route.clone();
-                route2.canonical_model_id = binding_id.clone();
-                let issues = CompatibilityGate::evaluate(&req, &route2);
-                assert!(!issues.iter().any(|i| i.code() == "COMPAT_MODEL_ID"));
-            }
-        }
+        let req = make_request(MISMATCH_BINDING);
+        let issues = CompatibilityGate::evaluate(&req, &route);
+        assert!(issues.iter().any(|i| i.code() == "COMPAT_MODEL_ID"));
     }
 
     #[test]
     fn model_id_matches_alias() {
         let route = make_route(&[]);
-        let req = make_request("gpt-4");
-        let result = std::panic::catch_unwind(|| {
-            CompatibilityGate::evaluate(&req, &route)
-        });
-        match result {
-            Ok(issues) => {
-                assert!(!issues.iter().any(|i| i.code() == "COMPAT_MODEL_ID"),
-                    "alias should match, got issues: {:?}",
-                    issues.iter().filter(|i| i.code() == "COMPAT_MODEL_ID").collect::<Vec<_>>()
-                );
-            }
-            Err(_) => {}
-        }
+        let req = make_request(ALIAS_BINDING);
+        let issues = CompatibilityGate::evaluate(&req, &route);
+        assert!(
+            !issues.iter().any(|i| i.code() == "COMPAT_MODEL_ID"),
+            "alias should match, got issues: {:?}",
+            issues.iter().filter(|i| i.code() == "COMPAT_MODEL_ID").collect::<Vec<_>>()
+        );
     }
 }

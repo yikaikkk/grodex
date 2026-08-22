@@ -107,7 +107,28 @@ impl SamplingClient {
         let status = response.status();
         if !status.is_success() {
             let status_code = status.as_u16();
-            let message = response.text().await.unwrap_or_default();
+            let raw_message = response.text().await.unwrap_or_default();
+            // Clean up the message: proxy error pages (openresty, nginx,
+            // Cloudflare) return HTML bodies. Strip to a plain-text summary
+            // so the user sees a readable message instead of <html> soup.
+            let message = if raw_message.trim_start().starts_with('<') {
+                // Likely HTML — extract a readable summary.
+                if status_code == 413 {
+                    "请求体过大 (413 Request Entity Too Large)。上下文可能超出限制，正在尝试压缩后重试…".to_string()
+                } else if status_code == 502 {
+                    format!("上游服务不可用 (502 Bad Gateway)")
+                } else if status_code == 503 {
+                    format!("上游服务暂不可用 (503 Service Unavailable)")
+                } else if status_code == 504 {
+                    format!("上游服务超时 (504 Gateway Timeout)")
+                } else {
+                    // Generic HTML: strip tags via simple heuristic.
+                    let text = strip_html_tags(&raw_message);
+                    if text.len() > 300 { format!("{}…", &text[..300]) } else { text }
+                }
+            } else {
+                raw_message
+            };
             return match status_code {
                 401 | 403 => Err(ProviderError::Auth {
                     message,
@@ -136,14 +157,17 @@ impl SamplingClient {
     fn build_responses_body(&self, binding: &ModelBinding, request: &CanonicalModelRequest) -> serde_json::Value {
         let mut input: Vec<serde_json::Value> = Vec::new();
 
-        // Map instructions.
-        for inst in &request.instructions {
+        // Map instructions. PREFIX-CACHE AWARE: the FIRST block (the stable
+        // system prompt) goes at the head; any trailing blocks are volatile
+        // (e.g. per-turn memory RAG) and are emitted AFTER the conversation
+        // history so they don't invalidate the cached prefix.
+        if let Some(first) = request.instructions.first() {
             input.push(serde_json::json!({
-                "role": match inst.role {
+                "role": match first.role {
                     grodex_provider::canonical_request::InstructionRole::System => "system",
                     grodex_provider::canonical_request::InstructionRole::Developer => "developer",
                 },
-                "content": inst.content,
+                "content": first.content,
             }));
         }
 
@@ -153,6 +177,17 @@ impl SamplingClient {
             if let Some(m) = mapped {
                 input.push(m);
             }
+        }
+
+        // Trailing volatile instruction blocks at the END of the input.
+        for inst in request.instructions.iter().skip(1) {
+            input.push(serde_json::json!({
+                "role": match inst.role {
+                    grodex_provider::canonical_request::InstructionRole::System => "system",
+                    grodex_provider::canonical_request::InstructionRole::Developer => "developer",
+                },
+                "content": inst.content,
+            }));
         }
 
         // Map tools.
@@ -301,9 +336,13 @@ impl SamplingClient {
     /// Build Chat Completions API body.
     fn build_chat_body(&self, _binding: &ModelBinding, request: &CanonicalModelRequest) -> serde_json::Value {
         let mut messages: Vec<serde_json::Value> = Vec::new();
-        // Add system instructions first.
-        for inst in &request.instructions {
-            messages.push(serde_json::json!({"role": "system", "content": inst.content}));
+        // PREFIX-CACHE AWARE: only the FIRST instruction block (the stable
+        // system prompt) goes at the head. Trailing blocks are volatile
+        // (e.g. per-turn memory RAG) and are appended AFTER the conversation
+        // history — a changing system message would invalidate the whole
+        // cached prefix (system + tools + history).
+        if let Some(first) = request.instructions.first() {
+            messages.push(serde_json::json!({"role": "system", "content": first.content}));
         }
         // Add context items, merging consecutive ToolCall items into a
         // single assistant message's tool_calls array.
@@ -389,6 +428,16 @@ impl SamplingClient {
                 }
             }
         }
+        // Trailing volatile instruction blocks (e.g. per-turn memory RAG)
+        // go AFTER the conversation history so the stable prefix
+        // (system + history) remains cacheable across turns.
+        for inst in request.instructions.iter().skip(1) {
+            let role = match inst.role {
+                grodex_provider::canonical_request::InstructionRole::System => "system",
+                grodex_provider::canonical_request::InstructionRole::Developer => "developer",
+            };
+            messages.push(serde_json::json!({"role": role, "content": inst.content}));
+        }
         let tools: Vec<serde_json::Value> = request.tool_specs.iter().map(|t| serde_json::json!({
             "type": "function",
             "function": {"name": t.name, "description": t.description, "parameters": t.parameters}
@@ -417,6 +466,13 @@ impl SamplingClient {
     fn build_messages_body(&self, _binding: &ModelBinding, request: &CanonicalModelRequest) -> serde_json::Value {
         let mut messages = Vec::new();
         let mut system = String::new();
+        // The FIRST instruction block (stable system prompt) leads the
+        // system field. NOTE: instructions were previously dropped entirely
+        // in this protocol — the model never saw the system prompt.
+        if let Some(first) = request.instructions.first() {
+            system.push_str(&first.content);
+            system.push('\n');
+        }
         for item in &request.context_items {
             match item {
                 ContextItem::System { content } | ContextItem::Developer { content } => {
@@ -430,6 +486,15 @@ impl SamplingClient {
                 }
             }
         }
+        // Trailing volatile instruction blocks (e.g. per-turn memory RAG)
+        // go AFTER the history as a user message so the stable prefix
+        // (system + tools + history) stays cacheable.
+        for inst in request.instructions.iter().skip(1) {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("<context>\n{}\n</context>", inst.content),
+            }));
+        }
         let tools: Vec<serde_json::Value> = request.tool_specs.iter().map(|t| serde_json::json!({
             "name": t.name, "description": t.description, "input_schema": t.parameters
         })).collect();
@@ -441,11 +506,48 @@ impl SamplingClient {
             "stream": true,
         });
         if !system.is_empty() {
-            body["system"] = serde_json::json!(system.trim());
+            // Block-array form with an explicit cache_control breakpoint:
+            // Anthropic caches tools + system up to the breakpoint, so the
+            // (stable) system prompt + tool schemas hit the cache every step.
+            body["system"] = serde_json::json!([{
+                "type": "text",
+                "text": system.trim(),
+                "cache_control": {"type": "ephemeral"},
+            }]);
         }
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(tools);
         }
         body
     }
+}
+
+/// Strip HTML tags from a string, returning plain text.
+/// Simple heuristic: remove everything between `<` and `>`, decode
+/// common HTML entities, collapse whitespace.
+fn strip_html_tags(html: &str) -> String {
+    let mut result = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => { in_tag = true; result.push(' '); }
+            '>' => { in_tag = false; }
+            _ if !in_tag => result.push(ch),
+            _ => {}
+        }
+    }
+    // Decode common entities.
+    result
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        // Collapse runs of whitespace into a single space.
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
 }
