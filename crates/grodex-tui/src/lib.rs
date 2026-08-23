@@ -60,13 +60,17 @@ const ARROW_BURST_CONTINUE: Duration = Duration::from_millis(700);
 /// 单个滚轮手势的总时长上限：防止真实方向键持续按压把延续窗口无限延长的病态场景（惯性最长也就 2-3s）。
 const ARROW_GESTURE_MAX_DUR: Duration = Duration::from_secs(3);
 
-/// 滚轮阻尼参数（防触控板惯性尾巴塞）：窗口限速 + 单手势封顶。
-/// 手离开触控板后系统惯性仍会持续发事件，但单个手势（相邻事件间隔 ≤ GAP）的总滚动量被封顶在
-/// GESTURE_MAX 行，超出后的惯性事件全部丢弃；停顿超过 GAP 后再次滑动视为新手势。
-const WHEEL_WINDOW_MS: u64 = 30;
-const WHEEL_WINDOW_MAX: u32 = 4;
-const WHEEL_GESTURE_MAX: u32 = 60;
-const WHEEL_GESTURE_GAP: Duration = Duration::from_millis(150);
+/// 滚轮平滑参数：事件只累加进滚动目标，实际滚动按帧以固定比例逼近目标（指数平滑）。
+/// 触控板箭头流的到达率忽高忽慢（慢滑 30~80ms 一个、快滑爆发一串），事件驱动的直接应用
+/// 会“一卡一卡”；改为帧驱动后画面以稳定 60fps 连续运动，事件节奏被抹平且一行不丢。
+/// SCROLL_SMOOTHING 为每帧逼近目标剩余量的比例：0.45 ≈ 48ms 完成 ~90%，跟手且顺滑；
+/// 衰减系数同时天然是速度上限（等效窗口限速），无需再丢弃事件。
+const SCROLL_SMOOTHING: f32 = 0.45;
+
+/// 帧率节流：限制 draw() 的最高频率，防止触控板滚轮 / 高频事件造成
+/// “每个事件一次 draw + set_cursor” 的终端硬光标闪烁。16ms ≈ 60fps，
+/// 对 streaming 增量渲染与滚动都足够顺滑；键盘输入反馈延迟 ≤16ms 不可感知。
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// 鼠标上报（仅 macOS Terminal.app 兜底用）：普通跟踪 (1000) + SGR 扩展 (1006)。
 /// Terminal.app 不实现 DECSET 1007，滚轮不会被翻译成方向键；不开上报时滚轮会滚动终端自己的回滚缓冲，
@@ -119,11 +123,9 @@ pub struct GrodexTui {
     terminal: Terminal<CrosstermBackend<io::Stderr>>,
     state: TuiAppState,
     transport: Box<dyn TransportAdapter>,
-    /// 滚轮手势累计量（行数，正 = 向下）。突发箭头键/滚轮事件只累加，
-    /// 由主循环在限流窗口里统一应用，避免触控板惯性失控。
-    wheel_accum: i32,
-    /// 上一次应用滚轮累计值的时间戳。
-    wheel_last_apply: std::time::Instant,
+    /// 滚动目标累计量（行数，正 = 向下）。突发箭头键/滚轮事件只累加到这里，
+    /// 实际滚动按帧指数平滑逼近，与事件到达节奏解耦。
+    scroll_target: i32,
     /// 上一个裸箭头键到达时间（滚轮突发识别用）。
     arrow_last_at: Option<std::time::Instant>,
     /// 当前连续箭头键计数（滚轮突发识别用）。
@@ -142,10 +144,8 @@ pub struct GrodexTui {
     /// 鼠标上报（滚轮）是否开启：仅 macOS Terminal.app 自动开启（它不支持 1007），
     /// 其他终端保持关闭以保留终端原生选择。不提供用户开关。
     mouse_capture: bool,
-    /// 当前手势已应用的滚动行数（手势封顶计数）。
-    gesture_lines: u32,
-    /// 上一次滚轮事件（突发箭头键/真实滚轮）到达时间，用于手势间隔判定。
-    wheel_last_event: Option<std::time::Instant>,
+    /// 上一次实际执行 draw() 的时间（帧率节流，防光标高频闪烁）。
+    last_frame_at: std::time::Instant,
 }
 
 impl GrodexTui {
@@ -184,9 +184,7 @@ impl GrodexTui {
             terminal,
             state,
             transport: Box::new(transport),
-            wheel_accum: 0,
-            // 倒推 1 秒，保证首个滚轮事件无需等待限流窗口。
-            wheel_last_apply: std::time::Instant::now() - Duration::from_secs(1),
+            scroll_target: 0,
             arrow_last_at: None,
             arrow_burst: 0,
             burst_confirmed: false,
@@ -195,23 +193,15 @@ impl GrodexTui {
             queued_keys: std::collections::VecDeque::new(),
             queued_dispatch: false,
             mouse_capture: false,
-            gesture_lines: 0,
-            wheel_last_event: None,
+            // 倒推 1 秒，保证首帧无需等待节流窗口即可立即绘制。
+            last_frame_at: std::time::Instant::now() - Duration::from_secs(1),
         })
     }
 
     /// 滚轮累加统一入口（突发箭头键与 Terminal.app 真实滚轮共用）。
-    /// 与上一事件间隔超过 WHEEL_GESTURE_GAP 视为新手势，重置封顶计数。
+    /// 只累加进滚动目标，由主循环按帧指数平滑应用。
     fn add_wheel(&mut self, lines: i32) {
-        let now = std::time::Instant::now();
-        if self
-            .wheel_last_event
-            .is_some_and(|t| now.duration_since(t) > WHEEL_GESTURE_GAP)
-        {
-            self.gesture_lines = 0;
-        }
-        self.wheel_last_event = Some(now);
-        self.wheel_accum += lines;
+        self.scroll_target += lines;
     }
 
     pub fn run_blocking(mut self) -> Result<()> {
@@ -663,35 +653,22 @@ impl GrodexTui {
                 self.burst_started_at = None;
             }
 
-            // ── 滚轮手势限流应用：把突发箭头键累计量折算成滚动行数。两层阻尼防止“手离开触控板后还在跑”：
-            // 1）窗口限速：每 WHEEL_WINDOW_MS 最多应用 WHEEL_WINDOW_MAX 行，溢出丢弃；
-            // 2）手势封顶：单个手势总滚动量 ≤ WHEEL_GESTURE_MAX 行，封顶后剩余惯性事件全部丢弃，
-            // 停顿超过 WHEEL_GESTURE_GAP 再滑视为新手势。方向用带符号累计，反向滑动立即抵消。
-            if self.wheel_accum != 0 {
-                let now = std::time::Instant::now();
-                if now.duration_since(self.wheel_last_apply)
-                    >= Duration::from_millis(WHEEL_WINDOW_MS)
-                {
-                    self.wheel_last_apply = now;
-                    let mut step = self
-                        .wheel_accum
-                        .clamp(-(WHEEL_WINDOW_MAX as i32), WHEEL_WINDOW_MAX as i32);
-                    let remaining = WHEEL_GESTURE_MAX as i32 - self.gesture_lines as i32;
-                    if remaining <= 0 {
-                        step = 0;
+            // ── 滚轮指数平滑应用：事件只累加进滚动目标，实际滚动每帧按“剩余量的固定比例”
+            // 逼近（至少 1 行、不越过目标）。画面运动节奏由帧率（~60fps）决定，与触控板箭头流
+            // 的忽快忽慢解耦，消除“一卡一卡”；整数比例精确收敛，累计量一行不丢。比例系数同时
+            // 天然是速度上限（等效窗口限速，但不丢弃事件）。方向带符号，反向滑动立即抵消。
+            if self.scroll_target != 0 {
+                let remaining = self.scroll_target;
+                let sign = remaining.signum();
+                let mag = remaining.unsigned_abs();
+                // 本帧步长 = 剩余量 × SCROLL_SMOOTHING（四舍五入），至少 1 行、不超过剩余量。
+                let step = ((mag as f32 * SCROLL_SMOOTHING).round() as u32).clamp(1, mag);
+                self.scroll_target -= step as i32 * sign;
+                for _ in 0..step {
+                    if sign > 0 {
+                        self.state.scroll_down(None);
                     } else {
-                        step = step.clamp(-remaining, remaining);
-                    }
-                    self.wheel_accum = 0;
-                    if step != 0 {
-                        self.gesture_lines += step.unsigned_abs();
-                        for _ in 0..step.unsigned_abs() {
-                            if step > 0 {
-                                self.state.scroll_down(None);
-                            } else {
-                                self.state.scroll_up();
-                            }
-                        }
+                        self.state.scroll_up();
                     }
                 }
             }
@@ -706,20 +683,29 @@ impl GrodexTui {
             // the user finally typed something. Moving draw() here
             // ensures the screen reflects every batch of events
             // immediately, giving true SSE-style incremental rendering.
-            let draw_res = self.terminal.draw(|f| {
-                let area = f.size();
-                let approvals_rows = approvals_desired_rows(self.state.pending_approvals.len());
-                let turn_status_rows = turn_status_desired_rows(
-                    self.state.is_streaming(), self.state.active_tool_count());
-                let wrap_w = (area.width as usize).saturating_sub(7).max(20);
-                let content_rows = self.state.prompt_content_lines(wrap_w);
-                let slash_rows = self.state.slash_menu_rows();
-                let prompt_rows = prompt_desired_rows(content_rows + slash_rows);
-                let layout = build_layout(area, approvals_rows, turn_status_rows, prompt_rows);
-                render_full(f, &mut self.state, &layout);
-            });
-            if let Err(e) = draw_res {
-                self.state.push_log(format!("[render] draw 错误（已跳过）：{e}"));
+            //
+            // 帧率节流：触控板滚轮 / 高频事件会让本循环高频唤醒，若每次都
+            // draw()，render_prompt_widget 每帧 set_cursor() 会让终端硬光标在
+            // 高频重绘中闪烁。这里把重绘压到最高 ~60fps；两次 draw 之间到达
+            // 的事件照常累积，下一帧一并呈现——只影响呈现节奏，不影响正确性。
+            let frame_now = std::time::Instant::now();
+            if frame_now.duration_since(self.last_frame_at) >= MIN_FRAME_INTERVAL {
+                self.last_frame_at = frame_now;
+                let draw_res = self.terminal.draw(|f| {
+                    let area = f.size();
+                    let approvals_rows = approvals_desired_rows(self.state.pending_approvals.len());
+                    let turn_status_rows = turn_status_desired_rows(
+                        self.state.is_streaming(), self.state.active_tool_count());
+                    let wrap_w = (area.width as usize).saturating_sub(7).max(20);
+                    let content_rows = self.state.prompt_content_lines(wrap_w);
+                    let slash_rows = self.state.slash_menu_rows();
+                    let prompt_rows = prompt_desired_rows(content_rows + slash_rows);
+                    let layout = build_layout(area, approvals_rows, turn_status_rows, prompt_rows);
+                    render_full(f, &mut self.state, &layout);
+                });
+                if let Err(e) = draw_res {
+                    self.state.push_log(format!("[render] draw 错误（已跳过）：{e}"));
+                }
             }
 
             // During streaming, poll keyboard with a 1ms timeout so new
@@ -758,10 +744,10 @@ impl GrodexTui {
                         // ── 触控板滚轮突发识别（不捕获鼠标，参考 codex）──
                         // DECSET 1007 把滚轮翻译成 ↑/↓：触控板一划会在几十毫秒内爆发大量箭头键，
                         // 而人手按键（含长按重复）最快也只有 ~30Hz。短窗口内 ≥ 阈值个裸箭头键判为
-                        // 滚轮手势 → 只累加进 wheel_accum 滚动正文，不进 handle_key：
+                        // 滚轮手势 → 只累加进滚动目标（按帧平滑应用），不进 handle_key：
                         //   · 不会误改 slash 菜单 / 审批的选中项（选择只认真实按键）；
                         //   · 不会误触发输入历史导航；
-                        //   · 经限流封顶后，轻轻一划不会一直跑。
+                        //   · 经帧平滑后运动连贯，不会一顿一顿。
                         // 突发确认前的箭头键先暂存不派发，超时还原为真实按键，
                         // 避免滚轮手势的前几个箭头键误触发选择/历史导航。
                         if !bypass_burst {
