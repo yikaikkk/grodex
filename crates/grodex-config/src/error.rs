@@ -20,4 +20,7 @@ pub enum ConfigError {
 
     #[error("requirement constraint violated: {message}")]
     RequirementViolation { message: String },
+
+    #[error("fs watcher error: {message}")]
+    Watch { message: String },
 }

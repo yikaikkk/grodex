@@ -54,6 +54,14 @@ pub struct SessionReducer {
     last_seq: u64,
     /// Active tool calls awaiting results.
     pending_tool_calls: HashMap<String, ContextItem>,
+    /// Resume mode: repair orphaned tool calls instead of hard-failing.
+    ///
+    /// A user interrupt aborts the turn task mid-tool-execution; the
+    /// journal then contains a ToolCall whose ToolResultCommitted was
+    /// never written. Strict validation (crash-recovery audits) keeps
+    /// rejecting that shape, but resume must heal it or the session is
+    /// permanently un-resumable.
+    tolerant_orphans: bool,
 }
 
 impl SessionReducer {
@@ -66,7 +74,14 @@ impl SessionReducer {
             current_generation: StepGeneration::initial(),
             last_seq: 0,
             pending_tool_calls: HashMap::new(),
+            tolerant_orphans: false,
         }
+    }
+
+    /// Enable orphan-healing for resume paths (see field doc).
+    pub fn tolerant_orphans(mut self) -> Self {
+        self.tolerant_orphans = true;
+        self
     }
 
     /// Apply a single event.
@@ -207,11 +222,18 @@ impl SessionReducer {
             }
             RolloutEventType::TurnCompleted => {
                 self.turn_state = None;
-                // Validate no orphaned tool results.
+                // Validate no orphaned tool results. In tolerant mode
+                // (resume) an orphan means the user interrupted mid-tool:
+                // synthesize an error result so the transcript stays
+                // call/result-paired instead of failing the whole resume.
                 if !self.pending_tool_calls.is_empty() {
-                    let orphaned: Vec<String> =
-                        self.pending_tool_calls.keys().cloned().collect();
-                    return Err(ReducerError::OrphanedToolResult(orphaned.join(", ")));
+                    if self.tolerant_orphans {
+                        self.heal_pending_orphans();
+                    } else {
+                        let orphaned: Vec<String> =
+                            self.pending_tool_calls.keys().cloned().collect();
+                        return Err(ReducerError::OrphanedToolResult(orphaned.join(", ")));
+                    }
                 }
             }
             RolloutEventType::ContextRestored => {
@@ -301,6 +323,83 @@ impl SessionReducer {
         self.context
     }
 
+    /// Consume the reducer, healing interrupt-induced damage first when
+    /// in tolerant mode:
+    ///   1. Pending tool calls (journal ended before their result was
+    ///      committed — the turn was aborted mid-execution) get a
+    ///      synthetic error result so the transcript stays paired.
+    ///   2. Reverse orphans — ToolResults with no preceding ToolCall
+    ///      (malformed legacy journals) — are dropped, because wire
+    ///      encoders reject a tool message with no matching tool_calls.
+    /// In strict mode this is identical to `into_context`.
+    pub fn finish(mut self) -> Vec<ContextItem> {
+        if self.tolerant_orphans {
+            if !self.pending_tool_calls.is_empty() {
+                self.heal_pending_orphans();
+            }
+            self.drop_orphan_results();
+        }
+        self.context
+    }
+
+    /// Synthesize error results for every pending tool call, inserted
+    /// directly after each call so transcript order stays natural.
+    fn heal_pending_orphans(&mut self) {
+        if self.pending_tool_calls.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            orphaned = self.pending_tool_calls.len(),
+            "reducer: healing orphaned tool calls left by an interrupted turn"
+        );
+        let mut rebuilt = Vec::with_capacity(self.context.len() + self.pending_tool_calls.len());
+        for item in std::mem::take(&mut self.context) {
+            if let ContextItem::ToolCall { call_id, name, .. } = &item {
+                if self.pending_tool_calls.remove(&call_id.to_string()).is_some() {
+                    let synthetic = ContextItem::ToolResult {
+                        call_id: *call_id,
+                        content: format!(
+                            "[interrupted] Tool call `{name}` was interrupted by the user \
+                             before its result was committed; the outcome is unknown. \
+                             Do not assume it completed — verify actual state if needed."
+                        ),
+                        is_error: true,
+                    };
+                    rebuilt.push(item);
+                    rebuilt.push(synthetic);
+                    continue;
+                }
+            }
+            rebuilt.push(item);
+        }
+        self.context = rebuilt;
+        self.pending_tool_calls.clear();
+    }
+
+    /// Drop ToolResults whose call_id never appeared as a ToolCall in
+    /// the current context (reverse orphans).
+    fn drop_orphan_results(&mut self) {
+        let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut dropped = 0usize;
+        self.context.retain(|item| match item {
+            ContextItem::ToolCall { call_id, .. } => {
+                seen_calls.insert(call_id.to_string());
+                true
+            }
+            ContextItem::ToolResult { call_id, .. } => {
+                let keep = seen_calls.contains(&call_id.to_string());
+                if !keep {
+                    dropped += 1;
+                }
+                keep
+            }
+            _ => true,
+        });
+        if dropped > 0 {
+            tracing::warn!(dropped, "reducer: dropped orphaned tool results with no matching call");
+        }
+    }
+
     /// Get the current context without consuming.
     pub fn context(&self) -> &[ContextItem] {
         &self.context
@@ -362,7 +461,10 @@ pub fn replay_journal_lean(
 
     let mut events: Vec<RolloutEvent> = Vec::new();
     let mut last_seq = 0u64;
-    let mut reducer = SessionReducer::new(*sid);
+    // Tolerant: legacy journals frequently end with an interrupted turn
+    // (ToolCall committed, ToolResultCommitted lost to the abort). Heal
+    // those instead of failing the resume with OrphanedToolResult.
+    let mut reducer = SessionReducer::new(*sid).tolerant_orphans();
 
     grodex_rollout::journal_actor::for_each_journal_line(jsonl_path, |line| {
         use grodex_core::error::GrodexError;
@@ -424,7 +526,7 @@ pub fn replay_journal_lean(
     })
     .map_err(|e| ReducerError::JournalRead(e.to_string()))?;
 
-    let ctx = reducer.into_context();
+    let ctx = reducer.finish();
     Ok((events, last_seq, ctx))
 }
 
@@ -656,5 +758,105 @@ mod tests {
         assert_eq!(lean_events.len(), 3);
         assert_eq!(ctx.len(), 2);
         assert!(matches!(ctx[0], ContextItem::User { ref content, .. } if content == "prior history"));
+    }
+
+    /// Strict mode (crash-recovery audits) still rejects a ToolCall that
+    /// never received a result before TurnCompleted.
+    #[test]
+    fn strict_mode_rejects_orphaned_tool_call() {
+        let sid = SessionId::new();
+        let cid = grodex_core::id::ToolCallId::new();
+        let events = vec![
+            make_event(sid, 0, RolloutEventType::ModelItemProduced, serde_json::json!({
+                "tool_calls": [{"call_id": cid.to_string(), "name": "exec", "arguments": {}}]
+            })),
+            make_event(sid, 1, RolloutEventType::TurnCompleted, serde_json::json!({})),
+        ];
+        let mut reducer = SessionReducer::new(sid);
+        let err = reducer.apply_all(&events).unwrap_err();
+        assert!(matches!(err, ReducerError::OrphanedToolResult(_)));
+    }
+
+    /// Tolerant mode (resume): the same interrupted-turn shape heals
+    /// into a call + synthetic error result instead of failing.
+    #[test]
+    fn tolerant_mode_heals_orphan_at_turn_boundary() {
+        let sid = SessionId::new();
+        let cid = grodex_core::id::ToolCallId::new();
+        let events = vec![
+            make_event(sid, 0, RolloutEventType::UserInputAccepted, serde_json::json!({"text": "run tests"})),
+            make_event(sid, 1, RolloutEventType::ModelItemProduced, serde_json::json!({
+                "tool_calls": [{"call_id": cid.to_string(), "name": "exec", "arguments": {}}]
+            })),
+            make_event(sid, 2, RolloutEventType::TurnCompleted, serde_json::json!({})),
+        ];
+        let mut reducer = SessionReducer::new(sid).tolerant_orphans();
+        reducer.apply_all(&events).unwrap();
+        let ctx = reducer.finish();
+
+        // user + tool call + synthetic result.
+        assert_eq!(ctx.len(), 3);
+        assert!(matches!(ctx[1], ContextItem::ToolCall { .. }));
+        match &ctx[2] {
+            ContextItem::ToolResult { call_id, content, is_error } => {
+                assert_eq!(call_id, &cid);
+                assert!(is_error);
+                assert!(content.contains("interrupted"));
+            }
+            other => panic!("expected synthetic ToolResult, got {other:?}"),
+        }
+    }
+
+    /// `finish()` heals a journal that ENDS mid-tool (no TurnCompleted
+    /// after the abort) and drops reverse orphans (results with no call).
+    #[test]
+    fn tolerant_finish_heals_tail_and_drops_reverse_orphans() {
+        let sid = SessionId::new();
+        let cid = grodex_core::id::ToolCallId::new();
+        let stray = grodex_core::id::ToolCallId::new();
+        let events = vec![
+            // Reverse orphan: result whose call event was lost.
+            make_event(sid, 0, RolloutEventType::ToolResultCommitted, serde_json::json!({
+                "call_id": stray.to_string(), "content": "lost call", "is_error": false
+            })),
+            make_event(sid, 1, RolloutEventType::ModelItemProduced, serde_json::json!({
+                "tool_calls": [{"call_id": cid.to_string(), "name": "exec", "arguments": {}}]
+            })),
+            // Journal ends here — the turn was aborted, no TurnCompleted.
+        ];
+        let mut reducer = SessionReducer::new(sid).tolerant_orphans();
+        reducer.apply_all(&events).unwrap();
+        let ctx = reducer.finish();
+
+        // stray result dropped; call + synthetic result kept.
+        assert_eq!(ctx.len(), 2);
+        assert!(matches!(ctx[0], ContextItem::ToolCall { .. }));
+        assert!(matches!(ctx[1], ContextItem::ToolResult { is_error: true, .. }));
+    }
+
+    /// End-to-end: lean replay of an interrupted-turn journal succeeds
+    /// and yields a fully call/result-paired transcript.
+    #[test]
+    fn lean_replay_heals_interrupted_journal() {
+        let sid = SessionId::new();
+        let cid = grodex_core::id::ToolCallId::new();
+        let events = vec![
+            make_event(sid, 0, RolloutEventType::UserInputAccepted, serde_json::json!({"text": "run tests"})),
+            make_event(sid, 1, RolloutEventType::ModelItemProduced, serde_json::json!({
+                "tool_calls": [{"call_id": cid.to_string(), "name": "exec", "arguments": {}}]
+            })),
+            // User hit Esc mid-execution: no ToolResultCommitted, and a
+            // LATER turn's TurnCompleted surfaces the orphan.
+            make_event(sid, 2, RolloutEventType::UserInputAccepted, serde_json::json!({"text": "continue"})),
+            make_event(sid, 3, RolloutEventType::TurnCompleted, serde_json::json!({})),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = write_journal(&dir, &sid, &events);
+
+        let (_evts, last_seq, ctx) = replay_journal_lean(&jsonl, &sid).unwrap();
+        assert_eq!(last_seq, 3);
+        // user + call + synthetic result + user.
+        assert_eq!(ctx.len(), 4);
+        assert!(matches!(ctx[2], ContextItem::ToolResult { is_error: true, .. }));
     }
 }

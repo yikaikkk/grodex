@@ -702,6 +702,35 @@ impl MemoryDatabase {
         .map_err(|e| DbError::Embedding(format!("spawn_blocking join: {e}")))?
     }
 
+    /// Active memory + evidence units that have no embedding row for the
+    /// given model yet. Returns `(doc_ref, content)` pairs (doc_refs are
+    /// namespaced). Tolerates bare-id rows written before namespacing.
+    pub(crate) fn units_missing_embeddings(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ?2 || id, content FROM memory_units WHERE status = 'active'
+               AND (?2 || id) NOT IN (SELECT DISTINCT doc_ref FROM document_embeddings WHERE embedding_model = ?1)
+               AND id NOT IN (SELECT DISTINCT doc_ref FROM document_embeddings WHERE embedding_model = ?1)
+             UNION ALL
+             SELECT ?3 || id, content FROM evidence_units WHERE status = 'active'
+               AND (?3 || id) NOT IN (SELECT DISTINCT doc_ref FROM document_embeddings WHERE embedding_model = ?1)
+               AND id NOT IN (SELECT DISTINCT doc_ref FROM document_embeddings WHERE embedding_model = ?1)
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![model, MEMORY_DOC_REF_PREFIX, EVIDENCE_DOC_REF_PREFIX, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// 同步 brute-force cosine kNN（内部同步）。
     /// Fail-soft: 若 document_embeddings 表不存在直接返回空 Vec（不报错）。
     pub(crate) fn search_bruteforce_cosine_sync(
@@ -807,6 +836,27 @@ use crate::retrievers::{
     retrieve_fts_evidence_ids_only, retrieve_fts_memory_ids_only,
 };
 
+/// doc_ref 命名空间：memory 与 evidence 的 unit id 都源自 Markdown HTML 注释，
+/// 可能撞号，故向量行按来源命名空间存储，避免 (doc_ref, chunk) 主键冲突。
+pub const MEMORY_DOC_REF_PREFIX: &str = "memory:";
+pub const EVIDENCE_DOC_REF_PREFIX: &str = "evidence:";
+
+pub fn memory_doc_ref(unit_id: &str) -> String {
+    format!("{MEMORY_DOC_REF_PREFIX}{unit_id}")
+}
+
+pub fn evidence_doc_ref(unit_id: &str) -> String {
+    format!("{EVIDENCE_DOC_REF_PREFIX}{unit_id}")
+}
+
+/// 剥掉任一命名空间前缀，还原为纯 unit_id（兼容无前缀旧行）。
+pub fn doc_ref_to_unit_id(doc_ref: &str) -> &str {
+    doc_ref
+        .strip_prefix(MEMORY_DOC_REF_PREFIX)
+        .or_else(|| doc_ref.strip_prefix(EVIDENCE_DOC_REF_PREFIX))
+        .unwrap_or(doc_ref)
+}
+
 /// Hybrid 检索的单条结果（与 RetrievalResult 对齐但简化）。
 #[derive(Debug, Clone)]
 pub struct RetrievedUnit {
@@ -841,7 +891,7 @@ impl MemoryDatabase {
     /// Hybrid RRF 检索主入口（Memory 管道）。
     ///
     /// Fail-Open 规则（任何失败不 throw，静默降级纯 FTS）：
-    ///   - emb=None / enable_embedding=false / No API key → vec_list = []
+    ///   - emb=None / enabled=false / No API key → vec_list = []
     ///   - Embedding HTTP 超时/429/网络错误 → vec_list = []
     ///   - Vector store 表缺失 → vec_list = []
     pub async fn retrieve_hybrid_memory(
@@ -861,7 +911,10 @@ impl MemoryDatabase {
                         .search_bruteforce_cosine(qvec, candidate_limit, model.model_id().to_string())
                         .await
                     {
-                        Ok(ranked) => ranked.into_iter().map(|(id, _)| id).collect(),
+                        Ok(ranked) => ranked
+                            .into_iter()
+                            .map(|(id, _)| doc_ref_to_unit_id(&id).to_string())
+                            .collect(),
                         Err(_) => Vec::new(),
                     }
                 }
@@ -904,7 +957,10 @@ impl MemoryDatabase {
                         .search_bruteforce_cosine(qvec, candidate_limit, model.model_id().to_string())
                         .await
                     {
-                        Ok(ranked) => ranked.into_iter().map(|(id, _)| id).collect(),
+                        Ok(ranked) => ranked
+                            .into_iter()
+                            .map(|(id, _)| doc_ref_to_unit_id(&id).to_string())
+                            .collect(),
                         Err(_) => Vec::new(),
                     }
                 }

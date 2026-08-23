@@ -78,7 +78,13 @@ pub trait BuiltInTool {
 // ── Read V2 primitives (§9) ──────────────────────────────────────────────
 
 /// A range within a file that a Read call operates against (§9.1).
+///
+/// Uses `#[serde(untagged)]` so the model can pass plain objects
+/// (e.g. `{"start_line": 10, "count": null}`) without needing to
+/// wrap them in the variant name. LLM function-calling schemas
+/// do not understand serde's default externally-tagged encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum ReadRange {
     /// No explicit range — handler chooses a safe default upper bound.
     Whole,

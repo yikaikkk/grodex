@@ -15,6 +15,7 @@
 //!   - PatchPlan + PatchFile (atomic apply_patch)
 //!   - StaleFile + AtomicityLevel (version fence + atomic writes)
 
+pub mod blob_refs;
 pub mod blob_store;
 pub mod cancel;
 pub mod common;
@@ -27,7 +28,8 @@ pub mod read;
 pub mod registry;
 pub mod write;
 
-pub use blob_store::{BlobRef, BlobStore, BoundedView, InMemoryBlobStore};
+pub use blob_refs::{BlobOwnerKind, BlobRefLedger, BlobRefKind, BlobRefRecord};
+pub use blob_store::{BlobRef, BlobStore, BoundedView, FileBlobStore, InMemoryBlobStore, ManagedBlobStore};
 pub use cancel::{CancelPipeline, CancelRegistry, CancelResult, CancellationToken};
 pub use common::{
     ArtifactRef, AtomicityLevel, BuiltInTool, ChangedResource, ChangeType, ExecOutput, ExecStatus,

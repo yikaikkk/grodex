@@ -21,6 +21,7 @@ pub mod mailbox;
 pub mod manager;
 pub mod node;
 pub mod path;
+pub mod protocol;
 pub mod residency;
 pub mod scheduler;
 pub mod supervisor;
@@ -41,6 +42,10 @@ pub use mailbox::{
 pub use manager::{AgentTree, SubAgentManager};
 pub use node::{AgentId, AgentNode, AgentStatus};
 pub use path::{AgentPath, PathError};
+pub use protocol::{
+    AgentListing, CollaborationProtocol, FollowupOutcome, MailboxReadResult, ProtocolConfig,
+    ProtocolError, ProtocolEvent, WaitResult, WaitTargetState,
+};
 pub use residency::{
     ProcessInfo, ResidencyEntry, ResidencyError, ResidencyManager, ResidencyState,
     ResidencyToken, ResourceBudgetUsage, ResourcePool,

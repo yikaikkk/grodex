@@ -116,6 +116,12 @@ pub struct TurnCoordinator {
     /// task never dies silently mid-way. Configurable via
     /// `max_steps_per_turn` (default 40).
     max_steps: usize,
+    /// Managed blob store backing oversized tool-result offload (Design
+    /// Doc 11 §22). When present, offloaded results are stored as owned
+    /// blobs (owner = `ToolResult` / session id) whose lifetime is
+    /// governed by the `blob_refs` projection instead of scattered temp
+    /// files; when absent, the legacy temp-file path is used.
+    blob_store: Option<Arc<grodex_tools::ManagedBlobStore<grodex_tools::FileBlobStore>>>,
 }
 
 impl TurnCoordinator {
@@ -176,6 +182,40 @@ impl TurnCoordinator {
         self
     }
 
+    /// Attach a managed blob store used for oversized tool-result offload
+    /// (Doc 11 §22). Offloaded content becomes an owned blob whose
+    /// lifetime is governed by the `blob_refs` projection; call
+    /// `release_session_blobs` when the session ends to reclaim them.
+    pub fn with_blob_store(
+        mut self,
+        store: Arc<grodex_tools::ManagedBlobStore<grodex_tools::FileBlobStore>>,
+    ) -> Self {
+        self.blob_store = Some(store);
+        self
+    }
+
+    /// Reclaim all blobs owned by `session_id`'s offloaded tool results
+    /// (Doc 11 §22): revoke the owner's references, then run GC at a
+    /// point past the retention grace so the backing files are deleted
+    /// deterministically at session shutdown (the grace period protects
+    /// against concurrent readers, which no longer exist here).
+    pub async fn release_session_blobs(&self, session_id: &str) {
+        let Some(store) = &self.blob_store else {
+            return;
+        };
+        let revoked = store.revoke_owner(grodex_tools::BlobOwnerKind::ToolResult, session_id);
+        let deadline = std::time::SystemTime::now() + store.grace();
+        let deleted = store.gc_at(deadline).await;
+        if !revoked.is_empty() || !deleted.is_empty() {
+            tracing::info!(
+                session_id,
+                revoked = revoked.len(),
+                deleted = deleted.len(),
+                "released session tool-result blobs"
+            );
+        }
+    }
+
     /// Wire up the approval bus for a freshly-built manager and stash the
     /// drain receiver. Called by both `new()` and `with_permission()` so
     /// every construction path produces a manager whose `Ask` decisions
@@ -210,6 +250,7 @@ impl TurnCoordinator {
             memory: None,
             max_tool_result_bytes: 32 * 1024,
             max_steps: 40,
+            blob_store: None,
         }
     }
 
@@ -401,7 +442,7 @@ impl TurnCoordinator {
             };
             if should_compact
             {
-                self.try_compact(&turn_ctx, &context).await;
+                self.try_compact(&turn_ctx, &context, stream_tx.as_ref()).await;
             }
 
             // ── Build request ───────────────────────────────────
@@ -863,12 +904,41 @@ impl TurnCoordinator {
                             } = &mut tr.result
                             {
                                 if !*is_error && content.len() > self.max_tool_result_bytes {
-                                    if let Some(path) = offload_large_result(
-                                        content, &tr.name, tr.call_id,
-                                        &turn_ctx.session_id.to_string(),
-                                    )
-                                    .await
-                                    {
+                                    let session_id = turn_ctx.session_id.to_string();
+                                    let path = if let Some(store) = &self.blob_store {
+                                        // Doc 11 §22: store as an owned blob
+                                        // (owner = this session's ToolResult
+                                        // set) so the blob_refs projection —
+                                        // not a temp-dir scan — governs its
+                                        // lifetime. Revoke + GC happen at
+                                        // session shutdown
+                                        // (`release_session_blobs`).
+                                        let (_blob_ref, hash) = store
+                                            .store_owned(
+                                                content.as_bytes().to_vec(),
+                                                "text/plain".to_string(),
+                                                grodex_tools::BlobOwnerKind::ToolResult,
+                                                session_id.clone(),
+                                                grodex_tools::BlobRefKind::ToolOutputBody,
+                                                None,
+                                            )
+                                            .await;
+                                        // FileBlobStore is content-addressed:
+                                        // blob id == content hash.
+                                        let p = store.inner().path_of(&hash);
+                                        tracing::info!(
+                                            bytes = content.len(),
+                                            path = %p.display(),
+                                            "offloaded oversized tool result to blob store"
+                                        );
+                                        Some(p)
+                                    } else {
+                                        offload_large_result(
+                                            content, &tr.name, tr.call_id, &session_id,
+                                        )
+                                        .await
+                                    };
+                                    if let Some(path) = path {
                                         let orig_len = content.len();
                                         let preview = truncate_utf8(content, 2048);
                                         *content = format!(
@@ -1075,7 +1145,7 @@ impl TurnCoordinator {
                             "request too large (413/context-overflow) — forcing compaction and retrying"
                         );
                         let context = self.chat_state.get_conversation().await;
-                        self.try_compact(&turn_ctx, &context).await;
+                        self.try_compact(&turn_ctx, &context, stream_tx.as_ref()).await;
                         // Re-fetch compacted context and retry.
                         let context = self.chat_state.get_conversation().await;
                         let retry_request = CanonicalModelRequest {
@@ -1283,7 +1353,18 @@ impl TurnCoordinator {
         skip(self, turn_ctx, context),
         fields(turn_id = %turn_ctx.turn_id)
     )]
-    async fn try_compact(&self, turn_ctx: &TurnContext, context: &[ContextItem]) {
+    async fn try_compact(
+        &self,
+        turn_ctx: &TurnContext,
+        context: &[ContextItem],
+        stream_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamFragment>>,
+    ) {
+        // UI 提示通道：压缩会额外跑一轮模型调用，没有提示时前端看起来像卡死。
+        let emit_status = |phase: &'static str| {
+            if let Some(tx) = stream_tx {
+                let _ = tx.send(StreamFragment::CompactionStatus { phase: phase.to_string() });
+            }
+        };
         let plan = {
             let c = self.compaction.lock().await;
             c.plan_compaction(context)
@@ -1303,6 +1384,7 @@ impl TurnCoordinator {
                     return;
                 }
             }
+            emit_status("started");
 
             let (sys, user) = CompactionManager::build_compaction_prompt(&plan);
             let compact_req = CanonicalModelRequest {
@@ -1382,6 +1464,9 @@ impl TurnCoordinator {
                     }
                     if !abort_compaction {
                         self.chat_state.replace_conversation(rebuilt, true).await;
+                        emit_status("finished");
+                    } else {
+                        emit_status("failed");
                     }
                 } else {
                     // P1-4: summary was not effective — record as Failed
@@ -1395,6 +1480,7 @@ impl TurnCoordinator {
                             )
                             .await;
                     }
+                    emit_status("failed");
                 }
             } else {
                 // P1-4: model returned no response — record as Failed.
@@ -1407,6 +1493,7 @@ impl TurnCoordinator {
                         .write_compaction_failed(Some(turn_ctx.turn_id), &reason)
                         .await;
                 }
+                emit_status("failed");
             }
         }
     }

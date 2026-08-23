@@ -9,6 +9,7 @@ use crate::breaker::{BreakerConfig, CircuitBreaker, Outcome};
 use crate::retry::RetryBudget;
 use grodex_provider::binding::ModelBinding;
 use grodex_provider::descriptor::WireProtocol;
+use grodex_provider::lossiness::{LossinessGate, LossinessManifest, SwitchReasonView};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +62,11 @@ pub enum RouteEvent {
     /// A candidate failed. `failover` indicates whether the route will
     /// try the next candidate.
     CandidateFailed { candidate_id: String, failover: bool },
+    /// A candidate was REJECTED by the Lossiness Gate during failover
+    /// (required capability lost or undeclared degradation — Doc 14
+    /// acceptance #11: no silent degradation). `reasons` comes from the
+    /// manifest's rejection entries.
+    CandidateRejected { candidate_id: String, reasons: Vec<String> },
     /// All candidates exhausted — the route cannot serve this Turn.
     RouteExhausted { attempts: u32 },
     /// A candidate's breaker transitioned to Open.
@@ -119,6 +125,10 @@ pub struct ModelRoute {
     budget: RouteAttemptBudget,
     /// Sticky scope controlling when the route resets.
     sticky_scope: StickyScope,
+    /// Capability dimensions this route EXPLICITLY declares degradable
+    /// (Doc 14: "optional capability 可以按 route 显式声明降级").
+    /// Used to build the LossinessGate for failover gating.
+    declared_degradations: Vec<String>,
     /// Total attempts across all candidates this Turn.
     turn_attempts: u32,
     /// Index of the currently selected candidate (-1 if none).
@@ -156,10 +166,29 @@ impl ModelRoute {
             candidates: sorted,
             budget,
             sticky_scope,
+            declared_degradations: Vec::new(),
             turn_attempts: 0,
             current_index: -1,
             pending_events: Vec::new(),
         }
+    }
+
+    /// Declare capability dimensions this route allows degrading during
+    /// failover (e.g. "reasoning", "parallel_tool_calls"). Anything not
+    /// declared fails closed in the Lossiness Gate.
+    pub fn with_declared_degradations(mut self, dims: impl IntoIterator<Item = String>) -> Self {
+        self.declared_degradations = dims.into_iter().collect();
+        self
+    }
+
+    /// The route's declared degradation policy (for audit/rollout).
+    pub fn declared_degradations(&self) -> &[String] {
+        &self.declared_degradations
+    }
+
+    /// Build a LossinessGate from this route's declared degradation policy.
+    pub fn lossiness_gate(&self) -> LossinessGate {
+        LossinessGate::with_declared_degradations(self.declared_degradations.clone())
     }
 
     /// Get the current candidate (the one we're "stuck" to).
@@ -225,6 +254,67 @@ impl ModelRoute {
                 let binding = self.candidates[i].binding();
                 return Some((&self.candidates[i], binding));
             }
+        }
+        self.pending_events.push(RouteEvent::RouteExhausted {
+            attempts: self.turn_attempts,
+        });
+        None
+    }
+
+    /// Lossiness-gated failover (Doc 14 acceptance #6/#10/#11/#12).
+    ///
+    /// Like [`Self::try_next`], but each breaker-healthy candidate is
+    /// first evaluated by `evaluate`, which returns the candidate's
+    /// [`LossinessManifest`] (built by the caller from the current
+    /// binding + the candidate's ModelDescriptor via the route's
+    /// [`Self::lossiness_gate`]). A candidate is rejected when:
+    ///
+    /// - the manifest is not allowed (required capability lost or
+    ///   undeclared degradation), or
+    /// - the semantic fence was already crossed AND the switch is a
+    ///   transparent failover (Doc 14 acceptance #10).
+    ///
+    /// Rejections emit `RouteEvent::CandidateRejected` with the manifest
+    /// reasons so rollout/UI can explain why the candidate was skipped.
+    /// Returns the first admitted candidate together with its manifest.
+    pub fn try_next_lossiness(
+        &mut self,
+        mut evaluate: impl FnMut(&ModelCandidate) -> LossinessManifest,
+    ) -> Option<(&ModelCandidate, ModelBinding, LossinessManifest)> {
+        let start = (self.current_index + 1) as usize;
+        if start >= self.budget.max_candidates {
+            self.pending_events.push(RouteEvent::RouteExhausted {
+                attempts: self.turn_attempts,
+            });
+            return None;
+        }
+        for i in start..self.candidates.len() {
+            if !self.candidates[i].breaker.check().is_ok() {
+                continue;
+            }
+            let manifest = evaluate(&self.candidates[i]);
+            // Transparent failover past the semantic fence is forbidden.
+            let fence_blocks = manifest.semantic_fence_crossed
+                && manifest.reason == SwitchReasonView::Failover;
+            if manifest.allowed && !fence_blocks {
+                self.current_index = i as i32;
+                self.pending_events.push(RouteEvent::CandidateSelected {
+                    candidate_id: self.candidates[i].candidate_id.clone(),
+                    priority: self.candidates[i].priority,
+                });
+                let binding = self.candidates[i].binding();
+                return Some((&self.candidates[i], binding, manifest));
+            }
+            let mut reasons = manifest.rejection_reasons();
+            if fence_blocks {
+                reasons.push(
+                    "semantic fence already crossed; transparent failover forbidden".to_string(),
+                );
+            }
+            self.pending_events.push(RouteEvent::CandidateRejected {
+                candidate_id: self.candidates[i].candidate_id.clone(),
+                reasons,
+            });
         }
         self.pending_events.push(RouteEvent::RouteExhausted {
             attempts: self.turn_attempts,
@@ -334,6 +424,7 @@ pub struct CandidateToml {
 /// sticky_scope = "turn"
 /// max_candidates = 5
 /// turn_deadline_secs = 120
+/// allowed_degradations = ["reasoning", "parallel_tool_calls"]
 /// ```
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelRouteToml {
@@ -343,6 +434,10 @@ pub struct ModelRouteToml {
     pub max_candidates: usize,
     #[serde(default = "default_turn_deadline_secs")]
     pub turn_deadline_secs: u64,
+    /// Capability dimensions this route explicitly allows degrading on
+    /// failover (Doc 14 Lossiness Gate). Undeclared losses fail closed.
+    #[serde(default)]
+    pub allowed_degradations: Vec<String>,
     pub candidates: Vec<CandidateToml>,
 }
 
@@ -403,6 +498,7 @@ impl ModelRouteToml {
         };
 
         ModelRoute::with_config(candidates, budget, sticky_scope)
+            .with_declared_degradations(self.allowed_degradations.clone())
     }
 }
 
@@ -577,6 +673,83 @@ mod tests {
 
         // Drain should clear.
         assert!(route.drain_events().is_empty(), "events should be drained");
+    }
+
+    fn manifest_for(candidate: &ModelCandidate, allowed: bool, fence: bool) -> LossinessManifest {
+        use grodex_provider::lossiness::{LossinessClass, LossinessEntry};
+        let entries = if allowed {
+            vec![LossinessEntry {
+                dimension: grodex_provider::lossiness::dimension::REASONING.into(),
+                class: LossinessClass::Lossless,
+                losses: Vec::new(),
+            }]
+        } else {
+            vec![LossinessEntry {
+                dimension: grodex_provider::lossiness::dimension::REASONING.into(),
+                class: LossinessClass::UndeclaredDegradation,
+                losses: vec!["visible reasoning not supported".into()],
+            }]
+        };
+        LossinessManifest {
+            old_binding_id: "openai:1:gpt-5:1".into(),
+            new_provider_id: candidate.provider_id.clone(),
+            new_model_id: candidate.model_id.clone(),
+            reason: SwitchReasonView::Failover,
+            entries,
+            allowed,
+            requires_compaction: false,
+            semantic_fence_crossed: fence,
+        }
+    }
+
+    #[test]
+    fn lossiness_gate_rejects_undeclared_degradation_candidate() {
+        let candidates = vec![
+            make_candidate("primary", 0),
+            make_candidate("lossy", 1),    // undeclared reasoning loss
+            make_candidate("safe", 2),     // lossless
+        ];
+        let mut route = ModelRoute::new(candidates, RetryBudget::default());
+        route.select_first().unwrap();
+        route.record_failure(true);
+
+        let (c, _, manifest) = route
+            .try_next_lossiness(|cand| manifest_for(cand, cand.candidate_id != "lossy", false))
+            .unwrap();
+        assert_eq!(c.candidate_id, "safe", "lossy candidate must be skipped");
+        assert!(manifest.allowed);
+
+        let events = route.drain_events();
+        assert!(
+            events.iter().any(|e| matches!(
+                e, RouteEvent::CandidateRejected { candidate_id, reasons }
+                if candidate_id == "lossy" && reasons.iter().any(|r| r.contains("reasoning"))
+            )),
+            "rejection must be explained via CandidateRejected"
+        );
+    }
+
+    #[test]
+    fn semantic_fence_blocks_transparent_failover() {
+        let candidates = vec![
+            make_candidate("primary", 0),
+            make_candidate("secondary", 1),
+        ];
+        let mut route = ModelRoute::new(candidates, RetryBudget::default());
+        route.select_first().unwrap();
+        route.record_failure(true);
+
+        // Fence crossed + Failover reason → transparent failover forbidden.
+        let res = route.try_next_lossiness(|cand| manifest_for(cand, true, true));
+        assert!(res.is_none(), "fence must block transparent failover");
+        let events = route.drain_events();
+        assert!(
+            events.iter().any(|e| matches!(
+                e, RouteEvent::CandidateRejected { reasons, .. }
+                if reasons.iter().any(|r| r.contains("semantic fence"))
+            )),
+            "fence rejection must be recorded for rollout explainability"
+        );
     }
 
     #[test]

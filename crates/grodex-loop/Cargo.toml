@@ -18,6 +18,7 @@ grodex-skills.workspace = true
 grodex-memory.workspace = true
 grodex-sandbox.workspace = true
 grodex-subagent.workspace = true
+grodex-tools.workspace = true
 grodex-prompt.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

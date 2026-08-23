@@ -674,17 +674,34 @@ pub(crate) fn try_parse_local_slash(text: &str) -> Option<(SlashLocalKind, Strin
         return Some((SlashLocalKind::Unsupported, String::new()));
     }
     let args = splitn.next().unwrap_or("").to_string();
-    for cmd in BUILTIN_SLASH_COMMANDS.iter() {
-        if cmd.name.eq_ignore_ascii_case(name) {
-            // EVERY recognized command is handled locally — the `Forward`
-            // variant no longer exists by design (fail-closed).
-            return Some((cmd.local.clone(), args));
+    // Doc 19 §13: recognition + three-kind classification come from the
+    // unified registry (seeded from BUILTIN_SLASH_COMMANDS), not a
+    // TUI-private lookup. Registered names are lowercase; normalize the
+    // typed name to keep the historic ASCII case-insensitivity.
+    let normalized = format!("/{}", name.to_ascii_lowercase());
+    match super::state::tui_slash_registry().resolve(&normalized) {
+        Ok(grodex_prompt::SlashResolution::RuntimeDispatch { name }) => {
+            for cmd in BUILTIN_SLASH_COMMANDS.iter() {
+                if cmd.name == name {
+                    // EVERY recognized command is handled locally — the
+                    // `Forward` variant no longer exists by design
+                    // (fail-closed).
+                    return Some((cmd.local.clone(), args));
+                }
+            }
+            // Registered in the unified registry but has no local handler —
+            // a table slip. Block locally instead of leaking to the model.
+            Some((SlashLocalKind::Unsupported, String::new()))
         }
+        // Macro expansion / skill dispatch have no TUI forwarding path yet;
+        // fail-closed: block locally rather than silently sending anything
+        // to the model.
+        Ok(_) => Some((SlashLocalKind::Unsupported, String::new())),
+        // UNRECOGNIZED `/something` → also block locally, never leak to LLM.
+        // User typed something like `/exot` (typo for /exit) and shouldn't
+        // pay tokens on their mis-typed command name.
+        Err(_) => Some((SlashLocalKind::Unsupported, format!("/{name} {args}").trim().to_string())),
     }
-    // UNRECOGNIZED `/something` → also block locally, never leak to LLM.
-    // User typed something like `/exot` (typo for /exit) and shouldn't
-    // pay tokens on their mis-typed command name.
-    Some((SlashLocalKind::Unsupported, format!("/{name} {args}").trim().to_string()))
 }
 
 // ── Command mode — same sanitize as prompt, : prefixed colon —────────────
@@ -1156,5 +1173,46 @@ mod tests {
         s.record_input_history("hello");
         s.record_input_history("   ");
         assert_eq!(s.input_history, vec!["hello".to_string()]);
+    }
+
+    // ── Doc 19 §13: TUI builtin table wired into the unified registry ──
+
+    #[test]
+    fn unified_registry_covers_entire_builtin_table() {
+        // The registry is seeded from BUILTIN_SLASH_COMMANDS: same count
+        // (i.e. no duplicate names in the table) and every entry resolves
+        // as RuntimeDispatch — never reaches the model.
+        let reg = crate::ui::state::tui_slash_registry();
+        assert_eq!(reg.len(), BUILTIN_SLASH_COMMANDS.len());
+        for cmd in BUILTIN_SLASH_COMMANDS.iter() {
+            let res = reg
+                .resolve(&format!("/{}", cmd.name))
+                .unwrap_or_else(|e| panic!("builtin /{} must be registered: {e}", cmd.name));
+            assert!(
+                matches!(res, grodex_prompt::SlashResolution::RuntimeDispatch { .. }),
+                "builtin /{} must classify as RuntimeDispatch, got {res:?}",
+                cmd.name
+            );
+        }
+    }
+
+    #[test]
+    fn slash_parse_via_registry_keeps_fail_closed_contract() {
+        // Known builtin → local dispatch with args preserved.
+        let (kind, args) = try_parse_local_slash("/cd /tmp/x").unwrap();
+        assert!(matches!(kind, SlashLocalKind::AcpChdir));
+        assert_eq!(args, "/tmp/x");
+        // Historic ASCII case-insensitivity survives the registry hop.
+        let (kind, _) = try_parse_local_slash("/EXIT").unwrap();
+        assert!(matches!(kind, SlashLocalKind::Exit));
+        // Unknown command → blocked locally (fail-closed), never forwarded.
+        let (kind, args) = try_parse_local_slash("/exot now").unwrap();
+        assert!(matches!(kind, SlashLocalKind::Unsupported));
+        assert_eq!(args, "/exot now");
+        // Bare `/` → blocked.
+        let (kind, _) = try_parse_local_slash("/   ").unwrap();
+        assert!(matches!(kind, SlashLocalKind::Unsupported));
+        // Regular prompt → passthrough (None).
+        assert!(try_parse_local_slash("hello world").is_none());
     }
 }

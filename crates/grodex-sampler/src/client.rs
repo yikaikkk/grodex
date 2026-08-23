@@ -325,7 +325,8 @@ impl SamplingClient {
                 Some(serde_json::json!({"role": "system", "content": format!("[Previous conversation summary]:\n{summary}")}))
             }
             ContextItem::ReasoningSummary { content } => {
-                Some(serde_json::json!({"role": "assistant", "content": format!("[Previous reasoning]:\n{content}")}))
+                // Set reasoning_content FIELD for thinking-mode providers.
+                Some(serde_json::json!({"role": "assistant", "content": null, "reasoning_content": content}))
             }
             ContextItem::ImagePlaceholder { mime_type, artifact_ref } => {
                 Some(serde_json::json!({"role": "user", "content": format!("[Image: {mime_type}, ref: {artifact_ref}]")}))
@@ -414,12 +415,23 @@ impl SamplingClient {
                 }
                 // All other variants use the 1:1 mapping.
                 other => {
-                    // Flush any pending reasoning as a developer message so it
+                    // Flush any pending reasoning as an assistant message so it
                     // is not silently dropped when no assistant message follows.
+                    // NOTE: must NOT use role "developer" — Chat Completions
+                    // endpoints (esp. third-party) reject unknown roles; this
+                    // flush path triggers after mid-tool-call interrupts when a
+                    // ReasoningSummary is followed directly by a ToolResult.
+                    //
+                    // CRITICAL: set the `reasoning_content` FIELD (not just
+                    // text content). DeepSeek/Qwen thinking-mode APIs require
+                    // this field to be echoed back verbatim — putting it in
+                    // the message text does NOT satisfy the requirement and
+                    // triggers a 400 "reasoning_content must be passed back".
                     if let Some(r) = pending_reasoning.take() {
                         messages.push(serde_json::json!({
-                            "role": "developer",
-                            "content": format!("[Previous reasoning]:\n{r}")
+                            "role": "assistant",
+                            "content": null,
+                            "reasoning_content": r,
                         }));
                     }
                     if let Some(m) = self.map_chat_item(other) {
@@ -431,10 +443,12 @@ impl SamplingClient {
         // Trailing volatile instruction blocks (e.g. per-turn memory RAG)
         // go AFTER the conversation history so the stable prefix
         // (system + history) remains cacheable across turns.
+        // Chat Completions has a single instruction role: `developer` is
+        // mapped to `system` — many endpoints reject unknown roles.
         for inst in request.instructions.iter().skip(1) {
             let role = match inst.role {
                 grodex_provider::canonical_request::InstructionRole::System => "system",
-                grodex_provider::canonical_request::InstructionRole::Developer => "developer",
+                grodex_provider::canonical_request::InstructionRole::Developer => "system",
             };
             messages.push(serde_json::json!({"role": role, "content": inst.content}));
         }
@@ -479,10 +493,54 @@ impl SamplingClient {
                     system.push_str(content);
                     system.push('\n');
                 }
-                _ => {
-                    if let Some(mapped) = self.map_context_item(item) {
-                        messages.push(mapped);
-                    }
+                // Anthropic-native formats — must NOT reuse map_context_item
+                // here: it emits Responses-API shapes (function_call /
+                // role "developer") that the Messages endpoint rejects.
+                ContextItem::ToolCall { call_id, name, arguments } => {
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": call_id.to_string(),
+                            "name": name,
+                            "input": arguments,
+                        }]
+                    }));
+                }
+                ContextItem::ToolResult { call_id, content, is_error } => {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": call_id.to_string(),
+                            "content": content,
+                            "is_error": is_error,
+                        }]
+                    }));
+                }
+                ContextItem::CompactionSummary { summary, .. } => {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("[Previous conversation summary]:\n{summary}"),
+                    }));
+                }
+                ContextItem::ReasoningSummary { content } => {
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": format!("[Previous reasoning]:\n{content}"),
+                    }));
+                }
+                ContextItem::ImagePlaceholder { mime_type, artifact_ref } => {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("[Image: {mime_type}, ref: {artifact_ref}]"),
+                    }));
+                }
+                ContextItem::User { content, .. } => {
+                    messages.push(serde_json::json!({"role": "user", "content": content}));
+                }
+                ContextItem::Assistant { content } => {
+                    messages.push(serde_json::json!({"role": "assistant", "content": content}));
                 }
             }
         }
@@ -495,9 +553,20 @@ impl SamplingClient {
                 "content": format!("<context>\n{}\n</context>", inst.content),
             }));
         }
-        let tools: Vec<serde_json::Value> = request.tool_specs.iter().map(|t| serde_json::json!({
+        let mut tools: Vec<serde_json::Value> = request.tool_specs.iter().map(|t| serde_json::json!({
             "name": t.name, "description": t.description, "input_schema": t.parameters
         })).collect();
+        // Anthropic supports up to 4 cache breakpoints per request.
+        // Place an ephemeral breakpoint on the LAST tool so the
+        // system + tools prefix is independently cacheable even when
+        // messages change every step (tools schemas are the largest
+        // static block — often 5k+ tokens).
+        if let Some(last) = tools.last_mut() {
+            last.as_object_mut().unwrap().insert(
+                "cache_control".into(),
+                serde_json::json!({"type": "ephemeral"}),
+            );
+        }
 
         let mut body = serde_json::json!({
             "model": _binding.model_id,
@@ -550,4 +619,113 @@ fn strip_html_tags(html: &str) -> String {
         .join(" ")
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod wire_role_tests {
+    use super::*;
+    use grodex_core::id::{SessionId, StepId, ToolCallId, TurnId};
+    use grodex_provider::canonical_request::{InstructionBlock, InstructionRole, ToolChoice};
+
+    fn test_client() -> SamplingClient {
+        SamplingClient::new(SamplingClientConfig::default()).unwrap()
+    }
+
+    fn chat_binding() -> ModelBinding {
+        ModelBinding::new("p".into(), 1, "m".into(), 1, WireProtocol::ChatCompletions)
+    }
+
+    fn messages_binding() -> ModelBinding {
+        ModelBinding::new("p".into(), 1, "m".into(), 1, WireProtocol::Messages)
+    }
+
+    fn request_with(items: Vec<ContextItem>, instructions: Vec<InstructionBlock>) -> CanonicalModelRequest {
+        CanonicalModelRequest {
+            request_id: "req-test".into(),
+            session_id: SessionId::new(),
+            turn_id: TurnId::new(),
+            step_id: StepId::new(),
+            model_binding_id: grodex_provider::binding::ModelBindingId::new(),
+            prompt_snapshot_hash: None,
+            instructions,
+            context_items: items,
+            tool_specs: Vec::new(),
+            tool_choice: ToolChoice::Auto,
+            parallel_tool_calls: false,
+            reasoning_request: None,
+            response_format: None,
+            max_output_tokens: None,
+            provider_state_in: None,
+        }
+    }
+
+    /// Regression: mid-tool-call interrupt leaves ReasoningSummary directly
+    /// followed by ToolResult; the reasoning flush must NOT emit role
+    /// "developer" (Chat Completions endpoints reject unknown roles).
+    #[test]
+    fn chat_body_never_emits_developer_role_after_interrupt() {
+        let req = request_with(
+            vec![
+                ContextItem::User { content: "run tests".into(), message_id: None },
+                ContextItem::ReasoningSummary { content: "thinking...".into() },
+                ContextItem::ToolResult {
+                    call_id: ToolCallId::new(),
+                    content: "interrupted".into(),
+                    is_error: true,
+                },
+            ],
+            Vec::new(),
+        );
+        let body = test_client().build_chat_body(&chat_binding(), &req);
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert!(!roles.contains(&"developer"), "roles: {roles:?}");
+        // The flushed reasoning must still be present (not dropped).
+        assert!(roles.contains(&"assistant"));
+    }
+
+    /// Regression: trailing volatile instruction blocks with Developer role
+    /// must map to "system" on the chat wire.
+    #[test]
+    fn chat_trailing_developer_instruction_maps_to_system() {
+        let req = request_with(
+            vec![ContextItem::User { content: "hi".into(), message_id: None }],
+            vec![
+                InstructionBlock { role: InstructionRole::System, content: "base".into(), priority: 100 },
+                InstructionBlock { role: InstructionRole::Developer, content: "rag".into(), priority: 10 },
+            ],
+        );
+        let body = test_client().build_chat_body(&chat_binding(), &req);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs.last().unwrap()["role"], "system", "Developer trailing block must map to system");
+    }
+
+    /// Regression: Anthropic Messages wire must use native tool_use /
+    /// tool_result shapes and never emit role "developer" or
+    /// Responses-style function_call items.
+    #[test]
+    fn messages_body_uses_anthropic_shapes_only() {
+        let call_id = ToolCallId::new();
+        let req = request_with(
+            vec![
+                ContextItem::ToolCall { call_id: call_id.clone(), name: "exec".into(), arguments: serde_json::json!({"cmd": "ls"}) },
+                ContextItem::ToolResult { call_id, content: "ok".into(), is_error: false },
+                ContextItem::CompactionSummary { summary: "sum".into(), window_number: 1 },
+            ],
+            vec![InstructionBlock { role: InstructionRole::Developer, content: "base".into(), priority: 100 }],
+        );
+        let body = test_client().build_messages_body(&messages_binding(), &req);
+        let msgs = body["messages"].as_array().unwrap();
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(!serialized.contains("\"developer\""), "no developer role on Messages wire");
+        assert!(!serialized.contains("function_call"), "no Responses shapes on Messages wire");
+        assert_eq!(msgs[0]["content"][0]["type"], "tool_use");
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["role"], "user");
+    }
 }

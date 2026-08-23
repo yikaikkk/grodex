@@ -206,6 +206,11 @@ pub enum SessionEvent {
     /// abusing `Error` as a generic "toast". The frontend renders Info
     /// via push_log, not the red "Error" card.
     Info { message: String },
+    /// Context compaction lifecycle status — maps to ACP CompactionStatus.
+    /// `phase` ∈ {"started", "finished", "failed"}. The frontend shows a
+    /// transient "会话压缩中…" indicator while started and clears it on
+    /// finished/failed.
+    CompactionStatus { phase: String },
     /// The session has shut down.
     Shutdown,
     /// A snapshot is ready for the client (in response to `ResumeSession`

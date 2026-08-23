@@ -494,6 +494,24 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandDef] = &[
     SlashCommandDef { name: "forget",      description: "让 agent 忘记某个主题（/forget <terms>）",                                 local: SlashLocalKind::GrodexForget },
 ];
 
+/// The unified slash registry (Doc 19 §13) seeded from
+/// [`BUILTIN_SLASH_COMMANDS`] — the single authority for command
+/// recognition and three-kind classification. Every TUI builtin enters as
+/// a `RuntimeCommand` (never reaches the model); the TUI's local dispatch
+/// (`SlashLocalKind`) layers on top of the registry's verdict. Unknown
+/// names resolve to `Err(Unknown)` here and are blocked locally by the
+/// caller — same fail-closed contract, now enforced by one registry
+/// instead of a TUI-private lookup loop.
+pub fn tui_slash_registry() -> &'static grodex_prompt::SlashCommandRegistry {
+    static REG: std::sync::OnceLock<grodex_prompt::SlashCommandRegistry> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| {
+        grodex_prompt::SlashCommandRegistry::with_builtins(
+            BUILTIN_SLASH_COMMANDS.iter().map(|c| (c.name, c.description)),
+        )
+    })
+}
+
 /// A single matched row in the slash dropdown.
 #[derive(Debug, Clone)]
 pub struct SlashMatchRow {
@@ -573,6 +591,11 @@ pub struct TuiAppState {
     /// Prevents duplicate Cancel commands (which cause "Idle -> Idle"
     /// state transition errors) when the user presses Esc multiple times.
     pub cancel_sent: bool,
+    /// True while the agent runs a context compaction round-trip
+    /// (CompactionStatus "started" → cleared on "finished"/"failed").
+    /// Renders the "会话压缩中…" indicator so the mid-turn model call
+    /// doesn't look like a freeze.
+    pub compacting: bool,
     /// Whether the most-recent Thinking (CoT) block is expanded.
     /// Toggle with Ctrl+O. When false (default), the Thinking panel
     /// shows a fixed-height window of MAX_LINES=12 lines that is
@@ -670,6 +693,7 @@ impl TuiAppState {
             scroll_conversation: 0,
             scroll_follow_bottom: true,
             cancel_sent: false,
+            compacting: false,
             thinking_expanded: false,
             subagent_expanded: false,
             thinking_scroll: 0,
@@ -1199,9 +1223,18 @@ impl TuiAppState {
             self.turn_id = snapshot.current_turn_id.clone();
         }
 
+        // 会话压缩状态指示：started 点亮，finished/failed 熄灭。
+        if let SessionEvent::CompactionStatus { phase } = &e {
+            self.compacting = phase == "started";
+        }
+
         if let SessionEvent::TurnComplete { turn_id, input_tokens, cached_tokens } = &e {
             self.turn_id = Some(turn_id.clone());
             self.cancel_sent = false;
+            // 防御：turn 结束时强制熄灭压缩指示（正常路径由
+            // CompactionStatus "finished"/"failed" 关闭，但取消的 turn
+            // 可能丢失关闭事件）。
+            self.compacting = false;
             // Close the two per-turn open blocks independently.
             //
             // BUG-FIX: previous code iterated .rev() and broke on the

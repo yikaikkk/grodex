@@ -221,6 +221,9 @@ pub struct SessionSupervisor {
     /// Whether the workspace is trusted (controls whether untrusted
     /// AGENTS.md content is included in the prompt — fail-closed).
     workspace_trusted: bool,
+    /// Discovery configuration for instruction discovery (Doc 19 §7.3
+    /// compat vendor opt-in). Default: no compat vendors scanned.
+    discovery_config: grodex_prompt::DiscoveryConfig,
     /// Handle to the currently running turn task (for cancellation).
     current_turn_handle: Option<tokio::task::AbortHandle>,
     /// CancellationToken for the current turn.
@@ -306,6 +309,7 @@ impl SessionSupervisor {
             model_config,
             cwd,
             workspace_trusted,
+            discovery_config: grodex_prompt::DiscoveryConfig::default(),
             current_turn_handle: None,
             current_turn_cancel: None,
             permission,
@@ -318,6 +322,12 @@ impl SessionSupervisor {
 
         let handle = SessionHandle { cmd_tx, event_rx };
         (supervisor, handle)
+    }
+
+    /// Override the instruction discovery configuration (Doc 19 §7.3
+    /// compat vendor opt-in). Call before `run()`.
+    pub fn set_discovery_config(&mut self, cfg: grodex_prompt::DiscoveryConfig) {
+        self.discovery_config = cfg;
     }
 
     /// Main event loop with tokio::select!.
@@ -796,7 +806,7 @@ impl SessionSupervisor {
             return;
         }
 
-        let mut reducer = SessionReducer::new(self.session.id);
+        let mut reducer = SessionReducer::new(self.session.id).tolerant_orphans();
         if let Err(e) = reducer.apply_all(&events) {
             let _ = self.event_tx
                 .send(SessionEvent::Error {
@@ -806,8 +816,8 @@ impl SessionSupervisor {
             return;
         }
 
-        let context = reducer.context().to_vec();
         let generation = reducer.generation().as_u64();
+        let context = reducer.finish();
         let event_count = events.len() as u64;
 
         // ── Inject context into Session + chat_state ────────────────────
@@ -1079,8 +1089,22 @@ impl SessionSupervisor {
         self.prev_skill_snapshot = Some(snapshot);
         self.skill_catalog = Some(new_catalog);
         if self.cached_discovered_nodes.is_none() {
-            let mut tmp = grodex_prompt::PromptBuilder::new();
+            let mut tmp = grodex_prompt::PromptBuilder::new()
+                .with_discovery_config(self.discovery_config.clone());
             tmp.discover_instructions(&self.cwd, self.workspace_trusted);
+            // Doc 19 §7.3 diagnostics (compat precedence / unknown
+            // vendors) are explanatory — surface via tracing only.
+            for d in tmp.discovery_diagnostics() {
+                tracing::info!("instruction discovery diagnostic: {d}");
+            }
+            // Doc 19 §12: structural conflict detection (boundary
+            // violations / scope overrides / duplicates) — explanatory,
+            // surfaces via tracing; also embedded in the manifest built
+            // below for `prompt explain` visibility.
+            let conflict_report = grodex_prompt::detect_conflicts(tmp.discovered_nodes());
+            for c in &conflict_report.conflicts {
+                tracing::info!("instruction conflict: {}", c.message);
+            }
             self.cached_discovered_nodes = Some(tmp.discovered_nodes().to_vec());
         }
 
@@ -1177,6 +1201,9 @@ impl SessionSupervisor {
                             args: None,
                             call_id: None,
                         },
+                        StreamFragment::CompactionStatus { phase } => {
+                            SessionEvent::CompactionStatus { phase }
+                        }
                     };
                     let _ = event_tx.send(ev).await;
                 }
@@ -1209,18 +1236,6 @@ impl SessionSupervisor {
                     found_error = true;
                 }
             }
-            // ── Step-budget exhaustion notice ─────────────────────
-            // The coordinator forces a wrap-up summary when max_steps is
-            // hit; make that VISIBLE to the user so a long task ending
-            // early is never mistaken for a completed one.
-            if completion.outcome.steps_exhausted {
-                let _ = self.event_tx.send(SessionEvent::Info {
-                    message: format!(
-                        "⚠️ 已达到本轮最大执行步数（{} 步），上方已自动生成进展总结。发一条消息（如“继续”）即可接着完成未完成的工作。",
-                        completion.outcome.steps.len().saturating_sub(1)
-                    ),
-                }).await;
-            }
             // ── Issue #4 fix: output-break-after-tool-failure ──────
             // When the model produced no text AND no sampling error was
             // recorded, the likely cause is that tool(s) failed and the
@@ -1251,6 +1266,23 @@ impl SessionSupervisor {
                     }).await;
                 }
             }
+        }
+
+        // ── Step-budget exhaustion notice ─────────────────────
+        // The coordinator forces a wrap-up summary when max_steps is
+        // hit; make that VISIBLE to the user so a long task ending
+        // early is never mistaken for a completed one.
+        // NOTE: this must be OUTSIDE the if/else above — when the
+        // wrap-up summary produces text, final_text is non-empty and
+        // the if-branch runs; the steps_exhausted notice would be
+        // silently skipped if placed inside the else branch.
+        if completion.outcome.steps_exhausted {
+            let _ = self.event_tx.send(SessionEvent::Info {
+                message: format!(
+                    "⚠️ 已达到本轮最大执行步数（{} 步），上方已自动生成进展总结。发一条消息（如“继续”）即可接着完成未完成的工作。",
+                    completion.outcome.steps.len().saturating_sub(1)
+                ),
+            }).await;
         }
 
         // Always complete the turn (even if text is empty) so the session
@@ -1310,13 +1342,15 @@ impl SessionSupervisor {
 
         // Fold events through the reducer — this validates seq continuity,
         // rejects orphaned tool results and generation regressions, and
-        // produces the rebuilt context.
-        let mut reducer = SessionReducer::new(self.session.id);
+        // produces the rebuilt context. Tolerant mode: an interrupted
+        // turn leaves orphaned tool calls behind; heal them instead of
+        // making boot recovery fail on a salvageable journal.
+        let mut reducer = SessionReducer::new(self.session.id).tolerant_orphans();
         reducer
             .apply_all(&events)
             .map_err(|e| format!("replay: {e}"))?;
 
-        let rebuilt = reducer.into_context();
+        let rebuilt = reducer.finish();
         if !rebuilt.is_empty() {
             self.chat_state.replace_conversation(rebuilt, false).await;
         }
@@ -1348,6 +1382,16 @@ impl SessionSupervisor {
         if let Err(e) = self.session.cancel_turn() {
             let _ = self.event_tx.send(SessionEvent::Error { message: e }).await;
         }
+        // Repair the journal damage caused by the abort: when the turn
+        // task was killed mid-tool-execution, the ToolCall events are
+        // durable but their ToolResultCommitted will never be written.
+        // Without this repair every later resume fails validation with
+        // OrphanedToolResult and the transcript stays unpaired forever.
+        if had_turn {
+            if let Some(tid) = turn_id {
+                self.heal_interrupted_tool_calls(tid).await;
+            }
+        }
         // Notify the frontend that the turn is over so it stops the
         // streaming indicator and marks in-flight tool cards as done.
         // Without this, the TUI shows "⏳ working… 3m09s" forever because
@@ -1362,8 +1406,62 @@ impl SessionSupervisor {
         }
     }
 
+    /// Post-abort journal repair: synthesize an error result (journal +
+    /// live transcript) for every tool call that no longer has a paired
+    /// result, then seal the cancelled turn with TurnCompleted. This
+    /// keeps the journal valid under strict replay and the live
+    /// transcript wire-safe (no dangling tool_calls before the next
+    /// user message).
+    async fn heal_interrupted_tool_calls(&mut self, turn_id: grodex_core::id::TurnId) {
+        let Some(ref writer) = self.writer else { return };
+
+        // Scan the transcript for tool calls without a result.
+        let conversation = self.chat_state.get_conversation().await;
+        let mut pending: Vec<(grodex_core::id::ToolCallId, String)> = Vec::new();
+        for item in &conversation {
+            match item {
+                ContextItem::ToolCall { call_id, name, .. } => {
+                    pending.push((*call_id, name.clone()));
+                }
+                ContextItem::ToolResult { call_id, .. } => {
+                    pending.retain(|(id, _)| id != call_id);
+                }
+                _ => {}
+            }
+        }
+
+        for (call_id, name) in pending {
+            let content = format!(
+                "[interrupted] The `{name}` tool call was interrupted by the user; \
+                 no result was obtained. Do not assume its side effects completed \
+                 — verify actual state first if needed."
+            );
+            if let Err(e) = writer
+                .write_tool_result_interrupted(turn_id, &call_id.to_string(), &content)
+                .await
+            {
+                tracing::warn!("heal_interrupted_tool_calls: journal write failed: {e}");
+                continue;
+            }
+            self.chat_state
+                .push_tool_result(call_id, content, true)
+                .await;
+        }
+
+        // Seal the cancelled turn so strict replays see a complete turn
+        // boundary (the aborted task never reached handle_turn_completion).
+        if let Err(e) = writer.write_turn_completed(turn_id).await {
+            tracing::warn!("heal_interrupted_tool_calls: TurnCompleted write failed: {e}");
+        }
+    }
+
     async fn shutdown(&mut self) {
         self.cancel_turn().await;
+        // Doc 11 §22: reclaim this session's offloaded tool-result blobs
+        // (revoke owner refs + GC) instead of leaking them on disk.
+        self.coordinator
+            .release_session_blobs(&self.session.id.to_string())
+            .await;
         let _ = self.session.transition_to(SessionState::ShuttingDown);
     }
 }

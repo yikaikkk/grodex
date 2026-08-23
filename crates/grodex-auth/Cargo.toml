@@ -22,8 +22,5 @@ sha2.workspace = true
 reqwest.workspace = true
 url = "2"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "2"
-
 [lints]
 workspace = true

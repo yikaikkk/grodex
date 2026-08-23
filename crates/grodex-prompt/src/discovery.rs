@@ -43,8 +43,11 @@ const COMPAT_VENDORS: &[(&str, &str)] = &[
 /// Configuration for instruction discovery.
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
-    /// Whether compatibility vendor directories are scanned.
-    pub compatibility_mode: bool,
+    /// Compatibility vendors explicitly enabled for scanning (Doc 19 §7.3).
+    /// Recognized labels: `grok`, `codex`, `claude`, `cursor`. EMPTY by
+    /// default — vendor directories are NEVER scanned unless the user
+    /// opts in per vendor (no silent all-vendor concatenation).
+    pub compat_vendors: std::collections::BTreeSet<String>,
     /// Maximum file size in bytes (files larger than this are skipped).
     pub max_file_size: u64,
     /// Whether to scan user-global instructions (~/.agent/).
@@ -58,7 +61,8 @@ pub struct DiscoveryConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            compatibility_mode: false,
+            // Doc 19 §7.3: vendor dirs opt-in only — empty by default.
+            compat_vendors: std::collections::BTreeSet::new(),
             max_file_size: MAX_FILE_SIZE,
             scan_user_global: true,
             managed_bundle_path: None,
@@ -77,6 +81,10 @@ pub struct DiscoveryResult {
     pub duplicates: Vec<PathBuf>,
     /// Files skipped because workspace is untrusted.
     pub untrusted_skipped: Vec<PathBuf>,
+    /// Human-readable diagnostics (Doc 19 §7.3 conflict precedence,
+    /// unknown compat vendors). Never affect the prompt hash — they are
+    /// explanatory only.
+    pub diagnostics: Vec<String>,
 }
 
 impl DiscoveryResult {
@@ -135,17 +143,20 @@ impl InstructionDiscovery {
             self.discover_user_global(&mut result, &mut seen_canonical);
         }
 
-        // 3. Workspace chain (root → cwd).
+        // 3. Workspace chain (root → cwd). Canonical directories (those
+        //    contributing an AGENTS.md or .agent/rules) are recorded so
+        //    the compat scan can emit §7.3 precedence diagnostics.
+        let mut canonical_dirs: HashSet<PathBuf> = HashSet::new();
         if let Some(root) = find_project_root(cwd) {
-            self.discover_workspace_chain(&root, cwd, workspace_trusted, &mut result, &mut seen_canonical);
+            self.discover_workspace_chain(&root, cwd, workspace_trusted, &mut result, &mut seen_canonical, &mut canonical_dirs);
         } else {
             // No git root — just scan cwd.
-            self.discover_workspace_chain(cwd, cwd, workspace_trusted, &mut result, &mut seen_canonical);
+            self.discover_workspace_chain(cwd, cwd, workspace_trusted, &mut result, &mut seen_canonical, &mut canonical_dirs);
         }
 
-        // 4. Compatibility vendors (opt-in).
-        if self.config.compatibility_mode {
-            self.discover_compat_vendors(cwd, workspace_trusted, &mut result, &mut seen_canonical);
+        // 4. Compatibility vendors (explicit per-vendor opt-in, Doc 19 §7.3).
+        if !self.config.compat_vendors.is_empty() {
+            self.discover_compat_vendors(cwd, workspace_trusted, &mut result, &mut seen_canonical, &canonical_dirs);
         }
 
         result
@@ -258,6 +269,7 @@ impl InstructionDiscovery {
         trusted: bool,
         result: &mut DiscoveryResult,
         seen: &mut HashSet<PathBuf>,
+        canonical_dirs: &mut HashSet<PathBuf>,
     ) {
         // Walk from root to cwd (inclusive), scanning AGENTS.md and .agent/rules/*.md.
         let trust = if trusted {
@@ -287,6 +299,7 @@ impl InstructionDiscovery {
                                         trust,
                                         self.config.config_generation,
                                     ));
+                                    canonical_dirs.insert(dir.clone());
                                 } else {
                                     result.untrusted_skipped.push(canonical);
                                 }
@@ -329,6 +342,7 @@ impl InstructionDiscovery {
                                         trust,
                                         self.config.config_generation,
                                     ));
+                                    canonical_dirs.insert(dir.clone());
                                 } else {
                                     result.untrusted_skipped.push(canonical);
                                 }
@@ -348,12 +362,34 @@ impl InstructionDiscovery {
         trusted: bool,
         result: &mut DiscoveryResult,
         seen: &mut HashSet<PathBuf>,
+        canonical_dirs: &HashSet<PathBuf>,
     ) {
         if !trusted {
             return; // Don't load compat vendors from untrusted workspaces.
         }
 
+        // Doc 19 §7.3: only explicitly enabled vendors are scanned.
+        // Unknown vendor labels get a diagnostic instead of silent ignore.
+        let known: HashSet<&str> = COMPAT_VENDORS.iter().map(|(_, label)| *label).collect();
+        for requested in &self.config.compat_vendors {
+            if !known.contains(requested.as_str()) {
+                result.diagnostics.push(format!(
+                    "unknown compat vendor `{requested}`（仅支持 grok/codex/claude/cursor，已忽略）"
+                ));
+            }
+        }
+
+        let cwd_canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        // §7.3 conflict: canonical AGENTS.md / .agent/rules present at cwd
+        // → canonical keeps precedence (discovered earlier, thus ordered
+        // first); vendor content still loads as lower-priority rules but
+        // each load emits a diagnostic (no silent concatenation).
+        let canonical_conflict = canonical_dirs.contains(&cwd_canonical);
+
         for (dir_name, vendor_label) in COMPAT_VENDORS {
+            if !self.config.compat_vendors.contains(*vendor_label) {
+                continue;
+            }
             let vendor_dir = cwd.join(dir_name);
             if !vendor_dir.is_dir() {
                 continue;
@@ -379,6 +415,12 @@ impl InstructionDiscovery {
                                     TrustState::UserTrusted,
                                     self.config.config_generation,
                                 ));
+                                if canonical_conflict {
+                                    result.diagnostics.push(format!(
+                                        "canonical .agent 优先：{} 以低优先级兼容规则装载（Doc 19 §7.3）",
+                                        canonical.display()
+                                    ));
+                                }
                             }
                             Err(ReadError::Oversized) => result.oversized.push(path),
                             Err(ReadError::Io(_)) => {}
@@ -416,6 +458,12 @@ impl InstructionDiscovery {
                                     TrustState::UserTrusted,
                                     self.config.config_generation,
                                 ));
+                                if canonical_conflict {
+                                    result.diagnostics.push(format!(
+                                        "canonical .agent 优先：{} 以低优先级兼容规则装载（Doc 19 §7.3）",
+                                        canonical.display()
+                                    ));
+                                }
                             }
                             Err(ReadError::Oversized) => result.oversized.push(file),
                             Err(ReadError::Io(_)) => {}
@@ -620,7 +668,7 @@ mod tests {
         std::fs::write(claude_dir.join("CLAUDE.md"), "Claude-specific rules.").unwrap();
 
         let config = DiscoveryConfig {
-            compatibility_mode: true,
+            compat_vendors: ["claude".to_string()].into_iter().collect(),
             scan_user_global: false,
             ..DiscoveryConfig::default()
         };
@@ -641,6 +689,71 @@ mod tests {
         let result = discovery.discover(dir.path(), true);
 
         assert!(result.nodes.iter().all(|n| !n.content.contains("Grok rules")), "compat should be off by default");
+    }
+
+    #[test]
+    fn compat_per_vendor_opt_in() {
+        // Doc 19 §7.3: enabling one vendor must NOT scan the others.
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        let cursor_dir = dir.path().join(".cursor");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        std::fs::write(claude_dir.join("CLAUDE.md"), "Claude rules.").unwrap();
+        std::fs::write(cursor_dir.join("cursorrules.md"), "Cursor rules.").unwrap();
+
+        let config = DiscoveryConfig {
+            compat_vendors: ["claude".to_string()].into_iter().collect(),
+            scan_user_global: false,
+            ..DiscoveryConfig::default()
+        };
+        let result = InstructionDiscovery::new(config).discover(dir.path(), true);
+
+        assert!(result.nodes.iter().any(|n| n.content.contains("Claude rules")));
+        assert!(result.nodes.iter().all(|n| !n.content.contains("Cursor rules")), "unenabled vendor must not be scanned");
+    }
+
+    #[test]
+    fn canonical_precedence_emits_diagnostic() {
+        // Doc 19 §7.3: canonical AGENTS.md at cwd + enabled vendor file →
+        // both load, canonical ordered first, diagnostic emitted.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Canonical rules.").unwrap();
+        let claude_dir = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("CLAUDE.md"), "Claude rules.").unwrap();
+
+        let config = DiscoveryConfig {
+            compat_vendors: ["claude".to_string()].into_iter().collect(),
+            scan_user_global: false,
+            ..DiscoveryConfig::default()
+        };
+        let result = InstructionDiscovery::new(config).discover(dir.path(), true);
+
+        let canonical_pos = result.nodes.iter().position(|n| n.content.contains("Canonical rules")).expect("canonical loaded");
+        let compat_pos = result.nodes.iter().position(|n| n.content.contains("Claude rules")).expect("compat loaded");
+        assert!(canonical_pos < compat_pos, "canonical .agent must keep precedence ordering");
+        assert!(
+            result.diagnostics.iter().any(|d| d.contains("canonical .agent 优先")),
+            "conflict must produce a diagnostic, got {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn unknown_compat_vendor_diagnostic() {
+        let dir = TempDir::new().unwrap();
+        let config = DiscoveryConfig {
+            compat_vendors: ["acme".to_string()].into_iter().collect(),
+            scan_user_global: false,
+            ..DiscoveryConfig::default()
+        };
+        let result = InstructionDiscovery::new(config).discover(dir.path(), true);
+        assert!(
+            result.diagnostics.iter().any(|d| d.contains("unknown compat vendor `acme`")),
+            "unknown vendor must be diagnosed, got {:?}",
+            result.diagnostics
+        );
     }
 
     #[test]

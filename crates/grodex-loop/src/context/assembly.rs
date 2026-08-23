@@ -2,7 +2,12 @@
 //!
 //! Following Grok's `build_compacted_history` pattern: assemble the
 //! compacted context in canonical order:
-//!   [Zone A: system + developer, ..., CompactionSummary, state_capsule?, recent_items]
+//!   [Zone A: system + developer, ..., CompactionSummary, recent_items, state_capsule?]
+//!
+//! The state capsule is placed LAST because its contents (edited files,
+//! active processes, etc.) change every turn. Placing it after the
+//! stable prefix (Zone A + summary + recent) maximises prompt-cache
+//! hit rate: the static prefix remains identical across steps.
 
 use crate::context::state_capsule::StateCapsule;
 use grodex_core::context::ContextItem;
@@ -12,8 +17,10 @@ use grodex_core::context::ContextItem;
 /// Output order (oldest first):
 ///   1. Preserved items (Zone A: system instructions, developer rules)
 ///   2. CompactionSummary (the generated summary)
-///   3. State capsule (if present, as a User item with <system-reminder>)
-///   4. Recent items (kept verbatim)
+///   3. Recent items (kept verbatim)
+///   4. State capsule (if present, as a User item with <system-reminder>)
+///      — placed last because its dynamic content changes every turn,
+///        which would invalidate the cache for everything after it.
 pub struct CompactionAssembly;
 
 impl CompactionAssembly {
@@ -62,7 +69,14 @@ impl CompactionAssembly {
             });
         }
 
-        // 3. State capsule (as a synthetic user item so the model sees it).
+        // 3. Recent items (verbatim) — placed before capsule so the
+        //    stable prefix (Zone A + summary + recent) is cacheable.
+        result.extend(recent);
+
+        // 4. State capsule LAST (as a synthetic user item so the model sees it).
+        //    Capsule contents (edited_files, active_processes, etc.) change
+        //    every turn; placing it at the tail prevents it from invalidating
+        //    the cache for the recent conversation items.
         let capsule_text = state_capsule.render();
         if !capsule_text.is_empty() {
             result.push(ContextItem::User {
@@ -70,9 +84,6 @@ impl CompactionAssembly {
                 message_id: Some("compaction-state-capsule".into()),
             });
         }
-
-        // 4. Recent items (verbatim).
-        result.extend(recent);
 
         result
     }
@@ -130,13 +141,49 @@ mod tests {
         }];
 
         let result = CompactionAssembly::assemble(preserved, summary, &capsule, recent);
-        assert_eq!(result.len(), 3); // system + summary + user
+        assert_eq!(result.len(), 3); // system + summary + user(recent)
         assert!(matches!(result[0], ContextItem::System { .. }));
         assert!(matches!(
             result[1],
             ContextItem::CompactionSummary { .. }
         ));
         assert!(matches!(result[2], ContextItem::User { .. }));
+    }
+
+    #[test]
+    fn capsule_placed_after_recent_for_cache_stability() {
+        // Capsule must be LAST so its dynamic content doesn't invalidate
+        // the cache for the stable prefix (Zone A + summary + recent).
+        let mut capsule = StateCapsule::new();
+        capsule.add_section("State", "active_processes=3");
+
+        let result = CompactionAssembly::assemble(
+            vec![ContextItem::System { content: "sys".into() }],
+            "summary".into(),
+            &capsule,
+            vec![ContextItem::User { content: "recent-msg".into(), message_id: None }],
+        );
+
+        // Expected: System → CompactionSummary → User(recent) → User(capsule)
+        assert_eq!(result.len(), 4);
+        assert!(matches!(result[0], ContextItem::System { .. }));
+        assert!(matches!(result[1], ContextItem::CompactionSummary { .. }));
+        // result[2] = recent item (no message_id → not capsule)
+        match &result[2] {
+            ContextItem::User { content, message_id } => {
+                assert_eq!(*content, "recent-msg");
+                assert!(message_id.is_none(), "recent item must not have capsule message_id");
+            }
+            other => panic!("expected User(recent), got {other:?}"),
+        }
+        // result[3] = capsule (has the stable message_id)
+        match &result[3] {
+            ContextItem::User { content, message_id } => {
+                assert!(content.contains("active_processes"));
+                assert_eq!(message_id.as_deref(), Some("compaction-state-capsule"));
+            }
+            other => panic!("expected User(capsule), got {other:?}"),
+        }
     }
 
     #[test]

@@ -164,7 +164,7 @@ impl ToolRuntime for ReadFileTool {
         let (output, lines_returned, truncated) = if use_hashline {
             let start_idx = args.offset.unwrap_or(1).max(1) - 1;
             let lim = args.limit.unwrap_or(usize::MAX);
-            let end_idx = (start_idx + lim).min(all_lines.len());
+            let end_idx = start_idx.saturating_add(lim).min(all_lines.len());
             render_hashline(&all_lines, start_idx, end_idx, max_bytes)
         } else if let Some(ref ranges) = args.ranges {
             render_multi_range(&all_lines, ranges, max_bytes)?
@@ -295,7 +295,7 @@ fn render_single_range(
     let start = offset.unwrap_or(1).max(1);
     let lim = limit.unwrap_or(usize::MAX);
     let start_idx = (start - 1).min(total_lines);
-    let end_idx = (start_idx + lim).min(total_lines);
+    let end_idx = start_idx.saturating_add(lim).min(total_lines);
 
     let mut output = String::new();
     let mut bytes = 0usize;
@@ -559,7 +559,7 @@ impl BuiltInTool for ReadFileTool {
         let max_bytes = prepared.args.max_bytes.unwrap_or(usize::MAX);
 
         let start_idx = (offset - 1).min(total_lines);
-        let end_idx = (start_idx + limit).min(total_lines);
+        let end_idx = start_idx.saturating_add(limit).min(total_lines);
 
         // Hashline mode: when `format` is "hashline", use per-line SHA-256
         // hashing for change detection (L1 standardization).
@@ -725,8 +725,8 @@ mod tests {
             serde_json::json!({
                 "path": tmp.path(),
                 "ranges": [
-                    {"Lines": {"start_line": 1, "count": 3}},
-                    {"Lines": {"start_line": 18, "count": 3}}
+                    {"start_line": 1, "count": 3},
+                    {"start_line": 18, "count": 3}
                 ]
             }),
             OperationId::new(),
@@ -762,7 +762,7 @@ mod tests {
             serde_json::json!({
                 "path": tmp.path(),
                 "ranges": [
-                    {"Anchor": {"start_pattern": "fn alpha", "end_pattern": "}"}}
+                    {"start_pattern": "fn alpha", "end_pattern": "}"}
                 ]
             }),
             OperationId::new(),

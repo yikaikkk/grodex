@@ -1446,7 +1446,13 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
 fn render_turn_status(f: &mut Frame<'_>, state: &TuiAppState, area: Rect) {
     if area.is_empty() { return; }
     let mut spans: Vec<Span> = vec![Span::raw("  ")];
+    if state.compacting {
+        spans.push(style_s(c_warn().add_modifier(Modifier::BOLD), "⏳ 会话压缩中…"));
+    }
     if state.is_streaming() {
+        if state.compacting {
+            spans.push(Span::raw("  ·  "));
+        }
         spans.push(style_s(c_accent(), "⏳ streaming"));
     }
     let active = state.active_tool_count();

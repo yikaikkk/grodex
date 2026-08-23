@@ -26,6 +26,12 @@ pub struct MessageId(Uuid);
 
 impl MessageId {
     pub fn new() -> Self { Self(Uuid::new_v4()) }
+
+    /// Parse from a Uuid string. Returns None if invalid. Used by the
+    /// collaboration protocol's read-then-ack confirmation path.
+    pub fn from_string(s: &str) -> Option<Self> {
+        Uuid::parse_str(s).ok().map(Self)
+    }
 }
 
 impl std::fmt::Display for MessageId {

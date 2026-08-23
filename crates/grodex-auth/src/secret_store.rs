@@ -1,24 +1,21 @@
-//! OS Secret Store — durable, OS-backed storage for master credentials.
+//! Secret Store — durable storage for master credentials.
 //!
 //! The [`CredentialBroker`](crate::lease::CredentialBroker) previously held
 //! master tokens in a `HashMap<String, String>` in memory, so a process
 //! restart lost every token. This module defines a [`SecretStore`] trait that
-//! offloads secret material to the operating system's native credential
-//! vault, so tokens survive restarts and are never written to plaintext
-//! config.
+//! offloads secret material to a durable backend so tokens survive restarts.
 //!
-//! Platform support (as implemented):
-//! - macOS: [`MacOSKeychainStore`] shells out to the `security` CLI.
-//! - Linux / Windows: **no native backend yet** — callers fail-soft to
-//!   [`InMemorySecretStore`], i.e. tokens are memory-only and lost on
-//!   restart (secure, but not durable). A Secret Service / CredMan
-//!   implementation is a future task; do not document it as available.
+//! Design decision: credentials are **file-hosted, not OS-keychain-hosted**.
+//! Grodex intentionally never reads the system keychain; the user-level
+//! config file (`~/.grodex/credentials.json`, mode 0600) is the single
+//! durable backend on every platform.
 //!
 //! Two implementations ship here:
 //! - [`InMemorySecretStore`] — for tests and as a fail-soft fallback.
-//! - [`MacOSKeychainStore`] — shells out to the `security` CLI (macOS only).
+//! - [`FileSecretStore`] — JSON file with 0600 permissions, atomic writes.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// Errors returned by [`SecretStore`] backends.
@@ -28,8 +25,8 @@ pub enum SecretStoreError {
     NotFound,
     /// The caller is not permitted to read/write this secret.
     AccessDenied,
-    /// The OS secret backend is missing or unreachable (e.g. the `security`
-    /// binary is absent, or the D-Bus secret service is not running).
+    /// The OS secret backend is missing or unreachable (kept for trait
+    /// compatibility; the file backend does not produce this variant).
     BackendUnavailable,
     /// An I/O or backend-internal failure with a descriptive message.
     IoError(String),
@@ -48,10 +45,10 @@ impl std::fmt::Display for SecretStoreError {
 
 impl std::error::Error for SecretStoreError {}
 
-/// A durable, OS-backed key/value store for secret material.
+/// A durable key/value store for secret material.
 ///
 /// Keys are opaque strings; values are secret strings (e.g. master tokens).
-/// Implementations MUST NOT log or persist the value outside the OS vault.
+/// Implementations MUST NOT log the value anywhere.
 #[async_trait::async_trait]
 pub trait SecretStore: Send + Sync {
     /// Persist `value` under `key`. Overwrites any existing value.
@@ -66,7 +63,8 @@ pub trait SecretStore: Send + Sync {
 
 /// Trivial in-memory `SecretStore` backed by a `HashMap` behind a
 /// [`std::sync::Mutex`]. Intended for tests and as a fail-soft fallback
-/// when no OS backend is available. Secrets do NOT survive a process restart.
+/// when no durable backend is available. Secrets do NOT survive a process
+/// restart.
 #[derive(Debug, Default)]
 pub struct InMemorySecretStore {
     secrets: Mutex<HashMap<String, String>>,
@@ -110,160 +108,91 @@ impl SecretStore for InMemorySecretStore {
     }
 }
 
-// ── MacOSKeychainStore ──────────────────────────────────────────────
+// ── FileSecretStore ─────────────────────────────────────────────────
 
-/// macOS Keychain-backed `SecretStore`. Shells out to the system `security`
-/// CLI, storing each secret as a generic-password item with a fixed service
-/// name (`grodex` by default) and the caller-supplied key as the account.
+/// File-hosted `SecretStore`：凭证以 JSON 落盘（默认
+/// `~/.grodex/credentials.json`），重启存活且**不触碰系统钥匙串**。
+/// 文件权限 0600（仅当前用户可读写），写入走“临时文件 + rename”原子
+/// 路径，崩溃不会留下半截文件。
 ///
-/// Only compiled on `target_os = "macos"`.
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone)]
-pub struct MacOSKeychainStore {
-    /// Keychain service name — prefixed with `grodex` to avoid collisions
-    /// with other applications' keychain items.
-    service: String,
+/// 文件格式：`{ "master:<provider>": "<token>", ... }`（键名由
+/// [`CredentialBroker::persist_provider`](crate::lease::CredentialBroker::persist_provider)
+/// 约定）。
+#[derive(Debug)]
+pub struct FileSecretStore {
+    path: PathBuf,
+    /// Serializes read-modify-write cycles within this process.
+    io: Mutex<()>,
 }
 
-#[cfg(target_os = "macos")]
-impl MacOSKeychainStore {
-    /// Create a store using the default service name `grodex`.
-    pub fn new() -> Self {
+impl FileSecretStore {
+    /// Create a store persisting to `path` (created lazily on first write).
+    pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
-            service: "grodex".to_string(),
+            path: path.into(),
+            io: Mutex::new(()),
         }
     }
 
-    /// Create a store with a custom service name (e.g. for tests that must
-    /// not collide with production items).
-    pub fn with_service(service: impl Into<String>) -> Self {
-        Self {
-            service: service.into(),
-        }
+    fn load(&self) -> Result<HashMap<String, String>, SecretStoreError> {
+        let raw = match std::fs::read_to_string(&self.path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(e) => return Err(SecretStoreError::IoError(e.to_string())),
+        };
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&raw)
+            .map_err(|e| SecretStoreError::IoError(format!("credentials file corrupted: {e}")))?;
+        Ok(map
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+            .collect())
     }
 
-    /// macOS `security` exit code for `errSecItemNotFound`.
-    const EXIT_ITEM_NOT_FOUND: i32 = 44;
-}
-
-#[cfg(target_os = "macos")]
-impl Default for MacOSKeychainStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[async_trait::async_trait]
-impl SecretStore for MacOSKeychainStore {
-    async fn store(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
-        let output = Command::new("security")
-            .args([
-                "add-generic-password",
-                "-s",
-                &self.service,
-                "-a",
-                key,
-                "-w",
-                value,
-                "-U",
-            ])
-            .output()
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    SecretStoreError::BackendUnavailable
-                } else {
-                    SecretStoreError::IoError(e.to_string())
-                }
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let code = output.status.code().unwrap_or(-1);
-            // Exit 45 is errSecDuplicateItem — shouldn't happen with -U, but
-            // treat as a benign conflict rather than a hard failure.
-            if code == 45 {
-                return Ok(());
-            }
-            return Err(SecretStoreError::IoError(format!(
-                "security add-generic-password failed (exit {code}): {stderr}"
-            )));
+    fn save(&self, secrets: &HashMap<String, String>) -> Result<(), SecretStoreError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| SecretStoreError::IoError(e.to_string()))?;
         }
+        let json = serde_json::to_string_pretty(secrets)
+            .map_err(|e| SecretStoreError::IoError(e.to_string()))?;
+        // 原子写：先写临时文件、收紧权限，再 rename 到位。
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, json).map_err(|e| SecretStoreError::IoError(e.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| SecretStoreError::IoError(e.to_string()))?;
+        }
+        std::fs::rename(&tmp, &self.path)
+            .map_err(|e| SecretStoreError::IoError(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl SecretStore for FileSecretStore {
+    async fn store(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
+        let _guard = self.io.lock().expect("FileSecretStore mutex poisoned");
+        let mut secrets = self.load()?;
+        secrets.insert(key.to_string(), value.to_string());
+        self.save(&secrets)
     }
 
     async fn retrieve(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
-        let output = Command::new("security")
-            .args([
-                "find-generic-password",
-                "-s",
-                &self.service,
-                "-a",
-                key,
-                "-w",
-            ])
-            .output()
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    SecretStoreError::BackendUnavailable
-                } else {
-                    SecretStoreError::IoError(e.to_string())
-                }
-            })?;
-
-        let code = output.status.code().unwrap_or(-1);
-        if code == Self::EXIT_ITEM_NOT_FOUND {
-            return Ok(None);
-        }
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SecretStoreError::IoError(format!(
-                "security find-generic-password failed (exit {code}): {stderr}"
-            )));
-        }
-        // `-w` prints the password to stdout with a trailing newline.
-        let value = String::from_utf8_lossy(&output.stdout);
-        let value = value.trim_end_matches('\n');
-        Ok(Some(value.to_string()))
+        let _guard = self.io.lock().expect("FileSecretStore mutex poisoned");
+        Ok(self.load()?.remove(key))
     }
 
     async fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
-        let output = Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                &self.service,
-                "-a",
-                key,
-            ])
-            .output()
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    SecretStoreError::BackendUnavailable
-                } else {
-                    SecretStoreError::IoError(e.to_string())
-                }
-            })?;
-
-        let code = output.status.code().unwrap_or(-1);
-        if code == Self::EXIT_ITEM_NOT_FOUND {
+        let _guard = self.io.lock().expect("FileSecretStore mutex poisoned");
+        let mut secrets = self.load()?;
+        if secrets.remove(key).is_none() {
             return Err(SecretStoreError::NotFound);
         }
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SecretStoreError::IoError(format!(
-                "security delete-generic-password failed (exit {code}): {stderr}"
-            )));
-        }
-        Ok(())
+        self.save(&secrets)
     }
 }
-
-#[cfg(target_os = "macos")]
-use tokio::process::Command;
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -314,37 +243,83 @@ mod tests {
         assert_eq!(store.retrieve("b").await.unwrap(), Some("beta".to_string()));
     }
 
-    /// Real integration test: actually calls the macOS `security` CLI against
-    /// the user's login keychain. Gated to `target_os = "macos"` only.
-    #[cfg(target_os = "macos")]
+    /// Unique temp file per test run — avoids cross-talk between tests and
+    /// prior runs without pulling in a tempfile dependency.
+    fn tmp_credentials_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "grodex-auth-test-{}-{}-{}.json",
+            tag,
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
     #[tokio::test]
-    async fn macos_keychain_store_retrieve_delete_roundtrip() {
-        // Use a dedicated service name so we never collide with production
-        // items, and a unique key suffix to avoid cross-talk between test
-        // runs on shared machines.
-        let store = MacOSKeychainStore::with_service("grodex-test");
-        let key = "roundtrip-key";
-        let value = "sk-test-secret-12345";
+    async fn file_store_retrieve_delete_roundtrip() {
+        let path = tmp_credentials_path("roundtrip");
+        let store = FileSecretStore::new(&path);
 
-        // Clean up any leftover from a prior run before asserting.
-        let _ = store.delete(key).await;
+        // Missing file reads as empty (no error).
+        assert_eq!(store.retrieve("master:openai").await.unwrap(), None);
 
-        // Store the secret.
-        store.store(key, value).await.expect("store should succeed");
+        // Store → retrieve round-trip.
+        store.store("master:openai", "sk-secret-1").await.unwrap();
+        assert_eq!(
+            store.retrieve("master:openai").await.unwrap(),
+            Some("sk-secret-1".to_string())
+        );
 
-        // Retrieve must round-trip the exact value.
-        let got = store.retrieve(key).await.expect("retrieve should succeed");
-        assert_eq!(got.as_deref(), Some(value));
+        // Overwrite.
+        store.store("master:openai", "sk-secret-2").await.unwrap();
+        assert_eq!(
+            store.retrieve("master:openai").await.unwrap(),
+            Some("sk-secret-2".to_string())
+        );
 
-        // Delete cleans it up.
-        store.delete(key).await.expect("delete should succeed");
-
-        // Now retrieve returns None.
-        let after = store.retrieve(key).await.expect("retrieve after delete");
-        assert_eq!(after, None);
+        // Keys are isolated.
+        store.store("master:anthropic", "sk-ant").await.unwrap();
+        store.delete("master:openai").await.unwrap();
+        assert_eq!(store.retrieve("master:openai").await.unwrap(), None);
+        assert_eq!(
+            store.retrieve("master:anthropic").await.unwrap(),
+            Some("sk-ant".to_string())
+        );
 
         // Deleting a missing key yields NotFound.
-        let err = store.delete(key).await.unwrap_err();
+        let err = store.delete("master:openai").await.unwrap_err();
         assert_eq!(err, SecretStoreError::NotFound);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn file_store_survives_reopen() {
+        // Durability across "restarts": a fresh store instance pointing at
+        // the same path sees the previously persisted secret.
+        let path = tmp_credentials_path("reopen");
+        FileSecretStore::new(&path)
+            .store("master:openai", "sk-durable")
+            .await
+            .unwrap();
+        let reopened = FileSecretStore::new(&path);
+        assert_eq!(
+            reopened.retrieve("master:openai").await.unwrap(),
+            Some("sk-durable".to_string())
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_store_writes_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_credentials_path("perm");
+        FileSecretStore::new(&path)
+            .store("master:openai", "sk-perm")
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "credentials file must be owner-only");
+        let _ = std::fs::remove_file(&path);
     }
 }

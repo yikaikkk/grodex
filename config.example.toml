@@ -57,6 +57,14 @@ wire_protocol = "responses"
 # max_subagents = 4
 # max_subagents_per_session = 16
 
+# ── Instruction Discovery (Design Doc 19 §7.3) ─────────
+# Compatibility vendor directories (.grok/.codex/.claude/.cursor) are
+# NEVER scanned by default. Opt in per vendor; recognized labels:
+# "grok", "codex", "claude", "cursor". When a canonical AGENTS.md /
+# .agent/rules also exists at the same level, canonical content keeps
+# precedence and each vendor load emits a diagnostic (no silent merge).
+# instruction_compat_vendors = ["claude", "cursor"]
+
 # ── Authentication ────────────────────────────────────
 # API key can be set here or via environment variable:
 #   OPENAI_API_KEY=sk-...
@@ -81,6 +89,25 @@ wire_protocol = "responses"
 # SQLite + FTS5 database path (leading ~ is expanded to the home dir).
 # Precedence: GRODEX_MEMORY_DB env > this value > ~/.grodex/memory.db
 # path = "~/.grodex/memory.db"
+
+# ── Memory embedding (hybrid FTS5 + vector retrieval) ──
+# Disabled by default → pure FTS5 ranking. When enabled, every retrieval
+# failure (network, timeout, missing key) silently degrades to FTS5.
+#
+# [memory.embedding]
+# Master switch for the vector path.
+# enabled = true
+# Any OpenAI-compatible embeddings endpoint:
+# endpoint = "https://api.openai.com/v1/embeddings"
+# model = "text-embedding-3-small"
+# Env var holding the API key (default: GRODEX_OPENAI_API_KEY):
+# api_key_env_var = "GRODEX_OPENAI_API_KEY"
+# Must match the model output dim; mismatched vectors are rejected:
+# expected_dimension = 1536
+# Max texts per single embeddings API call:
+# batch_size = 64
+# Max documents embedded per startup backfill (rest continues next run):
+# backfill_max_documents = 200
 
 # ── Model Routes (failover) ───────────────────────────
 # Define multiple provider/model candidates with ordered failover.

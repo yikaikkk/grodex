@@ -89,5 +89,11 @@ pub enum StreamFragment {
         risk: String,
         timeout_remaining_ms: u64,
     },
+    /// Context compaction lifecycle status. Emitted by the TurnCoordinator
+    /// around the summarization round-trip so the frontend can show a
+    /// transient "会话压缩中…" indicator. `phase` ∈ {"started", "finished",
+    /// "failed"}. Like `ToolResult`/`ApprovalRequested`, this is produced
+    /// by the TurnCoordinator, not the sampling actor.
+    CompactionStatus { phase: String },
 }
 

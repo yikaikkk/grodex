@@ -18,20 +18,20 @@
 pub mod lease;
 pub mod manager;
 pub mod mcp_oauth;
+pub mod resilience;
 pub mod secret_store;
 pub mod store;
 
-#[cfg(target_os = "macos")]
-pub mod keychain_store;
-
+pub use grodex_auth_types::lease::CredentialLease;
 pub use lease::{CredentialBroker, CredentialError, LeaseError};
 pub use manager::AuthManager;
 pub use mcp_oauth::{
     AuthorizationUrl, CredentialLeaseId, McpoAuthBroker, McpoAuthError, OAuthClientConfig,
     PendingAuthorization, ServerId,
 };
-pub use secret_store::{InMemorySecretStore, SecretStore, SecretStoreError};
+pub use resilience::{
+    AuthBreakerState, AuthCircuitBreaker, AuthErrorKind, RefreshFn, RefreshPolicy,
+    SingleFlightRefresher,
+};
+pub use secret_store::{FileSecretStore, InMemorySecretStore, SecretStore, SecretStoreError};
 pub use store::CredentialStore;
-
-#[cfg(target_os = "macos")]
-pub use keychain_store::MacKeychainSecretStore;

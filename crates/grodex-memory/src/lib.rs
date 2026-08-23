@@ -8,7 +8,9 @@
 //! - **Evidence**: historical session records for verification
 //!
 //! V1 uses SQLite FTS5 with term coverage qualification gates.
-//! Vector/embedding search is deferred to V2 (requires Eval evidence).
+//! Vector/embedding search is opt-in via `[memory.embedding]` config:
+//! disabled by default, startup backfill writes vectors incrementally,
+//! and any failure degrades silently to pure FTS5.
 //!
 //! ## Module layout
 //!
@@ -19,7 +21,7 @@
 //! | `database` | SQLite-backed CRUD store + async vector write / brute-force cosine kNN / hybrid RRF entry |
 //! | `embedding` | EmbeddingModel trait + OpenAI-compatible HTTP implementation + cosine_similarity |
 //! | `retrievers` | Three-way FTS5 pipelines + term coverage gate + reciprocal_rank_fusion helpers |
-//! | `backfill` | Embedding Backfiller (skeleton; runs after Eval recall baseline established) |
+//! | `backfill` | Embedding Backfiller: incremental startup backfill of missing vectors |
 //! | `router` | Multi-label conservative Intent Router with diagnostics |
 //! | `negative_cache` | Session-level empty-result cache |
 //! | `eval` | Offline replay Eval harness + MemoryEvalCli (with_embedding_model for hybrid delta) |
@@ -48,7 +50,9 @@ pub mod store;
 
 // V2 re-exports
 pub use backfill::{backfill_missing_embeddings, batch_chunks, is_backfill_possible};
-pub use database::{DbError, MemoryDatabase, RetrievedUnit};
+pub use database::{
+    DbError, MemoryDatabase, RetrievedUnit, doc_ref_to_unit_id, evidence_doc_ref, memory_doc_ref,
+};
 pub use embedding::{
     EmbeddingConfig, EmbeddingError, EmbeddingModel, EmbeddingVector, OpenAiCompatibleModel,
     cosine_similarity,

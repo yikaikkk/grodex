@@ -86,6 +86,11 @@ pub struct PromptBuilder {
     config_prompt_generation: u64,
     /// Model binding id (for manifest binding).
     model_binding_id: Option<String>,
+    /// Optional discovery configuration override (Doc 19 §7.3 compat
+    /// vendor opt-in). `None` → `DiscoveryConfig::default()`.
+    discovery_config: Option<crate::discovery::DiscoveryConfig>,
+    /// Diagnostics from the last `discover_instructions` run.
+    discovery_diagnostics: Vec<String>,
 }
 
 impl PromptBuilder {
@@ -94,8 +99,12 @@ impl PromptBuilder {
         Self {
             base_instructions: vec![
                 "You are Grodex, an AI coding agent. You help users write, understand, and modify code.".into(),
-                "When a user asks you to read, write, edit files or run commands, you MUST use the available tools (read_file, write_file, edit_file, exec, apply_patch) to accomplish the task. Do not just say you will do it — actually call the tool.".into(),
-                "Be concise in your text responses. Let tool results speak for themselves.".into(),
+                // Tool-first execution: always act, don't narrate.
+                "When a user asks you to read, write, edit files or run commands, you MUST use the available tools (read_file, write_file, edit_file, exec, apply_patch) to accomplish the task. Do not just say you will do it — actually call the tool. Do not describe your plan and then stop — execute it immediately.".into(),
+                // Autonomous continuation: never stop mid-task.
+                "Work autonomously: once the user gives a task, carry it through to completion. Do NOT stop after each sub-step to ask \"should I proceed?\", \"shall I fix this?\", or \"want me to continue?\" — just keep going. Only stop when (a) the ENTIRE task is fully done and verified, or (b) you are genuinely blocked (missing information, ambiguous requirement, or need a decision only the user can make).".into(),
+                // Conciseness applies to EXPLANATIONS, not to work effort.
+                "Be concise in your text explanations. Let tool results speak for themselves. But never let conciseness cause you to stop working early — finish every task completely.".into(),
             ],
             skills: SkillCatalog::default(),
             tool_registry: ToolRegistry::builtin(),
@@ -106,6 +115,8 @@ impl PromptBuilder {
             zone_d: None,
             config_prompt_generation: 1,
             model_binding_id: None,
+            discovery_config: None,
+            discovery_diagnostics: Vec::new(),
         }
     }
 
@@ -139,19 +150,28 @@ impl PromptBuilder {
         self
     }
 
+    /// Override the discovery configuration (e.g. explicit compat vendor
+    /// opt-in per Doc 19 §7.3). `config_generation` is still stamped from
+    /// [`Self::with_config_generation`] at discovery time.
+    pub fn with_discovery_config(mut self, config: crate::discovery::DiscoveryConfig) -> Self {
+        self.discovery_config = Some(config);
+        self
+    }
+
     /// Run instruction discovery (Design Doc 19 §7) to find managed,
     /// user-global, and path-rule instructions.
     ///
     /// Discovered nodes are merged into the build alongside base/project nodes.
     /// Untrusted workspace content is excluded (fail-closed).
     pub fn discover_instructions(&mut self, cwd: &Path, workspace_trusted: bool) -> &mut Self {
-        let discovery = crate::discovery::InstructionDiscovery::new(
-            crate::discovery::DiscoveryConfig {
-                config_generation: self.config_prompt_generation,
-                ..Default::default()
-            },
-        );
+        let mut config = self
+            .discovery_config
+            .clone()
+            .unwrap_or_else(crate::discovery::DiscoveryConfig::default);
+        config.config_generation = self.config_prompt_generation;
+        let discovery = crate::discovery::InstructionDiscovery::new(config);
         let result = discovery.discover(cwd, workspace_trusted);
+        self.discovery_diagnostics = result.diagnostics;
         self.discovered_nodes = result.nodes;
         self
     }
@@ -173,6 +193,12 @@ impl PromptBuilder {
     /// Inspect the currently-loaded discovered nodes (for tests / explain).
     pub fn discovered_nodes(&self) -> &[crate::manifest::InstructionNode] {
         &self.discovered_nodes
+    }
+
+    /// Diagnostics from the last discovery run (Doc 19 §7.3 compat
+    /// precedence / unknown vendors). Empty if discovery hasn't run.
+    pub fn discovery_diagnostics(&self) -> &[String] {
+        &self.discovery_diagnostics
     }
 
     /// Set Zone C content (compaction baseline — Design Doc 19 §9).

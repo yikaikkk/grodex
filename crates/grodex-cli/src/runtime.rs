@@ -55,6 +55,9 @@ pub struct SessionRuntime {
     pub event_rx: mpsc::Receiver<LoopSessionEvent>,
     pub session_id: String,
     pub rollout_store: Option<Arc<dyn RolloutStore>>,
+    /// MCP OAuth 协调器：仅当至少一个 `[[mcp_server]]` 配了 `oauth` 块时存在。
+    /// 调用方用它驱动 begin/complete authorization 与 bearer 取值。
+    pub mcp_oauth: Option<grodex_mcp::McpOAuthCoordinator>,
     /// Resolved model config (provider/model/wire) — exposed so the CLI
     /// can echo it in the startup banner.
     pub model_config: ModelConfig,
@@ -62,6 +65,9 @@ pub struct SessionRuntime {
     /// sending `Shutdown` to drain the session. Dropping it detaches
     /// (does NOT abort) the supervisor.
     pub supervisor_task: tokio::task::JoinHandle<()>,
+    /// Config hot-reload fs backend (Doc 18 §11): kept alive for the
+    /// session so `notify` keeps feeding the ConfigWatcher pipeline.
+    pub config_fs_backend: Option<grodex_config::FsConfigBackend>,
 }
 
 /// Builder for [`SessionRuntime`]. Start with [`SessionRuntimeBuilder::new`],
@@ -154,6 +160,98 @@ impl SessionRuntimeBuilder {
             matches!(&l.source, ConfigLayerSource::Workspace { trusted } if *trusted)
         }) || self.trusted_override.unwrap_or(false);
 
+        // Doc 19 §7.3: compatibility vendor directories (.grok/.codex/
+        // .claude/.cursor) are NEVER scanned silently — opt in explicitly
+        // via `instruction_compat_vendors = ["claude", "cursor"]`.
+        let instruction_compat_vendors: std::collections::BTreeSet<String> = cfg
+            .get("instruction_compat_vendors")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // ── 1b. Config hot-reload pipeline (Doc 18 §11/§12) ─────────
+        // The `notify` fs backend feeds every config-file change into
+        // ConfigWatcher (hash dedup + publish breaker + per-domain LKG).
+        // Decisions are surfaced on stderr; hot-ADOPT of the new
+        // generation by live subsystems is out of scope here. Fail-open:
+        // watcher failure only disables hot-reload, never the session.
+        let config_fs_backend = {
+            let sources: Vec<grodex_config::FsWatchSource> = config
+                .paths
+                .ordered_paths()
+                .into_iter()
+                .filter(|(_, p)| p.exists())
+                .map(|(label, p)| grodex_config::FsWatchSource {
+                    source_id: label.to_string(),
+                    path: p.to_path_buf(),
+                    domain: grodex_config::ConfigDomain::Root,
+                })
+                .collect();
+            if sources.is_empty() {
+                None
+            } else {
+                let watcher = Arc::new(std::sync::Mutex::new(
+                    grodex_config::ConfigWatcher::default(),
+                ));
+                let (pub_tx, pub_rx) = std::sync::mpsc::channel();
+                let counter = Arc::new(std::sync::atomic::AtomicU64::new(
+                    config.effective.generation + 1,
+                ));
+                let counter2 = counter.clone();
+                let validator: grodex_config::ConfigValidator = Arc::new(move |bytes| {
+                    let s = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+                    toml::from_str::<toml::Value>(s).map_err(|e| e.to_string())?;
+                    Ok(counter2.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+                });
+                match grodex_config::FsConfigBackend::start(
+                    sources,
+                    watcher,
+                    validator,
+                    pub_tx,
+                ) {
+                    Ok(backend) => {
+                        // Drain pipeline decisions to stderr.
+                        let _ = std::thread::Builder::new()
+                            .name("config-publish-drain".into())
+                            .spawn(move || {
+                                use grodex_config::WatchOutcome;
+                                while let Ok(p) = pub_rx.recv() {
+                                    match &p.outcome {
+                                        WatchOutcome::Published { generation } => eprintln!(
+                                            "[config] {} hot-reload: published generation {generation}",
+                                            p.source_id
+                                        ),
+                                        WatchOutcome::Unchanged => {}
+                                        WatchOutcome::Rejected { diagnostic } => eprintln!(
+                                            "[config] {} hot-reload rejected (last-known-good retained): {diagnostic}",
+                                            p.source_id
+                                        ),
+                                        WatchOutcome::CachedFailure { diagnostic } => eprintln!(
+                                            "[config] {} still invalid: {diagnostic}",
+                                            p.source_id
+                                        ),
+                                        WatchOutcome::BreakerOpen { retry_after } => eprintln!(
+                                            "[config] {} publish breaker open, retry in {}s",
+                                            p.source_id,
+                                            retry_after.as_secs()
+                                        ),
+                                    }
+                                }
+                            });
+                        Some(backend)
+                    }
+                    Err(e) => {
+                        eprintln!("[warn] config fs watcher failed to start (hot-reload disabled): {e}");
+                        None
+                    }
+                }
+            }
+        };
+
         // ── 2. Auth (CredentialBroker → API key lease) ─────────────
         let route_toml = grodex_sampler::route::ModelRouteToml::from_config(cfg, "default");
         let first_candidate = route_toml.as_ref().and_then(|r| r.candidates.first());
@@ -184,11 +282,34 @@ impl SessionRuntimeBuilder {
         let auth = AuthManager::new();
         let master_key = auth.resolve_for_provider(&provider_name).or(api_key_from_cfg);
         let audience = endpoint.as_deref().unwrap_or("https://api.openai.com/v1").to_string();
-        let mut broker = master_key.map(|k| {
-            let mut b = grodex_auth::CredentialBroker::empty();
-            b.register_provider(&provider_name, k);
-            b
-        });
+        // Credential broker：凭证以配置文件方式托管在 ~/.grodex/credentials.json
+        // （0600 权限，仅当前用户可读写），不读取系统钥匙串。
+        // HOME 不可用时降级为内存 broker（安全，仅不持久）。
+        let mut broker = std::env::var("HOME")
+            .ok()
+            .map(|home| {
+                let cred_path = std::path::PathBuf::from(home)
+                    .join(".grodex")
+                    .join("credentials.json");
+                grodex_auth::CredentialBroker::with_secret_store(std::sync::Arc::new(
+                    grodex_auth::FileSecretStore::new(cred_path),
+                ))
+            })
+            .or_else(|| {
+                eprintln!("[auth] HOME 不可用，凭证仅保存在内存");
+                Some(grodex_auth::CredentialBroker::empty())
+            });
+        if let Some(b) = broker.as_mut() {
+            // 优先从凭证文件重建（重启存活）；未命中再用环境/配置的 key
+            // 注册并持久化，下次启动即可直接从文件恢复。
+            let hydrated = b.hydrate_provider(&provider_name).await.unwrap_or(false);
+            if !hydrated {
+                if let Some(k) = master_key {
+                    b.register_provider(&provider_name, k);
+                    let _ = b.persist_provider(&provider_name).await;
+                }
+            }
+        }
         let api_key: Option<String> = (|| {
             let b = broker.as_mut()?;
             let lease = b.issue_lease(&provider_name, &audience)?;
@@ -403,10 +524,20 @@ impl SessionRuntimeBuilder {
         // Inject permission + sandbox so the coordinator dispatches tool
         // calls through the config-loaded policy (not an empty default)
         // and validates against the config profile.
+        //
+        // Oversized tool results are offloaded into a managed blob store
+        // (Doc 11 §22): content-addressed files under `{tmp}/grodex-blobs/`
+        // whose lifetime is governed by the blob_refs projection and
+        // reclaimed at session shutdown (supervisor → release_session_blobs).
+        let blob_store = Arc::new(grodex_tools::ManagedBlobStore::new(
+            grodex_tools::FileBlobStore::new(std::env::temp_dir().join("grodex-blobs")),
+            std::time::Duration::from_secs(30),
+        ));
         let mut coordinator = TurnCoordinator::new(actor, chat_state.clone())
             .with_permission(permission_mgr)
             .with_sandbox(sandbox)
-            .with_context_window(model_config.context_window);
+            .with_context_window(model_config.context_window)
+            .with_blob_store(blob_store);
         if let Some(pct) = compaction_threshold_pct {
             coordinator = coordinator.with_compaction_threshold(pct);
         }
@@ -483,16 +614,34 @@ impl SessionRuntimeBuilder {
         if let Some(ref w) = writer {
             delegate = delegate.with_writer(w.clone(), SubAgentConfig::default());
         }
+        // Shared Arc: the collaboration-protocol followup executor reuses
+        // the same DelegateTool child loop.
+        let delegate = Arc::new(delegate);
         let delegate_schema = delegate.input_schema();
         coordinator
-            .register_tool("delegate_task", Arc::new(delegate), delegate_schema)
+            .register_tool("delegate_task", delegate.clone(), delegate_schema)
             .await;
+
+        // ── 7c. Parent-child collaboration protocol tools (Doc 12) ──
+        // send_message / followup_task / wait_agent / mailbox_read /
+        // list_agents / interrupt_agent. The session itself is the root
+        // agent; followup TaskRuns execute through the DelegateTool above.
+        let protocol_host = Arc::new(grodex_loop::protocol_tools::ProtocolToolHost::new(
+            max_subagents_total.unwrap_or(16),
+            Default::default(),
+        ));
+        for (name, runtime, schema) in protocol_host.tool_set(Some(delegate.clone())) {
+            coordinator.register_tool(name, runtime, schema).await;
+        }
 
         // ── 7b. MCP tools (from config `[[mcp_server]]`) ──────────
         // For each enabled MCP server, spawn the process, list tools,
         // wrap each as McpToolAdapter, and register with the coordinator.
         // Fail-open: if a server can't spawn or list tools, log and skip —
         // the session continues without those MCP tools.
+        // OAuth：带 `oauth` 块的 server 注册进 McpOAuthCoordinator，
+        // 授权流程由调用方（TUI/CLI）在需要时驱动。
+        let mut mcp_oauth: Option<grodex_mcp::McpOAuthCoordinator> = None;
         if let Some(mcp_servers) = cfg.get("mcp_server").and_then(|v| v.as_array()) {
             for server_cfg in mcp_servers {
                 // Convert toml::Value → serde_json::Value for deserialization.
@@ -506,6 +655,19 @@ impl SessionRuntimeBuilder {
                 };
                 if !mcp_config.enabled {
                     continue;
+                }
+                // 注册 OAuth 客户端配置（无 oauth 块时为 no-op）。
+                if mcp_config.requires_oauth() {
+                    let coord = mcp_oauth.get_or_insert_with(grodex_mcp::McpOAuthCoordinator::new);
+                    match coord.register_server(&mcp_config) {
+                        Ok(_) => eprintln!(
+                            "[mcp] server '{}' 需要 OAuth 授权（已注册，等待 begin_authorization）",
+                            mcp_config.name
+                        ),
+                        Err(e) => {
+                            eprintln!("[warn] MCP server '{}' OAuth 注册失败: {e}", mcp_config.name);
+                        }
+                    }
                 }
                 match grodex_mcp::McpProcess::spawn(mcp_config.clone()).await {
                     Ok(mut process) => {
@@ -599,43 +761,46 @@ impl SessionRuntimeBuilder {
             }
         }
 
-        // Embedding model for hybrid RAG (FTS5 + vector). Fail-open:
-        // if embedding is not configured (enable_embedding=false or
+        // Embedding model for hybrid RAG (FTS5 + vector). All model
+        // parameters come from the `[memory.embedding]` config section;
+        // defaults live in `EmbeddingConfig`'s serde layer, never here.
+        // Fail-open: if embedding is not configured (enabled=false or
         // missing API key env var), the model is None and
         // `retrieve_hybrid_memory` degrades to pure FTS5 ranking.
+        let emb_cfg: grodex_memory::EmbeddingConfig = cfg
+            .get("memory")
+            .and_then(|m| m.get("embedding"))
+            .cloned()
+            .and_then(|v| v.try_into().ok())
+            .unwrap_or_default();
+        let backfill_max_documents = emb_cfg.backfill_max_documents;
         let embedding: Option<Arc<dyn grodex_memory::EmbeddingModel + Send + Sync>> = {
-            let emb_cfg = grodex_memory::embedding::EmbeddingConfig {
-                enable_embedding: cfg.get("memory")
-                    .and_then(|m| m.get("enable_embedding"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                endpoint: cfg.get("memory")
-                    .and_then(|m| m.get("embedding_endpoint"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("https://api.openai.com/v1/embeddings")
-                    .to_string(),
-                model: cfg.get("memory")
-                    .and_then(|m| m.get("embedding_model"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("text-embedding-3-small")
-                    .to_string(),
-                api_key_env_var: cfg.get("memory")
-                    .and_then(|m| m.get("embedding_api_key_env_var"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                expected_dimension: cfg.get("memory")
-                    .and_then(|m| m.get("embedding_dim"))
-                    .and_then(|v| v.as_integer())
-                    .map(|v| v as usize)
-                    .unwrap_or(1536),
-                batch_size: 64,
-            };
             match grodex_memory::embedding::OpenAiCompatibleModel::new(emb_cfg) {
                 Ok(model) => Some(Arc::new(model) as Arc<dyn grodex_memory::EmbeddingModel + Send + Sync>),
                 Err(_) => None, // not configured — pure FTS5
             }
         };
+
+        // Startup backfill: embed active memory/evidence units that lack
+        // vectors for the current model, in the background so session
+        // startup never blocks on the embedding endpoint. Fail-open.
+        if let (Some(db), Some(model)) = (&memory, &embedding) {
+            let db = db.clone();
+            let model = model.clone();
+            tokio::spawn(async move {
+                match grodex_memory::backfill_missing_embeddings(
+                    &db,
+                    model.as_ref(),
+                    backfill_max_documents,
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("[memory] embedding backfill: {n} documents"),
+                    Err(e) => eprintln!("[warn] embedding backfill failed (staying pure FTS): {e}"),
+                }
+            });
+        }
 
         // P1-3: Wire the memory database into the TurnCoordinator so
         // non-error tool results are captured as EvidenceUnit entries
@@ -660,6 +825,12 @@ impl SessionRuntimeBuilder {
             self.cwd.clone(),
             workspace_trusted,
         );
+        // Doc 19 §7.3 compat vendor opt-in flows into instruction
+        // discovery (cached once per session inside the supervisor).
+        supervisor.set_discovery_config(grodex_prompt::DiscoveryConfig {
+            compat_vendors: instruction_compat_vendors,
+            ..Default::default()
+        });
 
         let (event_broadcast_tx, event_broadcast_rx) =
             mpsc::channel::<LoopSessionEvent>(128);
@@ -723,8 +894,10 @@ impl SessionRuntimeBuilder {
             event_rx: event_broadcast_rx,
             session_id: session_id_str,
             rollout_store: rollout,
+            mcp_oauth,
             model_config,
             supervisor_task,
+            config_fs_backend,
         })
     }
 }

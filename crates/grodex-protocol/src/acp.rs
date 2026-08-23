@@ -363,6 +363,11 @@ pub enum UpdateContent {
     /// scary red error card. Clients that do not surface Info can fall
     /// back to treating it as TextDelta so the user still sees the text.
     Info { message: String },
+    /// Context compaction lifecycle. The client shows a transient
+    /// "会话压缩中…" indicator while `phase == "started"` and clears it on
+    /// `"finished"` / `"failed"`. Compaction runs an extra model
+    /// round-trip, so without this the UI looks frozen mid-turn.
+    CompactionStatus { phase: String },
 
     // ── Legacy item lifecycle (flat form, kept for backward compat) ─
     ItemStarted { item_id: String, item_type: String },

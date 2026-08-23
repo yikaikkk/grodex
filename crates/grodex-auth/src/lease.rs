@@ -112,9 +112,10 @@ pub struct CredentialBroker {
     revocation_epoch: u64,
     /// Default lease TTL.
     default_ttl: Duration,
-    /// Optional OS-backed secret store for durable credential storage.
+    /// Optional durable secret store for credential persistence.
     /// When present, master tokens are also persisted here for restart
-    /// survival (macOS Keychain, etc.).
+    /// survival (file-backed `~/.grodex/credentials.json` by default —
+    /// Grodex never reads the OS keychain).
     secret_store: Option<Arc<dyn SecretStore>>,
 }
 
@@ -146,22 +147,18 @@ impl CredentialBroker {
         }
     }
 
-    /// macOS-only: construct a broker backed by the user's login Keychain
-    /// via the `security-framework` crate. Fails closed if the keychain
-    /// backend cannot be initialized (no silent fall-back to memory).
-    #[cfg(target_os = "macos")]
-    pub fn with_macos_keychain(service: String) -> Result<Self, CredentialError> {
-        use crate::keychain_store::MacKeychainSecretStore;
-        let store = MacKeychainSecretStore::new(service);
-        let store: Arc<dyn SecretStore> = Arc::new(store);
-        Ok(Self {
+    /// Construct an empty broker with a caller-supplied [`SecretStore`]
+    /// backend (any platform). Used for tests and for plugging in durable
+    /// backends — production wiring uses [`crate::secret_store::FileSecretStore`].
+    pub fn with_secret_store(store: Arc<dyn SecretStore>) -> Self {
+        Self {
             master_tokens: HashMap::new(),
             leases: HashMap::new(),
             refresh_tokens: HashMap::new(),
             revocation_epoch: 1,
             default_ttl: Duration::from_secs(300),
             secret_store: Some(store),
-        })
+        }
     }
 
     /// Store a refresh token associated with a lease.  `pub(crate)` so only
@@ -202,6 +199,48 @@ impl CredentialBroker {
     /// that provider are NOT auto-revoked — call `revoke_all` if you need to.
     pub fn register_provider(&mut self, provider_id: impl Into<String>, master_token: String) {
         self.master_tokens.insert(provider_id.into(), master_token);
+    }
+
+    /// Whether this broker has an OS-backed secret store attached (i.e.
+    /// master tokens can survive a process restart).
+    pub fn has_secret_store(&self) -> bool {
+        self.secret_store.is_some()
+    }
+
+    /// Persist `provider_id`'s current master token into the secret store.
+    /// No-op (returns `Ok(false)`) when no secret store is attached or the
+    /// provider is unregistered. The token already lives in memory; this only
+    /// adds restart durability. Master tokens are keyed as `master:<provider>`.
+    pub async fn persist_provider(&self, provider_id: &str) -> Result<bool, CredentialError> {
+        let Some(store) = &self.secret_store else {
+            return Ok(false);
+        };
+        let Some(token) = self.master_tokens.get(provider_id) else {
+            return Ok(false);
+        };
+        store.store(&format!("master:{provider_id}"), token).await?;
+        Ok(true)
+    }
+
+    /// Hydrate `provider_id`'s master token from the secret store into
+    /// memory, if not already present. Returns `true` when the token is
+    /// usable afterwards (either already in memory or successfully loaded).
+    /// This is the restart-survival path: a fresh broker re-registers
+    /// credentials persisted by a previous process.
+    pub async fn hydrate_provider(&mut self, provider_id: &str) -> Result<bool, CredentialError> {
+        if self.master_tokens.contains_key(provider_id) {
+            return Ok(true);
+        }
+        let Some(store) = &self.secret_store else {
+            return Ok(false);
+        };
+        match store.retrieve(&format!("master:{provider_id}")).await? {
+            Some(token) if !token.is_empty() => {
+                self.master_tokens.insert(provider_id.to_string(), token);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Bump the revocation epoch. All outstanding leases minted at an earlier
@@ -361,6 +400,33 @@ mod tests {
     fn unknown_provider_fail_closed() {
         let mut broker = CredentialBroker::new("sk-master-secret".into());
         assert!(broker.issue_lease("not-registered", "https://x").is_none());
+    }
+
+    #[tokio::test]
+    async fn persist_then_hydrate_roundtrip_survives_restart() {
+        // Share one store across two brokers to simulate process restart.
+        let store = Arc::new(crate::secret_store::InMemorySecretStore::new());
+        let mut first = CredentialBroker::with_secret_store(store.clone());
+        first.register_provider("openai", "sk-durable".to_string());
+        assert!(first.persist_provider("openai").await.unwrap());
+
+        // Fresh broker ("restarted process") rehydrates from the store.
+        let mut second = CredentialBroker::with_secret_store(store.clone());
+        assert!(second.hydrate_provider("openai").await.unwrap());
+        assert_eq!(
+            second.resolve_token_for_provider("openai").as_deref(),
+            Some("sk-durable")
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_hydrate_noop_without_secret_store() {
+        let mut broker = CredentialBroker::empty();
+        broker.register_provider("openai", "sk-ephemeral".to_string());
+        // No store attached: persist is a no-op, hydrate finds nothing.
+        assert!(!broker.persist_provider("openai").await.unwrap());
+        assert!(!broker.hydrate_provider("other").await.unwrap());
+        assert!(!broker.has_secret_store());
     }
 }
 

@@ -1,8 +1,9 @@
 //! Embedding 生成后端与向量存储相关类型。
 //!
-//! Design 08 §12: V2 在 Eval recall 达到基准线后才启用 Embedding。
-//! 默认纯 FTS，只有显式配置 `[memory] enable_embedding=true` 且
-//! API key 环境变量存在时才走向量路径，任何失败 Fail-Open 降级纯 FTS。
+//! Design 08 §12: 向量路径默认关闭，只有显式配置 `[memory.embedding]`
+//! `enabled = true` 且 API key 环境变量存在才启用，任何失败 Fail-Open 降级纯 FTS。
+//! 所有模型参数（endpoint / model / 维度 / 批量 / 回填上限）全部由配置文件驱动，
+//! 调用点不硬编码任何模型参数。
 
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ pub type EmbeddingVector = Vec<f32>;
 /// Embedding 生成错误。
 #[derive(Debug, Error)]
 pub enum EmbeddingError {
-    #[error("embedding not configured (enable_embedding=false or missing api_key env var)")]
+    #[error("embedding not configured (enabled=false or missing api_key env var)")]
     NotConfigured,
 
     #[error("http request failed: {0}")]
@@ -31,11 +32,15 @@ pub enum EmbeddingError {
     Api { code: String, msg: String },
 }
 
-/// Embedding 配置（从 TOML [memory] section 读取）。
+/// Embedding 配置（从 TOML `[memory.embedding]` 小节反序列化）。
+///
+/// 全部字段都有配置层默认值；调用点用 `Default`/`try_into` 解析，
+/// 不允许在接线代码里硬编码模型参数。
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmbeddingConfig {
+    /// 向量路径总开关；默认关闭 = 纯 FTS5。
     #[serde(default)]
-    pub enable_embedding: bool,
+    pub enabled: bool,
 
     #[serde(default = "default_endpoint")]
     pub endpoint: String,
@@ -43,14 +48,20 @@ pub struct EmbeddingConfig {
     #[serde(default = "default_model")]
     pub model: String,
 
+    /// API key 所在环境变量名；空则回落 GRODEX_OPENAI_API_KEY。
     #[serde(default)]
     pub api_key_env_var: String,
 
     #[serde(default = "default_dim")]
     pub expected_dimension: usize,
 
+    /// 单次 embed_texts 调用的最大文本数。
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// 启动时增量回填的最大文档数（防止大库阻塞启动）。
+    #[serde(default = "default_backfill_max")]
+    pub backfill_max_documents: usize,
 }
 
 fn default_endpoint() -> String {
@@ -69,15 +80,20 @@ fn default_batch_size() -> usize {
     64
 }
 
+fn default_backfill_max() -> usize {
+    200
+}
+
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            enable_embedding: false,
+            enabled: false,
             endpoint: default_endpoint(),
             model: default_model(),
             api_key_env_var: String::new(),
             expected_dimension: default_dim(),
             batch_size: default_batch_size(),
+            backfill_max_documents: default_backfill_max(),
         }
     }
 }
@@ -88,6 +104,10 @@ pub trait EmbeddingModel: Send + Sync {
     async fn embed_texts(&self, texts: &[String]) -> Result<Vec<EmbeddingVector>, EmbeddingError>;
     fn dimension(&self) -> usize;
     fn model_id(&self) -> &str;
+    /// 单次批量请求的文本数上限（回填器按此切批）。
+    fn batch_size(&self) -> usize {
+        default_batch_size()
+    }
 }
 
 /// OpenAI 兼容 Embedding 实现（HTTP 调 endpoint）。
@@ -100,7 +120,7 @@ pub struct OpenAiCompatibleModel {
 
 impl OpenAiCompatibleModel {
     pub fn new(cfg: EmbeddingConfig) -> Result<Self, EmbeddingError> {
-        if !cfg.enable_embedding {
+        if !cfg.enabled {
             return Err(EmbeddingError::NotConfigured);
         }
         let env_var = if cfg.api_key_env_var.is_empty() {
@@ -214,6 +234,10 @@ impl EmbeddingModel for OpenAiCompatibleModel {
     fn model_id(&self) -> &str {
         &self.cfg.model
     }
+
+    fn batch_size(&self) -> usize {
+        self.cfg.batch_size
+    }
 }
 
 /// 余弦相似度计算。
@@ -282,10 +306,65 @@ mod tests {
     #[test]
     fn config_defaults() {
         let cfg = EmbeddingConfig::default();
-        assert!(!cfg.enable_embedding);
+        assert!(!cfg.enabled);
         assert_eq!(cfg.endpoint, "https://api.openai.com/v1/embeddings");
         assert_eq!(cfg.model, "text-embedding-3-small");
         assert_eq!(cfg.expected_dimension, 1536);
         assert_eq!(cfg.batch_size, 64);
+        assert_eq!(cfg.backfill_max_documents, 200);
+    }
+
+    /// `[memory.embedding]` 小节部分配置：未给的字段落配置层默认值。
+    #[test]
+    fn partial_config_falls_back_to_defaults() {
+        let json = r#"{"enabled": true, "model": "bge-m3", "expected_dimension": 1024}"#;
+        let cfg: EmbeddingConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.model, "bge-m3");
+        assert_eq!(cfg.expected_dimension, 1024);
+        // 未配置字段 → 配置层默认值，而非调用点硬编码。
+        assert_eq!(cfg.endpoint, "https://api.openai.com/v1/embeddings");
+        assert_eq!(cfg.batch_size, 64);
+        assert_eq!(cfg.backfill_max_documents, 200);
+    }
+
+    /// 空表 = 全默认 = 关闭状态。
+    #[test]
+    fn empty_table_is_disabled_default() {
+        let cfg: EmbeddingConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.enabled);
+        assert!(matches!(
+            OpenAiCompatibleModel::new(cfg).unwrap_err(),
+            EmbeddingError::NotConfigured
+        ));
+    }
+
+    /// TOML `[memory.embedding]` 小节 → EmbeddingConfig（与 config.example.toml 同构）。
+    #[test]
+    fn toml_section_round_trip() {
+        let toml_str = r#"
+            enabled = true
+            endpoint = "http://127.0.0.1:11434/v1/embeddings"
+            model = "bge-m3"
+            api_key_env_var = "MY_KEY"
+            expected_dimension = 1024
+            batch_size = 16
+            backfill_max_documents = 50
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let cfg: EmbeddingConfig = value.try_into().unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.endpoint, "http://127.0.0.1:11434/v1/embeddings");
+        assert_eq!(cfg.model, "bge-m3");
+        assert_eq!(cfg.api_key_env_var, "MY_KEY");
+        assert_eq!(cfg.expected_dimension, 1024);
+        assert_eq!(cfg.batch_size, 16);
+        assert_eq!(cfg.backfill_max_documents, 50);
+
+        // 只给开关，其余落默认值。
+        let minimal: toml::Value = toml::from_str("enabled = true").unwrap();
+        let cfg: EmbeddingConfig = minimal.try_into().unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.model, "text-embedding-3-small");
     }
 }

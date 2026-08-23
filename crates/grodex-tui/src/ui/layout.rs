@@ -56,9 +56,10 @@ pub fn approvals_desired_rows(count: usize) -> u16 {
 /// How many rows the turn-status line wants this frame.
 ///
 /// Grok hides it between turns; grodex shows a single status row whenever a
-/// turn is streaming or there are active tool calls.
-pub fn turn_status_desired_rows(is_streaming: bool, active_tools: usize) -> u16 {
-    if is_streaming || active_tools > 0 { 1 } else { 0 }
+/// turn is streaming, there are active tool calls, or a context compaction
+/// is in flight ("会话压缩中…").
+pub fn turn_status_desired_rows(is_streaming: bool, active_tools: usize, compacting: bool) -> u16 {
+    if is_streaming || active_tools > 0 || compacting { 1 } else { 0 }
 }
 
 /// Prompt widget height based on content rows + chrome overhead.
@@ -188,7 +189,7 @@ mod tests {
     #[test]
     fn all_panes_nonzero_on_tall_terminal() {
         let r = Rect::new(0, 0, 120, 50);
-        let l = build_layout(r, approvals_desired_rows(2), turn_status_desired_rows(true, 2), 6);
+        let l = build_layout(r, approvals_desired_rows(2), turn_status_desired_rows(true, 2, false), 6);
         assert!(l.status_bar.height > 0);
         assert!(l.approvals.height > 0);
         assert!(l.conversation.height > 0);

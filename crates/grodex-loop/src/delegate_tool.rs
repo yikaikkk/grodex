@@ -391,7 +391,7 @@ async fn run_subagent_turn(
         cfg.wire_protocol,
     );
 
-    let tool_specs: Vec<ToolSpec> = readonly_tools
+    let mut tool_specs: Vec<ToolSpec> = readonly_tools
         .iter()
         .map(|(name, _, schema)| ToolSpec {
             name: name.clone(),
@@ -400,6 +400,11 @@ async fn run_subagent_turn(
             required: vec![],
         })
         .collect();
+    // Deterministic sort by name — same rationale as
+    // TurnCapabilityOverlay::effective_specs: HashMap or caller-provided
+    // order may vary, and an unstable tools array defeats provider-side
+    // prompt caching.
+    tool_specs.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut context: Vec<ContextItem> = vec![ContextItem::User {
         content: task.to_string(),

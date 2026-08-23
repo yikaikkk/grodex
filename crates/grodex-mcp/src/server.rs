@@ -19,6 +19,11 @@ pub struct McpServerConfig {
     /// Whether this server is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional OAuth client settings. When present, the server requires an
+    /// OAuth authorization flow before use; the runtime registers this
+    /// config with the MCP OAuth coordinator (see `crate::oauth`).
+    #[serde(default)]
+    pub oauth: Option<grodex_auth::OAuthClientConfig>,
 }
 
 fn default_true() -> bool {
@@ -34,6 +39,12 @@ impl McpServerConfig {
             args: Vec::new(),
             env: HashMap::new(),
             enabled: true,
+            oauth: None,
         }
+    }
+
+    /// Whether this server requires an OAuth authorization flow.
+    pub fn requires_oauth(&self) -> bool {
+        self.oauth.is_some()
     }
 }

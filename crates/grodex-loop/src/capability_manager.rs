@@ -371,8 +371,12 @@ pub struct TurnCapabilityBase {
 
 impl TurnCapabilityBase {
     /// Effective model-visible tool specs from this base alone.
+    /// Sorted by name for deterministic ordering (see `effective_specs`
+    /// for the rationale — HashMap iteration is non-deterministic).
     pub fn model_specs(&self) -> Vec<ToolSpec> {
-        self.tool_specs.values().cloned().collect()
+        let mut specs: Vec<ToolSpec> = self.tool_specs.values().cloned().collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
     }
 
     /// Look up a tool runtime by name.

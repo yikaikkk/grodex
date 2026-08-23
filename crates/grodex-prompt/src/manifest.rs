@@ -308,6 +308,15 @@ pub struct PromptManifest {
     pub config_prompt_generation: u64,
     /// Per-node manifest entries (metadata only, no content).
     pub nodes: Vec<NodeManifestEntry>,
+
+    // ── Conflict analysis (Doc 19 §12; explanatory, never affects hash) ──
+    /// Structurally detected conflicts (boundary violations, scope
+    /// overrides, duplicate content).
+    #[serde(default)]
+    pub conflicts: Vec<crate::conflict::InstructionConflict>,
+    /// Nodes masked by a more specific same-authority rule.
+    #[serde(default)]
+    pub masked: Vec<crate::conflict::MaskRecord>,
 }
 
 impl PromptManifest {
@@ -317,6 +326,10 @@ impl PromptManifest {
     /// Create a new manifest from instruction nodes, assembled in
     /// four-zone order (A → C → B → D).
     pub fn from_nodes(nodes: Vec<InstructionNode>, model_binding_id: Option<String>, config_prompt_generation: u64) -> Self {
+        // §12 conflict analysis runs on the full node list before zoning;
+        // results are explanatory and never affect the content hash.
+        let report = crate::conflict::detect_conflicts(&nodes);
+
         // Assign zones based on kind/authority.
         let mut zoned: Vec<(PromptZone, InstructionNode)> = nodes
             .into_iter()
@@ -387,6 +400,8 @@ impl PromptManifest {
             model_binding_id,
             config_prompt_generation,
             nodes: node_entries,
+            conflicts: report.conflicts,
+            masked: report.masked,
         }
     }
 
@@ -436,6 +451,9 @@ impl PromptManifest {
         model_binding_id: Option<String>,
         config_prompt_generation: u64,
     ) -> Self {
+        // §12 conflict analysis (explanatory, hash-unaffected).
+        let report = crate::conflict::detect_conflicts(&nodes);
+
         // Assign zones based on kind (A or B).
         let mut zoned: Vec<(PromptZone, InstructionNode)> = nodes
             .into_iter()
@@ -535,6 +553,8 @@ impl PromptManifest {
             model_binding_id,
             config_prompt_generation,
             nodes: node_entries,
+            conflicts: report.conflicts,
+            masked: report.masked,
         }
     }
 
@@ -619,15 +639,51 @@ impl PromptManifest {
         out.push_str(&"-".repeat(90).as_str());
         out.push('\n');
         for entry in &self.nodes {
+            let masked_by: Vec<&str> = self
+                .masked
+                .iter()
+                .filter(|m| m.masked_id == entry.id)
+                .map(|m| m.masked_by.as_str())
+                .collect();
+            let mask_tag = if masked_by.is_empty() {
+                String::new()
+            } else {
+                format!("  [masked by: {}]", masked_by.join(", "))
+            };
             out.push_str(&format!(
-                "{:<5} {:<6} {:<8} {:<12} {:<24} {}\n",
+                "{:<5} {:<6} {:<8} {:<12} {:<24} {}{}\n",
                 entry.position,
                 format!("{:?}", entry.zone),
                 entry.authority.0,
                 format!("{:?}", entry.scope).chars().take(12).collect::<String>(),
                 entry.id.chars().take(24).collect::<String>(),
                 &entry.source_hash[..16.min(entry.source_hash.len())],
+                mask_tag,
             ));
+        }
+
+        // §12 conflict section (boundary violations first).
+        let violations: Vec<_> = self
+            .conflicts
+            .iter()
+            .filter(|c| c.kind == crate::conflict::ConflictKind::BoundaryViolation)
+            .collect();
+        if !violations.is_empty() {
+            out.push_str(&format!("\nBoundary violations ({}):\n", violations.len()));
+            for c in &violations {
+                out.push_str(&format!("  ✖ {}\n", c.message));
+            }
+        }
+        let others: Vec<_> = self
+            .conflicts
+            .iter()
+            .filter(|c| c.kind != crate::conflict::ConflictKind::BoundaryViolation)
+            .collect();
+        if !others.is_empty() {
+            out.push_str(&format!("\nConflicts/diagnostics ({}):\n", others.len()));
+            for c in &others {
+                out.push_str(&format!("  ⚠ [{:?}] {}\n", c.kind, c.message));
+            }
         }
         out
     }

@@ -49,9 +49,10 @@ const ENABLE_ALT_SCROLL: &[u8] = b"\x1b[?1007h";
 
 /// 触控板滚轮突发识别参数（配合 DECSET 1007，不捕获鼠标）。
 /// 1007 把滚轮翻译成 ↑/↓ 方向键：触控板轻轻一划会在极短时间内爆发几十个箭头键。
-/// 人手按键（含长按重复）最快也只有 ~30Hz；因此“短窗口内 ≥ 阈值个裸箭头键”判为滚轮手势，
-/// 直接转成正文滚动（不劫持选择），并经限流封顶避免惯性失控。
-const ARROW_BURST_WINDOW: Duration = Duration::from_millis(60);
+/// 人手按键（含长按重复）最快也只有 ~30Hz（间隔 ≥33ms）；因此“短窗口内 ≥ 阈值个裸箭头键”判为滚轮手势，
+/// 直接转成正文滚动（不劫持选择）。窗口取 40ms：既包住按键重复的最快间隔，
+/// 又让手势首箭头的暂存判定更快释放（窗口越短，轻划的首帧延迟上限越低）。
+const ARROW_BURST_WINDOW: Duration = Duration::from_millis(40);
 const ARROW_BURST_THRESHOLD: u32 = 2;
 /// 滚轮手势已确认后的惯性延续窗口：触控板惯性事件随衰减越来越稀疏（间隔远超 BURST_WINDOW），
 /// 只要距上一个箭头事件不超过该窗口就仍按滚轮处理，绝不泄漏成真实按键去触发选择/历史导航。
@@ -60,21 +61,14 @@ const ARROW_BURST_CONTINUE: Duration = Duration::from_millis(700);
 /// 单个滚轮手势的总时长上限：防止真实方向键持续按压把延续窗口无限延长的病态场景（惯性最长也就 2-3s）。
 const ARROW_GESTURE_MAX_DUR: Duration = Duration::from_secs(3);
 
-/// 滚轮平滑参数：事件只累加进滚动目标，实际滚动按帧以固定比例逼近目标（指数平滑）。
-/// 触控板箭头流的到达率忽高忽慢（慢滑 30~80ms 一个、快滑爆发一串），事件驱动的直接应用
-/// 会“一卡一卡”；改为帧驱动后画面以稳定 60fps 连续运动，事件节奏被抹平且一行不丢。
-/// SCROLL_SMOOTHING 为每帧逼近目标剩余量的比例：0.45 ≈ 48ms 完成 ~90%，跟手且顺滑；
-/// 衰减系数同时天然是速度上限（等效窗口限速），无需再丢弃事件。
-const SCROLL_SMOOTHING: f32 = 0.45;
-
-/// 帧率节流：限制 draw() 的最高频率，防止触控板滚轮 / 高频事件造成
-/// “每个事件一次 draw + set_cursor” 的终端硬光标闪烁。16ms ≈ 60fps，
-/// 对 streaming 增量渲染与滚动都足够顺滑；键盘输入反馈延迟 ≤16ms 不可感知。
-const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// 帧率节流：限制 draw() 的最高频率，防止高频事件造成“每个事件一次
+/// draw + set_cursor”的终端硬光标闪烁。8ms ≈ 120fps：对齐 VS Code 在
+/// ProMotion 屏上的滚动帧率；事件到达超过上限时自动合批到下一帧。
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 
 /// 鼠标上报（仅 macOS Terminal.app 兜底用）：普通跟踪 (1000) + SGR 扩展 (1006)。
 /// Terminal.app 不实现 DECSET 1007，滚轮不会被翻译成方向键；不开上报时滚轮会滚动终端自己的回滚缓冲，
-/// 把整个 TUI 从 alternate screen “卷走”。只有在这个终端里才开启，且只消费滚轮事件、忽略点击/拖拽。
+/// 把整个 TUI 从 alternate screen "卷走"。只有在这个终端里才开启，且只消费滚轮事件、忽略点击/拖拽。
 const ENABLE_MOUSE_CAPTURE: &[u8] = b"\x1b[?1006h\x1b[?1000h";
 
 fn hard_terminal_reset() {
@@ -123,9 +117,6 @@ pub struct GrodexTui {
     terminal: Terminal<CrosstermBackend<io::Stderr>>,
     state: TuiAppState,
     transport: Box<dyn TransportAdapter>,
-    /// 滚动目标累计量（行数，正 = 向下）。突发箭头键/滚轮事件只累加到这里，
-    /// 实际滚动按帧指数平滑逼近，与事件到达节奏解耦。
-    scroll_target: i32,
     /// 上一个裸箭头键到达时间（滚轮突发识别用）。
     arrow_last_at: Option<std::time::Instant>,
     /// 当前连续箭头键计数（滚轮突发识别用）。
@@ -142,7 +133,7 @@ pub struct GrodexTui {
     /// 当前迭代的事件来自待派发队列：直接派发，跳过突发检测（避免重复计数）。
     queued_dispatch: bool,
     /// 鼠标上报（滚轮）是否开启：仅 macOS Terminal.app 自动开启（它不支持 1007），
-    /// 其他终端保持关闭以保留终端原生选择。不提供用户开关。
+    /// 其他终端保持关闭以保留终端原生选择（对齐 codex）。
     mouse_capture: bool,
     /// 上一次实际执行 draw() 的时间（帧率节流，防光标高频闪烁）。
     last_frame_at: std::time::Instant,
@@ -184,7 +175,6 @@ impl GrodexTui {
             terminal,
             state,
             transport: Box::new(transport),
-            scroll_target: 0,
             arrow_last_at: None,
             arrow_burst: 0,
             burst_confirmed: false,
@@ -196,12 +186,6 @@ impl GrodexTui {
             // 倒推 1 秒，保证首帧无需等待节流窗口即可立即绘制。
             last_frame_at: std::time::Instant::now() - Duration::from_secs(1),
         })
-    }
-
-    /// 滚轮累加统一入口（突发箭头键与 Terminal.app 真实滚轮共用）。
-    /// 只累加进滚动目标，由主循环按帧指数平滑应用。
-    fn add_wheel(&mut self, lines: i32) {
-        self.scroll_target += lines;
     }
 
     pub fn run_blocking(mut self) -> Result<()> {
@@ -227,14 +211,14 @@ impl GrodexTui {
         let _ = io::Write::flush(&mut stderr);
         // 启用 DECSET 1007 (Alternate Scroll Mode)：滚轮 → 方向键。
         // 不捕获鼠标，终端原生的文本选择（拖拽选中 + 右键复制）始终可用，
-        // 参考 codex-rs 的设计。触控板惯性爆发由主循环的箭头突发识别限流。
+        // 参考 codex 的设计。触控板箭头直接应用（无平滑），手感接近 codex。
         let _ = io::Write::write_all(&mut stderr, ENABLE_ALT_SCROLL);
         let _ = io::Write::flush(&mut stderr);
         // macOS 自带 Terminal.app 不实现 DECSET 1007：滚轮不会被翻译成方向键，
-        // 反而会滚动终端自己的回滚缓冲，把整个 TUI 从屏幕上“卷走”。
+        // 反而会滚动终端自己的回滚缓冲，把整个 TUI 从屏幕上"卷走"。
         // 只有在这个终端里才开启最小鼠标上报（只消费滚轮、忽略点击），
         // 其他终端（iTerm2/WezTerm/Alacritty 等）保持零捕获，原生选择不受影响。
-        // 前提：Terminal.app 菜单 “显示 > 允许鼠标报告” 处于勾选状态（默认勾选）。
+        // 前提：Terminal.app 菜单 "显示 > 允许鼠标报告" 处于勾选状态（默认勾选）。
         let is_apple_terminal =
             std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal");
         if is_apple_terminal {
@@ -653,26 +637,6 @@ impl GrodexTui {
                 self.burst_started_at = None;
             }
 
-            // ── 滚轮指数平滑应用：事件只累加进滚动目标，实际滚动每帧按“剩余量的固定比例”
-            // 逼近（至少 1 行、不越过目标）。画面运动节奏由帧率（~60fps）决定，与触控板箭头流
-            // 的忽快忽慢解耦，消除“一卡一卡”；整数比例精确收敛，累计量一行不丢。比例系数同时
-            // 天然是速度上限（等效窗口限速，但不丢弃事件）。方向带符号，反向滑动立即抵消。
-            if self.scroll_target != 0 {
-                let remaining = self.scroll_target;
-                let sign = remaining.signum();
-                let mag = remaining.unsigned_abs();
-                // 本帧步长 = 剩余量 × SCROLL_SMOOTHING（四舍五入），至少 1 行、不超过剩余量。
-                let step = ((mag as f32 * SCROLL_SMOOTHING).round() as u32).clamp(1, mag);
-                self.scroll_target -= step as i32 * sign;
-                for _ in 0..step {
-                    if sign > 0 {
-                        self.state.scroll_down(None);
-                    } else {
-                        self.state.scroll_up();
-                    }
-                }
-            }
-
             // ── Render EVERY iteration (after draining events, before
             // polling keyboard). Previously draw() was at the BOTTOM of
             // the loop, AFTER `if !poll_ok { continue; }`. During
@@ -695,7 +659,8 @@ impl GrodexTui {
                     let area = f.size();
                     let approvals_rows = approvals_desired_rows(self.state.pending_approvals.len());
                     let turn_status_rows = turn_status_desired_rows(
-                        self.state.is_streaming(), self.state.active_tool_count());
+                        self.state.is_streaming(), self.state.active_tool_count(),
+                        self.state.compacting);
                     let wrap_w = (area.width as usize).saturating_sub(7).max(20);
                     let content_rows = self.state.prompt_content_lines(wrap_w);
                     let slash_rows = self.state.slash_menu_rows();
@@ -710,9 +675,9 @@ impl GrodexTui {
 
             // During streaming, poll keyboard with a 1ms timeout so new
             // TextDelta chunks are picked up almost immediately. When idle,
-            // 10ms is fine and saves CPU. Previously the fixed 10ms timeout
-            // added noticeable latency to each streaming chunk.
-            let poll_ms = if self.state.is_streaming() { 1 } else { 10 };
+            // 2ms keeps first-keystroke / gesture-start latency negligible
+            // at negligible CPU cost (event poll is cheap).
+            let poll_ms = if self.state.is_streaming() { 1 } else { 2 };
             // 优先消费突发识别还原的待派发按键，其次才从终端读新事件。
             let ev: CrosstermEvent = if let Some(k) = self.queued_keys.pop_front() {
                 // 队列里是突发识别还原的真实按键：本迭代直接派发，不再参与检测。
@@ -750,7 +715,30 @@ impl GrodexTui {
                         //   · 经帧平滑后运动连贯，不会一顿一顿。
                         // 突发确认前的箭头键先暂存不派发，超时还原为真实按键，
                         // 避免滚轮手势的前几个箭头键误触发选择/历史导航。
-                        if !bypass_burst {
+                        // ── 交互覆盖层直通（对齐 codex：popup 打开时 Up/Down 永远归 popup）──
+                        // slash 菜单或审批选择激活时，↑/↓ 属于覆盖层，绝不能被突发识别
+                        // 劫持成滚轮手势——否则在菜单里快速按下箭头选择命令时，会泄漏成
+                        // “翻上面的聊天”。此时滚动需求由鼠标/触控板直接驱动菜单选择。
+                        let overlay_active = (self.state.slash.open
+                            && !self.state.slash.matches.is_empty())
+                            || !self.state.pending_approvals.is_empty();
+                        if !bypass_burst && overlay_active {
+                            // 仍在暂存待判定的箭头此时也必然是真实按键：按时间顺序还原派发。
+                            if !self.held_arrows.is_empty() {
+                                self.queued_keys.extend(self.held_arrows.drain(..));
+                                self.queued_keys.push_back(key);
+                                self.arrow_burst = 0;
+                                self.arrow_last_at = None;
+                                self.burst_confirmed = false;
+                                self.burst_started_at = None;
+                                continue;
+                            }
+                            self.arrow_burst = 0;
+                            self.arrow_last_at = None;
+                            self.burst_confirmed = false;
+                            self.burst_started_at = None;
+                            // 落到下方 handle_key 直接派发。
+                        } else if !bypass_burst {
                         let is_plain_arrow = matches!(
                             key.code,
                             crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Down
@@ -772,10 +760,11 @@ impl GrodexTui {
                                     .is_some_and(|t| now.duration_since(t) <= ARROW_GESTURE_MAX_DUR);
                             self.arrow_last_at = Some(now);
                             if continuing {
+                                // 惯性延续：直接应用（无平滑），对齐 codex。
                                 if matches!(key.code, crossterm::event::KeyCode::Up) {
-                                    self.add_wheel(-2);
+                                    self.state.scroll_up();
                                 } else {
-                                    self.add_wheel(2);
+                                    self.state.scroll_down(None);
                                 }
                                 continue;
                             }
@@ -789,17 +778,26 @@ impl GrodexTui {
                             }
                             self.arrow_burst += 1;
                             if self.arrow_burst >= ARROW_BURST_THRESHOLD {
-                                // 突发确认：暂存的箭头键也是滚轮手势的一部分，全部丢弃；
-                                // 当前键也丢弃，只累加滚动量（经限流窗口应用）。
+                                // 突发确认：暂存的箭头键也是滚轮手势的一部分——
+                                // 直接应用每个箭头（无平滑），对齐 codex。
                                 self.burst_confirmed = true;
                                 if self.burst_started_at.is_none() {
                                     self.burst_started_at = Some(now);
                                 }
+                                // 应用暂存的箭头
+                                for _ in 0..self.held_arrows.len() {
+                                    if matches!(key.code, crossterm::event::KeyCode::Up) {
+                                        self.state.scroll_up();
+                                    } else {
+                                        self.state.scroll_down(None);
+                                    }
+                                }
                                 self.held_arrows.clear();
+                                // 应用当前箭头
                                 if matches!(key.code, crossterm::event::KeyCode::Up) {
-                                    self.add_wheel(-2);
+                                    self.state.scroll_up();
                                 } else {
-                                    self.add_wheel(2);
+                                    self.state.scroll_down(None);
                                 }
                                 continue;
                             }
@@ -3037,13 +3035,17 @@ impl GrodexTui {
                     }
                     CrosstermEvent::Mouse(me) => {
                         // 默认不捕获鼠标（对齐 codex）：滚轮走 DECSET 1007 翻译成方向键，
-                        // 由上方 Key 分支的突发识别处理。唯一例外是 macOS Terminal.app（不支持 1007）：
+                        // 由上方 Key 分支直接应用。唯一例外是 macOS Terminal.app（不支持 1007）：
                         // 只在那里开了鼠标上报，此时只消费滚轮事件，点击/拖拽一律忽略。
                         if self.mouse_capture {
                             use crossterm::event::MouseEventKind;
                             match me.kind {
-                                MouseEventKind::ScrollUp => self.add_wheel(-2),
-                                MouseEventKind::ScrollDown => self.add_wheel(2),
+                                MouseEventKind::ScrollUp => {
+                                    self.state.scroll_up();
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    self.state.scroll_down(None);
+                                }
                                 _ => {}
                             }
                         }
@@ -3480,3 +3482,5 @@ fn export_conversation_md(state: &ui::state::TuiAppState) -> Result<std::path::P
     f.flush().ok();
     Ok(path)
 }
+
+

@@ -699,6 +699,35 @@ impl RolloutWriter {
         .await
     }
 
+    /// ToolResultCommitted (synthetic) — emitted by the supervisor when
+    /// a turn is aborted mid-tool-execution (`cancel_turn`). The real
+    /// result never arrives, so we commit an error placeholder to keep
+    /// every ToolCall paired; otherwise resume replay fails validation
+    /// with OrphanedToolResult. step_id/generation are None because the
+    /// step never completed — the reducer only validates generation
+    /// when present, so this cannot regress monotonicity.
+    pub async fn write_tool_result_interrupted(
+        &self,
+        turn_id: TurnId,
+        call_id: &str,
+        content: &str,
+    ) -> Result<u64, GrodexError> {
+        self.write(
+            RolloutEventType::ToolResultCommitted,
+            Some(turn_id),
+            None,
+            None,
+            serde_json::json!({
+                "call_id": call_id,
+                "content": content,
+                "is_error": true,
+                "interrupted": true
+            }),
+            true,
+        )
+        .await
+    }
+
     /// CompactionCommitted — must be durable; a post-crash replay that
     /// skips compaction would re-read a stale oversized transcript and
     /// produce a different model output (semantic drift).

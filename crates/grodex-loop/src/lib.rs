@@ -11,6 +11,7 @@ pub mod capability;
 pub mod capability_manager;
 pub mod chat_state;
 pub mod delegate_tool;
+pub mod protocol_tools;
 pub mod command;
 pub mod context;
 pub mod context_projection;

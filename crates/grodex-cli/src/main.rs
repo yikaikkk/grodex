@@ -142,6 +142,32 @@ enum PromptCommand {
         #[arg(long)]
         zone_d: Option<String>,
     },
+    /// Dump the actual canonical assembled prompt (Design Doc 19 §12/§18).
+    /// Pure content goes to stdout (metadata to stderr), so it can be piped
+    /// / diffed for reproducibility.
+    Dump {
+        /// Working directory to use for discovery (default: current dir).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Treat the workspace as explicitly trusted (same semantics as
+        /// `prompt explain --trusted`).
+        #[arg(long)]
+        trusted: bool,
+        /// Optional model binding id to record in the manifest.
+        #[arg(long)]
+        model_binding: Option<String>,
+        /// Optional Zone C content (compaction baseline) for dry-run assembly.
+        #[arg(long)]
+        zone_c: Option<String>,
+        /// Optional Zone D content (recent tail) for dry-run assembly.
+        #[arg(long)]
+        zone_d: Option<String>,
+        /// Print full unredacted content. Default is REDACTED: home/cwd
+        /// and remaining absolute user paths are replaced by placeholders
+        /// (Design Doc 19 §18: dump 默认脱敏路径和环境值).
+        #[arg(long)]
+        no_redact: bool,
+    },
 }
 
 #[tokio::main]
@@ -181,6 +207,21 @@ async fn main() {
                 show_content,
                 zone_c.as_deref(),
                 zone_d.as_deref(),
+            ),
+            PromptCommand::Dump {
+                cwd,
+                trusted,
+                model_binding,
+                zone_c,
+                zone_d,
+                no_redact,
+            } => prompt_dump(
+                cwd.as_deref(),
+                trusted,
+                model_binding.as_deref(),
+                zone_c.as_deref(),
+                zone_d.as_deref(),
+                !no_redact,
             ),
         },
         Command::Version => {
@@ -369,6 +410,12 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
         }
         LoopSessionEvent::Info { message } => {
             let content = UpdateContent::Info { message };
+            let env = EventEnvelope::wrap(seq, session_id, content);
+            Some(ServerFrame::Event(env))
+        }
+        // ── Context compaction lifecycle → TUI "会话压缩中…" 指示。
+        LoopSessionEvent::CompactionStatus { phase } => {
+            let content = UpdateContent::CompactionStatus { phase };
             let env = EventEnvelope::wrap(seq, session_id, content);
             Some(ServerFrame::Event(env))
         }
@@ -1029,30 +1076,31 @@ async fn serve_acp() -> Result<()> {
 /// explanation of every instruction node, its zone, authority, provenance,
 /// the manifest-level hashes, config diagnostics (including enterprise
 /// requirement overrides that take effect), and optionally the full prompt.
-fn prompt_explain(
-    cwd: Option<&std::path::Path>,
+/// Shared assembly path for `prompt explain` / `prompt dump`: mirrors the
+/// runtime build (config load → trust resolution → instruction discovery →
+/// PromptBuilder) so both commands see exactly what a live session would.
+fn assemble_prompt(
+    cwd_arg: Option<&std::path::Path>,
     explicit_trusted: bool,
     model_binding: Option<&str>,
-    show_content: bool,
     zone_c: Option<&str>,
     zone_d: Option<&str>,
+) -> (
+    PathBuf,
+    LoadedConfig,
+    bool,
+    grodex_prompt::DiscoveryResult,
+    grodex_prompt::PromptManifest,
 ) {
-    let cwd = cwd
+    let cwd = cwd_arg
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    println!("═══ Grodex Prompt Explain ═══");
-    println!("Working directory: {}", cwd.display());
-
-    // 1. Load config so we can surface its diagnostics (requirement overrides,
-    //    migration warnings, merge issues), extract the workspace trust flag,
-    //    and obtain the domain generation counters.
+    // 1. Load config: diagnostics + workspace trust flag + generation counters.
     let config = ConfigResolver::load(&cwd).unwrap_or_else(|_| LoadedConfig::empty());
 
-    // 2. Resolve workspace trust:
-    //    a. --trusted CLI flag wins
-    //    b. else [workspace] trusted = true in the loaded workspace layer
-    //    c. else untrusted (fail-closed — project/path-rule content excluded)
+    // 2. Resolve workspace trust: --trusted flag wins, else the workspace
+    //    layer's flag, else untrusted (fail-closed).
     let config_trusted = config
         .raw_layers
         .iter()
@@ -1063,48 +1111,33 @@ fn prompt_explain(
         .unwrap_or(false);
     let workspace_trusted = explicit_trusted || config_trusted;
 
-    println!(
-        "Workspace trust: {} (--trusted={}, config[workspace].trusted={})",
-        if workspace_trusted { "TRUSTED" } else { "UNTRUSTED (fail-closed)" },
-        explicit_trusted,
-        config_trusted
-    );
-    println!("Config root generation: {}", config.generation.root);
-    println!(
-        "Config diagnostics: {} (merge/migration/enforcement)",
-        config.effective.diagnostics.len()
-    );
-
-    // 3. Run instruction discovery (Design Doc 19 §7) with the resolved trust
-    //    flag and the config's prompt generation for stamping discovered nodes.
+    // 3. Instruction discovery (Design Doc 19 §7).
+    // Doc 19 §7.3: compat vendor dirs (.grok/.codex/.claude/.cursor) are
+    // opt-in via `instruction_compat_vendors` — never scanned by default.
+    let instruction_compat_vendors: std::collections::BTreeSet<String> = config
+        .effective
+        .values
+        .get("instruction_compat_vendors")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     let discovery_cfg = DiscoveryConfig {
         config_generation: config.generation.prompt,
+        compat_vendors: instruction_compat_vendors,
         ..DiscoveryConfig::default()
     };
     let discovery = InstructionDiscovery::new(discovery_cfg);
     let discovery_result = discovery.discover(&cwd, workspace_trusted);
 
-    println!(
-        "\n── Instruction Discovery ──\n\
-         Nodes discovered: {}\n\
-         Oversized files skipped: {}\n\
-         Duplicate canonical paths deduped: {}\n\
-         Untrusted workspace files skipped: {}",
-        discovery_result.nodes.len(),
-        discovery_result.oversized.len(),
-        discovery_result.duplicates.len(),
-        discovery_result.untrusted_skipped.len()
-    );
-
-    // 4. Build PromptManifest via PromptBuilder. The builder also layers in
-    //    base instructions, skill/tool listings, environment snapshot, and
-    //    any explicitly-configured project rules — so the explain output
-    //    matches what the runtime would actually send.
+    // 4. Assemble the manifest exactly like the runtime would.
     let builder = PromptBuilder::new()
         .with_config_generation(config.generation.prompt)
         .with_env(EnvironmentInfo::snapshot())
         .with_discovered_nodes(discovery_result.nodes.clone());
-
     let builder = if let Some(mb) = model_binding {
         builder.with_model_binding(mb)
     } else {
@@ -1120,22 +1153,70 @@ fn prompt_explain(
     } else {
         builder
     };
-    // Load the .grodex/AGENTS.md and .grodex.d/ project-level rules *in
-    // addition to* the discovery-result nodes we already pre-seeded.
-    // (These are two complementary sources; discovery handled the
-    //  per-path tree walk, this handles the explicit config locations.)
     let mut builder = builder;
     builder.load_project_rules(&cwd, workspace_trusted);
-
     let manifest = builder.build();
 
-    // 5. Print the manifest-level explanation.
+    (cwd, config, workspace_trusted, discovery_result, manifest)
+}
+
+fn prompt_explain(
+    cwd: Option<&std::path::Path>,
+    explicit_trusted: bool,
+    model_binding: Option<&str>,
+    show_content: bool,
+    zone_c: Option<&str>,
+    zone_d: Option<&str>,
+) {
+    let (cwd, config, workspace_trusted, discovery_result, manifest) =
+        assemble_prompt(cwd, explicit_trusted, model_binding, zone_c, zone_d);
+
+    println!("═══ Grodex Prompt Explain ═══");
+    println!("Working directory: {}", cwd.display());
+
+    // Trust resolution (flag + config layer) for fail-closed visibility.
+    let config_trusted = config
+        .raw_layers
+        .iter()
+        .find_map(|l| match &l.source {
+            grodex_config::ConfigLayerSource::Workspace { trusted } => Some(*trusted),
+            _ => None,
+        })
+        .unwrap_or(false);
+    println!(
+        "Workspace trust: {} (--trusted={}, config[workspace].trusted={})",
+        if workspace_trusted { "TRUSTED" } else { "UNTRUSTED (fail-closed)" },
+        explicit_trusted,
+        config_trusted
+    );
+    println!("Config root generation: {}", config.generation.root);
+    println!(
+        "Config diagnostics: {} (merge/migration/enforcement)",
+        config.effective.diagnostics.len()
+    );
+
+    println!(
+        "\n── Instruction Discovery ──\n\
+         Nodes discovered: {}\n\
+         Oversized files skipped: {}\n\
+         Duplicate canonical paths deduped: {}\n\
+         Untrusted workspace files skipped: {}",
+        discovery_result.nodes.len(),
+        discovery_result.oversized.len(),
+        discovery_result.duplicates.len(),
+        discovery_result.untrusted_skipped.len()
+    );
+    if !discovery_result.diagnostics.is_empty() {
+        for d in &discovery_result.diagnostics {
+            println!("  ⚠ {d}");
+        }
+    }
+
+    // Manifest-level explanation (zones, nodes, provenance, hash).
     println!("\n── Prompt Manifest ──");
     println!("{}", manifest.explain());
 
-    // 6. Print config diagnostics so users can see requirement overrides
-    //    that shape which provider/sandbox/features the assembled prompt
-    //    will actually run under (fail-closed visibility).
+    // Config diagnostics: requirement overrides shaping the assembled prompt.
     if !config.effective.diagnostics.is_empty() {
         println!("\n── Config Diagnostics (merge / migration / requirement overrides) ──");
         for d in &config.effective.diagnostics {
@@ -1144,7 +1225,6 @@ fn prompt_explain(
         }
     }
 
-    // 7. Optionally print the full assembled prompt text.
     if show_content {
         println!("\n── Assembled Prompt Content ({:.1} KiB) ──", manifest.content.len() as f64 / 1024.0);
         println!("{}", manifest.content);
@@ -1157,6 +1237,86 @@ fn prompt_explain(
             manifest.estimated_tokens
         );
     }
+}
+
+/// `prompt dump` — print the actual canonical assembled prompt.
+/// Pure content → stdout; metadata → stderr (pipe/diff friendly).
+/// Redaction is ON by default (Design Doc 19 §18): home/cwd and remaining
+/// absolute user paths become placeholders.
+fn prompt_dump(
+    cwd: Option<&std::path::Path>,
+    explicit_trusted: bool,
+    model_binding: Option<&str>,
+    zone_c: Option<&str>,
+    zone_d: Option<&str>,
+    redact: bool,
+) {
+    let (cwd, _config, _trusted, _discovery, manifest) =
+        assemble_prompt(cwd, explicit_trusted, model_binding, zone_c, zone_d);
+
+    eprintln!("═══ Grodex Prompt Dump ═══");
+    eprintln!("Working directory: {}", cwd.display());
+    eprintln!("Manifest hash: {}", manifest.hash);
+    eprintln!("Schema version: {}", manifest.prompt_schema_version);
+    eprintln!("Estimated tokens: {}", manifest.estimated_tokens);
+    if let Some(mb) = &manifest.model_binding_id {
+        eprintln!("Model binding: {mb}");
+    }
+    eprintln!("Redacted: {redact} (use --no-redact for full content)");
+
+    let content = if redact {
+        redact_prompt_content(&manifest.content)
+    } else {
+        manifest.content.clone()
+    };
+    println!("{content}");
+}
+
+/// Redact sensitive paths from prompt content: home → `<HOME>`, the
+/// resolved working directory → `<CWD>`, and any remaining absolute user
+/// paths (`/Users/...`, `/home/...`) → `<PATH>`.
+fn redact_prompt_content(content: &str) -> String {
+    let mut out = content.to_string();
+    if let Some(home) = dirs::home_dir().map(|p| p.display().to_string()) {
+        if !home.is_empty() {
+            out = out.replace(&home, "<HOME>");
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_s = cwd.display().to_string();
+        if !cwd_s.is_empty() && cwd_s != "." {
+            out = out.replace(&cwd_s, "<CWD>");
+        }
+    }
+    redact_absolute_user_paths(&out)
+}
+
+/// Replace remaining absolute user paths (`/Users/x/...`, `/home/x/...`)
+/// with `<PATH>`. Delimiters: whitespace, quotes, backticks, angle brackets.
+fn redact_absolute_user_paths(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    let starts_with = |i: usize, pat: &str| -> bool {
+        chars[i..].iter().collect::<String>().starts_with(pat)
+    };
+    while i < chars.len() {
+        let is_path_start = chars[i] == '/' && (starts_with(i, "/Users/") || starts_with(i, "/home/"));
+        if is_path_start {
+            // Consume until a delimiter; emit one placeholder.
+            while i < chars.len()
+                && !chars[i].is_whitespace()
+                && !matches!(chars[i], '"' | '\'' | '`' | '<' | '>' | ')')
+            {
+                i += 1;
+            }
+            out.push_str("<PATH>");
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Run an interactive session, optionally seeding the transcript with a
@@ -1372,6 +1532,13 @@ async fn run_interactive_with(
                     // Error. Never breaks the turn loop — Info is not a
                     // terminal event.
                     println!("ℹ {message}");
+                }
+                Some(LoopSessionEvent::CompactionStatus { phase }) => {
+                    // 压缩是额外一轮模型调用，简单 REPL 也打一行状态，
+                    // 避免长时间静默看起来像卡死。非终态事件，不打断 turn。
+                    if phase == "started" {
+                        println!("\n[compacting] 会话压缩中…");
+                    }
                 }
                 Some(LoopSessionEvent::Shutdown) => {
                     println!("Session shut down.");
@@ -1883,5 +2050,30 @@ fn truncate(s: &str, max: usize) -> String {
         // UTF-8 sequences, which would panic on `&s[..max]`.
         let truncated: String = s.chars().take(max).collect();
         format!("{truncated}…")
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::redact_absolute_user_paths;
+
+    #[test]
+    fn redacts_users_and_home_paths() {
+        let input = "cwd=/Users/alice/proj and log at /home/bob/x.log ok";
+        let out = redact_absolute_user_paths(input);
+        assert_eq!(out, "cwd=<PATH> and log at <PATH> ok");
+    }
+
+    #[test]
+    fn stops_at_delimiters() {
+        let input = "see </Users/alice/p> and \"/home/b/q\" and `/home/c/r`";
+        let out = redact_absolute_user_paths(input);
+        assert_eq!(out, "see <<PATH>> and \"<PATH>\" and `<PATH>`");
+    }
+
+    #[test]
+    fn leaves_system_paths_alone() {
+        let input = "/usr/bin/bash /etc/hosts /opt/x";
+        assert_eq!(redact_absolute_user_paths(input), input);
     }
 }
