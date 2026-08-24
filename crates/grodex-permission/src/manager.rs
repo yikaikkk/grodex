@@ -13,6 +13,7 @@
 
 use crate::broker::ApprovalBroker;
 use crate::policy::{ArgPattern, PermissionPolicy, PolicyRule};
+use crate::session_grant::SessionPolicyGrant;
 use crate::ticket::{ApprovalTicket, RiskLevel};
 use grodex_core::id::ToolCallId;
 use grodex_core::policy::PolicyDecision;
@@ -76,6 +77,10 @@ pub struct PermissionManager {
     /// creates a new pending ticket. Fail-silent if the channel is
     /// closed or full (frontend disconnected).
     approval_tx: Option<mpsc::UnboundedSender<ApprovalRequestedEvent>>,
+    /// Session-level "always allow" grants (doc 10 §20.12).
+    /// Checked BEFORE policy evaluation in `check()` — an active grant
+    /// matching the tool short-circuits to Allowed.
+    session_grants: Vec<SessionPolicyGrant>,
 }
 
 /// Validates tool arguments against sandbox profiles.
@@ -126,6 +131,7 @@ impl PermissionManager {
             sandbox_validator: None,
             revocation_epoch: 0,
             approval_tx: None,
+            session_grants: Vec::new(),
         }
     }
 
@@ -147,6 +153,7 @@ impl PermissionManager {
                 sandbox_validator: None,
                 revocation_epoch: 0,
                 approval_tx: None,
+                session_grants: Vec::new(),
             },
             Err(e) => {
                 eprintln!("[warn] approval SQLite store unavailable, using in-memory: {e}");
@@ -267,6 +274,10 @@ impl PermissionManager {
     ///
     /// Returns `Allowed` if policy says Allow, `Denied` if policy says Deny,
     /// or `ApprovalRequired` with a oneshot receiver if policy says Ask.
+    ///
+    /// Session grants (doc 10 §20.12) are checked FIRST: an active grant
+    /// whose `normalized_operation_matcher` contains `tool=<tool_name>`
+    /// short-circuits to Allowed (decrementing `max_uses` if set).
     pub fn check(
         &mut self,
         tool_call_id: ToolCallId,
@@ -274,6 +285,27 @@ impl PermissionManager {
         args: &serde_json::Value,
         summary: &str,
     ) -> PermissionResult {
+        // ── Session grant fast-path (doc 10 §20.12) ──
+        let now = chrono::Utc::now();
+        let matcher_key = format!("tool={tool_name}");
+        for grant in self.session_grants.iter_mut() {
+            if grant.is_active(now) && grant.normalized_operation_matcher.contains(&matcher_key) {
+                // Decrement use counter if bounded.
+                if let Some(ref mut max) = grant.max_uses {
+                    if *max == 0 {
+                        continue; // exhausted
+                    }
+                    *max -= 1;
+                }
+                tracing::debug!(
+                    grant_id = %grant.grant_id,
+                    tool_name,
+                    "session grant matched — allowing"
+                );
+                return PermissionResult::Allowed;
+            }
+        }
+
         let decision = self.policy.evaluate(tool_name, args);
 
         match decision {
@@ -377,6 +409,30 @@ impl PermissionManager {
     /// Number of pending approval tickets.
     pub fn pending_count(&self) -> usize {
         self.broker.pending_count()
+    }
+
+    /// Add a session-level grant (doc 10 §20.12). Called when the user
+    /// selects "always allow this session" for a tool.
+    pub fn add_session_grant(&mut self, grant: SessionPolicyGrant) {
+        self.session_grants.push(grant);
+    }
+
+    /// Revoke a session grant by id. Returns true if found and revoked.
+    pub fn revoke_session_grant(&mut self, grant_id: &str) -> bool {
+        let now = chrono::Utc::now();
+        for g in self.session_grants.iter_mut() {
+            if g.grant_id == grant_id {
+                g.revoke(now);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Active session grants count (for diagnostics).
+    pub fn active_session_grant_count(&self) -> usize {
+        let now = chrono::Utc::now();
+        self.session_grants.iter().filter(|g| g.is_active(now)).count()
     }
 
     /// Return lightweight info about a specific pending ticket (used by

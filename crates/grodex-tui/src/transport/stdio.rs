@@ -113,11 +113,12 @@ impl StdioClient {
     }
 
     pub fn send_acp_command(&mut self, c: &AcpCommand) -> Result<()> {
-        // ResolveApproval is a critical-path command: it unblocks the agent's
-        // permission gate. If we apply backpressure to it, the agent can get
-        // stuck waiting for approval while the TUI waits for the agent to
-        // drain — a classic deadlock. Exempt it from the inflight cap.
-        let is_approval = matches!(c, AcpCommand::ResolveApproval(_));
+        // ResolveApproval and ResolveIndeterminate are critical-path
+        // commands: they unblock the agent's permission gate / crash
+        // recovery flow. If we apply backpressure to them, the agent
+        // can get stuck waiting while the TUI waits for the agent to
+        // drain — a classic deadlock. Exempt them from the inflight cap.
+        let is_approval = matches!(c, AcpCommand::ResolveApproval(_) | AcpCommand::ResolveIndeterminate(_));
 
         if !is_approval {
             let mut retries = 0usize;

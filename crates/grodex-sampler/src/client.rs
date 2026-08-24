@@ -326,7 +326,7 @@ impl SamplingClient {
             }
             ContextItem::ReasoningSummary { content } => {
                 // Set reasoning_content FIELD for thinking-mode providers.
-                Some(serde_json::json!({"role": "assistant", "content": null, "reasoning_content": content}))
+                Some(serde_json::json!({"role": "assistant", "content": "", "reasoning_content": content}))
             }
             ContextItem::ImagePlaceholder { mime_type, artifact_ref } => {
                 Some(serde_json::json!({"role": "user", "content": format!("[Image: {mime_type}, ref: {artifact_ref}]")}))
@@ -430,7 +430,7 @@ impl SamplingClient {
                     if let Some(r) = pending_reasoning.take() {
                         messages.push(serde_json::json!({
                             "role": "assistant",
-                            "content": null,
+                            "content": "",
                             "reasoning_content": r,
                         }));
                     }

@@ -377,6 +377,7 @@ async fn run_subagent_turn(
         CanonicalModelRequest, InstructionBlock, InstructionRole, ToolChoice, ToolSpec,
     };
     use grodex_provider::canonical_event::CanonicalResponseItem;
+    use grodex_provider::prompt_snapshot::PromptSnapshot;
 
     /// Hard cap on sub-agent steps — keeps a runaway sub-agent bounded.
     const MAX_SUBAGENT_STEPS: usize = 15;
@@ -420,7 +421,7 @@ async fn run_subagent_turn(
             turn_id: TurnId::new(),
             step_id: StepId::new(),
             model_binding_id: binding.binding_id.clone(),
-            prompt_snapshot_hash: None,
+            prompt_snapshot_hash: Some(PromptSnapshot::capture(&context, &tool_specs).content_hash),
             instructions: vec![InstructionBlock {
                 role: InstructionRole::System,
                 content: "You are a sub-agent. Complete the task thoroughly. \

@@ -17,6 +17,48 @@ pub struct PendingApprovalRow {
     pub remaining_s: u32,
 }
 
+/// A tool call that was in-flight during a crash — its side-effect
+/// state is unknown and the user must adjudicate.
+#[derive(Clone)]
+pub struct PendingIndeterminateRow {
+    pub call_id: String,
+    pub tool_name: String,
+    pub message: String,
+}
+
+/// Three-option resolution for an Indeterminate tool call.
+/// The user inspects the real-world state and picks one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndeterminateOption {
+    Succeeded,
+    Failed,
+    Retry,
+}
+
+impl IndeterminateOption {
+    pub const ALL: [IndeterminateOption; 3] = [
+        IndeterminateOption::Succeeded,
+        IndeterminateOption::Failed,
+        IndeterminateOption::Retry,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            IndeterminateOption::Succeeded => "已完成",
+            IndeterminateOption::Failed => "失败",
+            IndeterminateOption::Retry => "重试",
+        }
+    }
+
+    pub fn desc(self) -> &'static str {
+        match self {
+            IndeterminateOption::Succeeded => "工具副作用已成功完成",
+            IndeterminateOption::Failed => "工具副作用失败或部分完成",
+            IndeterminateOption::Retry => "丢弃此次调用，模型将在下一轮重试",
+        }
+    }
+}
+
 /// Selectable approval decisions shown as a list (codex-style).
 /// The user navigates with j/k (or ↑/↓) and confirms with Enter —
 /// no letter-key shortcuts that would conflict with IME input.
@@ -568,6 +610,15 @@ pub struct TuiAppState {
     /// Chat-style messages for the main conversation view.
     pub messages: Vec<ChatMessage>,
     pub pending_approvals: Vec<PendingApprovalRow>,
+    /// Indeterminate tool calls discovered during crash recovery.
+    /// The user must inspect the real-world state and resolve each one
+    /// as Succeeded / Failed / Retry.
+    pub pending_indeterminates: Vec<PendingIndeterminateRow>,
+    /// Currently selected indeterminate row index.
+    pub selected_indeterminate_idx: usize,
+    /// Currently highlighted option within the indeterminate resolution
+    /// card (0=Succeeded, 1=Failed, 2=Retry).
+    pub indeterminate_option_idx: usize,
     pub input_mode: InputMode,
     /// Raw prompt text, may contain real '\n' newlines from Alt+Enter.
     /// Unlike the previous design, Enter alone does NOT insert here.
@@ -680,6 +731,9 @@ impl TuiAppState {
             events: Vec::new(),
             messages: Vec::new(),
             pending_approvals: Vec::new(),
+            pending_indeterminates: Vec::new(),
+            selected_indeterminate_idx: 0,
+            indeterminate_option_idx: 0,
             // Grok/codex 都没有“先按 i 才能聊天”的设计——默认就是 prompt-ready
             // 状态，避免启动后用户因“输入没反应”而困惑。Esc 才退出到
             // Normal（用于纯滚动/审批浏览）。
@@ -1217,6 +1271,19 @@ impl TuiAppState {
             });
         }
 
+        // Indeterminate tool calls from crash recovery — surface as a
+        // pending resolution card so the user can inspect and adjudicate.
+        if let SessionEvent::IndeterminateToolCall { call_id, tool_name, message } = &e {
+            self.pending_indeterminates.push(PendingIndeterminateRow {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                message: message.clone(),
+            });
+            self.push_log(format!(
+                "[崩溃恢复] 工具 `{tool_name}` (call_id={call_id}) 状态不确定，请检查后判定"
+            ));
+        }
+
         if let SessionEvent::SessionSnapshot { snapshot } = &e {
             self.session_id = Some(snapshot.session_id.to_string());
             self.capability_generation = snapshot.generation;
@@ -1647,6 +1714,18 @@ impl TuiAppState {
         }
         // Reset option selection for the next approval card.
         self.approval_option_idx = 0;
+    }
+
+    /// Remove a resolved indeterminate call from the pending list.
+    pub fn resolve_indeterminate(&mut self, call_id: &str) {
+        self.pending_indeterminates.retain(|r| r.call_id != call_id);
+        if self.selected_indeterminate_idx >= self.pending_indeterminates.len()
+            && !self.pending_indeterminates.is_empty()
+        {
+            self.selected_indeterminate_idx = self.pending_indeterminates.len() - 1;
+        }
+        // Reset option selection for the next indeterminate card.
+        self.indeterminate_option_idx = 0;
     }
 
     /// The currently-highlighted `ApprovalOption` for the selected approval.

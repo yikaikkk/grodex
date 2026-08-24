@@ -303,6 +303,16 @@ impl StreamingDecoder for ChatCompletionsDecoder {
                         name: pending.name_buffer.clone(),
                         arguments: args,
                     });
+                } else {
+                    // JSON parse failed — likely truncated by max_output_tokens.
+                    // Emit as a synthetic error item so the model knows to re-issue.
+                    items.push(CanonicalResponseItem::AssistantText {
+                        content: format!(
+                            "[output truncated: tool call '{}' had incomplete JSON arguments — \
+                             re-issue this tool call in full]",
+                            pending.name_buffer
+                        ),
+                    });
                 }
             }
         }

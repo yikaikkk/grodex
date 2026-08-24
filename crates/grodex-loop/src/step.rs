@@ -6,6 +6,7 @@ use grodex_core::tool::ToolRuntime;
 use grodex_permission::{PermissionManager, PermissionPolicy, PermissionResult};
 use grodex_provider::canonical_event::CanonicalResponseItem;
 use grodex_provider::canonical_request::{CanonicalModelRequest, ToolChoice};
+use grodex_provider::prompt_snapshot::PromptSnapshot;
 use grodex_provider::usage::SettledUsage;
 use grodex_sampler::SamplingActor;
 use std::collections::HashMap;
@@ -92,7 +93,7 @@ impl StepRunner {
                         turn_id: turn_ctx.turn_id,
                         step_id: StepId::new(),
                         model_binding_id: turn_ctx.model_binding.binding_id,
-                        prompt_snapshot_hash: None,
+                        prompt_snapshot_hash: Some(PromptSnapshot::capture(&[ContextItem::User { content: user_prompt.clone(), message_id: None }], &[]).content_hash),
                         instructions: vec![grodex_provider::canonical_request::InstructionBlock {
                             role: grodex_provider::canonical_request::InstructionRole::System,
                             content: sys_prompt,
@@ -259,7 +260,7 @@ impl StepRunner {
             turn_id: turn_ctx.turn_id,
             step_id,
             model_binding_id: turn_ctx.model_binding.binding_id,
-            prompt_snapshot_hash: None,
+            prompt_snapshot_hash: Some(PromptSnapshot::capture(context, &[]).content_hash),
             instructions: turn_ctx.instructions.clone(),
             context_items: context.to_vec(),
             tool_specs: Vec::new(),

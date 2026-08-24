@@ -16,8 +16,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::render::display_width;
-use super::state::{ApprovalOption, BUILTIN_SLASH_COMMANDS, CTRL_C_QUICK_WINDOW_MS, InputMode, SlashLocalKind, TuiAppState};
-use grodex_protocol::acp::ApprovalResolution;
+use super::state::{ApprovalOption, BUILTIN_SLASH_COMMANDS, CTRL_C_QUICK_WINDOW_MS, IndeterminateOption, InputMode, SlashLocalKind, TuiAppState};
+use grodex_protocol::acp::{ApprovalResolution, IndeterminateResolution};
 
 #[derive(Debug)]
 pub enum Dir {
@@ -31,6 +31,9 @@ pub enum TuiAction {
     SubmitPrompt { text: String },
     SubmitCommand { cmd: String },
     ResolveApproval { ticket_idx: usize, resolution: ApprovalResolution },
+    /// Resolve an Indeterminate tool call (crash recovery) with one of
+    /// three options: Succeeded / Failed / Retry.
+    ResolveIndeterminate { row_idx: usize, resolution: IndeterminateResolution },
     ScrollUp,
     ScrollDown,
     SwitchApprovalSelection(Dir),
@@ -266,6 +269,39 @@ fn handle_normal(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
                 None
             }
         }
+        // ── Indeterminate resolution (crash recovery) ────────────────
+        // s = Succeeded, f = Failed, r = Retry. Only active when there
+        // are pending indeterminate tool calls.
+        (KeyCode::Char('s'), _) => {
+            if !state.pending_indeterminates.is_empty() {
+                Some(TuiAction::ResolveIndeterminate {
+                    row_idx: state.selected_indeterminate_idx,
+                    resolution: IndeterminateResolution::Succeeded,
+                })
+            } else {
+                None
+            }
+        }
+        (KeyCode::Char('f'), _) => {
+            if !state.pending_indeterminates.is_empty() {
+                Some(TuiAction::ResolveIndeterminate {
+                    row_idx: state.selected_indeterminate_idx,
+                    resolution: IndeterminateResolution::Failed,
+                })
+            } else {
+                None
+            }
+        }
+        (KeyCode::Char('r'), _) => {
+            if !state.pending_indeterminates.is_empty() {
+                Some(TuiAction::ResolveIndeterminate {
+                    row_idx: state.selected_indeterminate_idx,
+                    resolution: IndeterminateResolution::Retry,
+                })
+            } else {
+                None
+            }
+        }
         (KeyCode::PageUp, _) => {
             state.scroll_up();
             Some(TuiAction::ScrollUp)
@@ -381,6 +417,44 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
                 };
                 return Some(TuiAction::ResolveApproval {
                     ticket_idx: state.selected_approval_idx,
+                    resolution: res,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // ── Indeterminate navigation layer (Prompt mode) ─────────────────
+    // Same pattern as approval navigation: ↑/↓ navigate the three
+    // resolution options (Succeeded/Failed/Retry), Enter confirms.
+    // Only active when there are pending indeterminates AND no approvals
+    // (approvals take priority since they block the agent).
+    if state.pending_approvals.is_empty()
+        && !state.pending_indeterminates.is_empty()
+        && key.modifiers == KeyModifiers::NONE
+    {
+        match key.code {
+            KeyCode::Up => {
+                if state.indeterminate_option_idx > 0 {
+                    state.indeterminate_option_idx -= 1;
+                }
+                return None;
+            }
+            KeyCode::Down => {
+                if state.indeterminate_option_idx < IndeterminateOption::ALL.len() - 1 {
+                    state.indeterminate_option_idx += 1;
+                }
+                return None;
+            }
+            KeyCode::Enter => {
+                let opt = IndeterminateOption::ALL[state.indeterminate_option_idx];
+                let res = match opt {
+                    IndeterminateOption::Succeeded => IndeterminateResolution::Succeeded,
+                    IndeterminateOption::Failed => IndeterminateResolution::Failed,
+                    IndeterminateOption::Retry => IndeterminateResolution::Retry,
+                };
+                return Some(TuiAction::ResolveIndeterminate {
+                    row_idx: state.selected_indeterminate_idx,
                     resolution: res,
                 });
             }

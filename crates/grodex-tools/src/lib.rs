@@ -1,11 +1,12 @@
 //! Grodex Tools — built-in tool implementations.
 //!
-//! Provides the four fundamental built-in tools:
+//! Provides the fundamental built-in tools:
 //!   - ReadFileTool: read files with line numbers
 //!   - WriteFileTool: create/overwrite files
 //!   - EditTool: exact string replacement in files
 //!   - ExecTool: run shell commands
 //!   - ProcessIoTool: interact with background processes (§11.2)
+//!   - ReadArtifactTool: retrieve offloaded large tool results (§12)
 //!
 //! V2 cross-tool primitives (§7–12 of Design Doc 15) live in `common`:
 //!   - `BuiltInTool` two-phase trait (prepare + execute), `PreparedCall`
@@ -25,6 +26,7 @@ pub mod fsutil;
 pub mod patch;
 pub mod process_io;
 pub mod read;
+pub mod read_artifact;
 pub mod registry;
 pub mod write;
 
@@ -44,5 +46,6 @@ pub use fsutil::{assert_within_root, canonicalize, FileVersion};
 pub use patch::ApplyPatchTool;
 pub use process_io::{ProcessIoTool, ProcessManager};
 pub use read::ReadFileTool;
+pub use read_artifact::ReadArtifactTool;
 pub use registry::ToolRegistry;
 pub use write::WriteFileTool;

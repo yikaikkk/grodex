@@ -54,6 +54,11 @@ pub struct SessionReducer {
     last_seq: u64,
     /// Active tool calls awaiting results.
     pending_tool_calls: HashMap<String, ContextItem>,
+    /// Tool calls that reached ToolExecutionFinished (content captured)
+    /// but whose ToolResultCommitted was never written. On finish(),
+    /// these get a synthetic ToolResult from the captured content
+    /// instead of the generic "[interrupted]" message.
+    finished_not_committed: HashMap<String, (String, bool)>,
     /// Resume mode: repair orphaned tool calls instead of hard-failing.
     ///
     /// A user interrupt aborts the turn task mid-tool-execution; the
@@ -74,6 +79,7 @@ impl SessionReducer {
             current_generation: StepGeneration::initial(),
             last_seq: 0,
             pending_tool_calls: HashMap::new(),
+            finished_not_committed: HashMap::new(),
             tolerant_orphans: false,
         }
     }
@@ -184,6 +190,18 @@ impl SessionReducer {
                     }
                 }
             }
+            RolloutEventType::ToolExecutionFinished => {
+                // Capture the content from ToolExecutionFinished so that
+                // if ToolResultCommitted never arrives (crash between the
+                // two writes), finish() can synthesize a ToolResult from
+                // the captured content rather than a generic "[interrupted]"
+                // placeholder. This is the "Finished-not-Committed" path.
+                if let Some(call_id_str) = event.payload.get("call_id").and_then(|v| v.as_str()) {
+                    let content = event.payload.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let is_error = event.payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    self.finished_not_committed.insert(call_id_str.to_string(), (content, is_error));
+                }
+            }
             RolloutEventType::ToolResultCommitted => {
                 if let (Some(call_id_str), Some(content)) = (
                     event.payload.get("call_id").and_then(|v| v.as_str()),
@@ -197,6 +215,9 @@ impl SessionReducer {
                     let call_id =
                         grodex_core::id::ToolCallId::from_string(call_id_str).unwrap_or_default();
                     self.pending_tool_calls.remove(call_id_str);
+                    // Finished-not-Committed is now fully committed — remove
+                    // from the interim map so finish() doesn't double-synthesize.
+                    self.finished_not_committed.remove(call_id_str);
                     self.context.push(ContextItem::ToolResult {
                         call_id,
                         content: content.to_string(),
@@ -344,26 +365,56 @@ impl SessionReducer {
 
     /// Synthesize error results for every pending tool call, inserted
     /// directly after each call so transcript order stays natural.
+    ///
+    /// Two tiers of recovery:
+    ///   1. **Finished-not-Committed**: the tool ran and the journal
+    ///      captured its output (ToolExecutionFinished has content), but
+    ///      ToolResultCommitted was never written. We synthesize from the
+    ///      captured content — the model sees the real output.
+    ///   2. **Dangling tool_call**: no Finished event either. The generic
+    ///      "[interrupted]" message is used — outcome genuinely unknown.
     fn heal_pending_orphans(&mut self) {
         if self.pending_tool_calls.is_empty() {
             return;
         }
+        let finished_count = self.pending_tool_calls.keys()
+            .filter(|k| self.finished_not_committed.contains_key(k.as_str()))
+            .count();
         tracing::warn!(
             orphaned = self.pending_tool_calls.len(),
+            finished_not_committed = finished_count,
             "reducer: healing orphaned tool calls left by an interrupted turn"
         );
         let mut rebuilt = Vec::with_capacity(self.context.len() + self.pending_tool_calls.len());
         for item in std::mem::take(&mut self.context) {
             if let ContextItem::ToolCall { call_id, name, .. } = &item {
                 if self.pending_tool_calls.remove(&call_id.to_string()).is_some() {
-                    let synthetic = ContextItem::ToolResult {
-                        call_id: *call_id,
-                        content: format!(
-                            "[interrupted] Tool call `{name}` was interrupted by the user \
-                             before its result was committed; the outcome is unknown. \
-                             Do not assume it completed — verify actual state if needed."
-                        ),
-                        is_error: true,
+                    // Check if we have a Finished-not-Committed capture.
+                    let synthetic = if let Some((content, is_error)) =
+                        self.finished_not_committed.remove(&call_id.to_string())
+                    {
+                        // Tier 1: real content from ToolExecutionFinished.
+                        tracing::info!(
+                            call_id = %call_id,
+                            content_len = content.len(),
+                            "reducer: synthesized ToolResult from ToolExecutionFinished capture"
+                        );
+                        ContextItem::ToolResult {
+                            call_id: *call_id,
+                            content,
+                            is_error,
+                        }
+                    } else {
+                        // Tier 2: no capture — generic interrupted message.
+                        ContextItem::ToolResult {
+                            call_id: *call_id,
+                            content: format!(
+                                "[interrupted] Tool call `{name}` was interrupted by the user \
+                                 before its result was committed; the outcome is unknown. \
+                                 Do not assume it completed — verify actual state if needed."
+                            ),
+                            is_error: true,
+                        }
                     };
                     rebuilt.push(item);
                     rebuilt.push(synthetic);
@@ -374,6 +425,7 @@ impl SessionReducer {
         }
         self.context = rebuilt;
         self.pending_tool_calls.clear();
+        self.finished_not_committed.clear();
     }
 
     /// Drop ToolResults whose call_id never appeared as a ToolCall in

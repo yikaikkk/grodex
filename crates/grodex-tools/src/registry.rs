@@ -5,6 +5,7 @@ use crate::exec::ExecTool;
 use crate::patch::ApplyPatchTool;
 use crate::process_io::{ProcessIoTool, ProcessManager};
 use crate::read::ReadFileTool;
+use crate::read_artifact::ReadArtifactTool;
 use crate::write::WriteFileTool;
 use grodex_core::tool::Tool;
 use grodex_core::tool::ToolMetadata;
@@ -32,6 +33,7 @@ impl ToolRegistry {
         registry.register(ExecTool::new().metadata());
         registry.register(ApplyPatchTool::new().metadata());
         registry.register(ProcessIoTool::new(process_manager).metadata());
+        registry.register(ReadArtifactTool::new().metadata());
 
         registry
     }
@@ -77,12 +79,13 @@ mod tests {
     #[test]
     fn builtin_registry_has_all_tools() {
         let registry = ToolRegistry::builtin();
-        assert_eq!(registry.len(), 6);
+        assert_eq!(registry.len(), 7);
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("write_file").is_some());
         assert!(registry.get("edit_file").is_some());
         assert!(registry.get("exec").is_some());
         assert!(registry.get("apply_patch").is_some(), "apply_patch must be in the builtin registry");
         assert!(registry.get("process_io").is_some(), "process_io must be in the builtin registry");
+        assert!(registry.get("read_artifact").is_some(), "read_artifact must be in the builtin registry");
     }
 }

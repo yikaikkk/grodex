@@ -28,8 +28,9 @@ use grodex_permission::{
     PermissionManager, PermissionPolicy, PermissionResult,
 };
 use grodex_subagent::delegation::DelegationEnvelope;
-use grodex_provider::canonical_event::CanonicalResponseItem;
+use grodex_provider::canonical_event::{CanonicalResponseItem, StopReason};
 use grodex_provider::canonical_request::{CanonicalModelRequest, ToolChoice};
+use grodex_provider::prompt_snapshot::PromptSnapshot;
 use grodex_sampler::{SamplingActor, StreamFragment};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -479,7 +480,7 @@ impl TurnCoordinator {
                 turn_id: turn_ctx.turn_id,
                 step_id,
                 model_binding_id: turn_ctx.model_binding.binding_id,
-                prompt_snapshot_hash: None,
+                prompt_snapshot_hash: Some(PromptSnapshot::capture(&context, &tool_specs).content_hash),
                 instructions: turn_ctx.instructions.clone(),
                 context_items: context.clone(),
                 tool_specs: tool_specs.clone(), // clone: may need for 413 retry
@@ -487,7 +488,7 @@ impl TurnCoordinator {
                 parallel_tool_calls: true,
                 reasoning_request: None,
                 response_format: None,
-                max_output_tokens: Some(4096),
+                max_output_tokens: Some(16384),
                 provider_state_in: None,
             };
 
@@ -593,6 +594,11 @@ impl TurnCoordinator {
                     }
 
                     if !has_tools {
+                        // Check if the model was truncated (hit max_output_tokens)
+                        // rather than voluntarily stopping. If so, inject a
+                        // continuation prompt and keep sampling instead of
+                        // ending the turn.
+                        let was_truncated = response.stop_reason == Some(StopReason::Length);
                         steps.push(StepResult {
                             step_id: StepId::new(),
                             response: Some(response.clone()),
@@ -601,6 +607,27 @@ impl TurnCoordinator {
                             tool_calls: Vec::new(),
                             elapsed_ms,
                         });
+                        if was_truncated {
+                            // The model's output was cut off mid-generation.
+                            // Push a nudge so the next sample can continue
+                            // where it left off.
+                            // NOTE: assistant_text was already pushed to
+                            // chat_state above (line ~534), so we only need
+                            // to add the continuation user message.
+                            tracing::info!(
+                                step_id = %step_id,
+                                "output truncated (StopReason::Length) — injecting continuation prompt"
+                            );
+                            self.chat_state.push_user_message(
+                                ContextItem::User {
+                                    content: "[System: Your previous response was truncated because it exceeded the output length limit. \
+                                     Continue exactly from where you left off. If you were in the middle of a tool call, \
+                                     re-issue the complete tool call now.]".into(),
+                                    message_id: None,
+                                }
+                            ).await;
+                            continue; // keep sampling
+                        }
                         finished = true;
                         break; // no tools → turn complete
                     }
@@ -944,7 +971,8 @@ impl TurnCoordinator {
                                         *content = format!(
                                             "工具结果过大（{orig_len} 字节），完整内容已保存到临时文件：{}\n\
                                              以下为前 2048 字节预览：\n{preview}\n\n\
-                                             [预览截断] 如需完整内容，请用 read_file 读取上述文件。",
+                                             [预览截断] 如需完整内容，请用 read_artifact 工具读取：path=\"{}\"",
+                                            path.display(),
                                             path.display()
                                         );
                                     }
@@ -1154,7 +1182,7 @@ impl TurnCoordinator {
                             turn_id: turn_ctx.turn_id,
                             step_id,
                             model_binding_id: turn_ctx.model_binding.binding_id,
-                            prompt_snapshot_hash: None,
+                            prompt_snapshot_hash: Some(PromptSnapshot::capture(&context, &tool_specs).content_hash),
                             instructions: turn_ctx.instructions.clone(),
                             context_items: context.clone(),
                             tool_specs: tool_specs.clone(),
@@ -1162,7 +1190,7 @@ impl TurnCoordinator {
                             parallel_tool_calls: true,
                             reasoning_request: None,
                             response_format: None,
-                            max_output_tokens: Some(4096),
+                            max_output_tokens: Some(16384),
                             provider_state_in: None,
                         };
                         let retry_outcome = match stream_tx {
@@ -1273,7 +1301,7 @@ impl TurnCoordinator {
                 turn_id: turn_ctx.turn_id,
                 step_id: StepId::new(),
                 model_binding_id: turn_ctx.model_binding.binding_id,
-                prompt_snapshot_hash: None,
+                prompt_snapshot_hash: Some(PromptSnapshot::capture(&wrap_context, &[]).content_hash),
                 instructions: turn_ctx.instructions.clone(),
                 context_items: wrap_context,
                 tool_specs: vec![],
@@ -1393,7 +1421,7 @@ impl TurnCoordinator {
                 turn_id: turn_ctx.turn_id,
                 step_id: StepId::new(),
                 model_binding_id: turn_ctx.model_binding.binding_id,
-                prompt_snapshot_hash: None,
+                prompt_snapshot_hash: Some(PromptSnapshot::capture(&[ContextItem::User { content: user.clone(), message_id: None }], &[]).content_hash),
                 instructions: vec![grodex_provider::canonical_request::InstructionBlock {
                     role: grodex_provider::canonical_request::InstructionRole::System,
                     content: sys,

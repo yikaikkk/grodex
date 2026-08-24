@@ -128,6 +128,8 @@ pub enum Command {
     Cancel(SessionCancel),
     ResolveApproval(ResolveApprovalCommand),
     ResumeSession(ResumeSessionCommand),
+    /// Resolve an Indeterminate tool call discovered during crash recovery.
+    ResolveIndeterminate(ResolveIndeterminateCommand),
 }
 
 /// The client's resolution of an approval ticket.
@@ -156,6 +158,35 @@ pub struct ResolveApprovalCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issued_by: Option<String>,
     pub issued_at_ms: u64,
+}
+
+/// Human adjudication for an Indeterminate tool call (protocol-level).
+///
+/// Mirrors `IndeterminateResolution` in `grodex-loop::command`, kept as a
+/// separate type to avoid a cross-crate dependency in the protocol layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndeterminateResolution {
+    /// The user confirmed the side effect completed successfully.
+    Succeeded,
+    /// The user confirmed the side effect failed or was partial.
+    Failed,
+    /// Discard the indeterminate call; the model will re-issue it.
+    Retry,
+}
+
+/// ResolveIndeterminate command — client resolves an indeterminate tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveIndeterminateCommand {
+    pub command_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    pub call_id: String,
+    pub resolution: IndeterminateResolution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 // ── Legacy approval types (kept for backward compat) ──────────────
@@ -385,6 +416,17 @@ pub enum UpdateContent {
     /// reconnection, or when the client requests a resync. Contains
     /// enough state for the UI to rebuild without replaying every event.
     SessionSnapshot { snapshot: SessionSnapshotPayload },
+
+    // ── Indeterminate tool call (crash recovery) ──────────────────
+    /// A tool call was in-flight when the session crashed. The side
+    /// effect state is unknown — the user must inspect the real-world
+    /// result and resolve as Succeeded, Failed, or Retry via
+    /// `Command::ResolveIndeterminate`.
+    IndeterminateToolCall {
+        call_id: String,
+        tool_name: String,
+        message: String,
+    },
 }
 
 // ── EventEnvelope (with ack_ref from B2) ─────────────────────────

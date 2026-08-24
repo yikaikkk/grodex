@@ -27,6 +27,12 @@ pub enum ToolCallFate {
     /// A previous recovery already marked this call `Indeterminate`
     /// and a human responded with a resolution. Replay-safe.
     Resolved,
+    /// ToolExecutionFinished was written (content captured) but
+    /// ToolResultCommitted was not. The tool ran to completion and its
+    /// output is recoverable from the Finished event's content field.
+    /// On resume, the reducer synthesizes a ToolResult from the
+    /// captured content — no human decision needed.
+    FinishedNotCommitted,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -179,6 +185,14 @@ pub fn recover_from_journal_with_metadata(
             RolloutEventType::ToolExecutionFinished => {
                 if let Some(c) = &cid {
                     cp.in_flight_call_ids.remove(c);
+                    // Finished but not yet Committed — mark as
+                    // FinishedNotCommitted. If a subsequent
+                    // ToolResultCommitted arrives, it will upgrade to
+                    // Completed. If not, the reducer can recover the
+                    // content from the Finished event's capture.
+                    if !matches!(cp.call_fate.get(c), Some(ToolCallFate::Completed)) {
+                        cp.call_fate.insert(c.clone(), ToolCallFate::FinishedNotCommitted);
+                    }
                 }
             }
             RolloutEventType::ToolResultCommitted => {

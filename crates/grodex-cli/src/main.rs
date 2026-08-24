@@ -25,8 +25,8 @@ use grodex_loop::reducer::SessionReducer;
 use grodex_loop::{Session, SessionCommand, SessionHandle, SessionSupervisor, TurnCoordinator};
 use grodex_prompt::{DiscoveryConfig, EnvironmentInfo, InstructionDiscovery, PromptBuilder};
 use grodex_protocol::acp::{
-    AckBucket, ApprovalResolution, Command as AcpCommand, EventEnvelope, ReplayMode,
-    SessionSnapshotPayload, UpdateContent,
+    AckBucket, ApprovalResolution, Command as AcpCommand, EventEnvelope, IndeterminateResolution,
+    ResolveIndeterminateCommand, ReplayMode, SessionSnapshotPayload, UpdateContent,
 };
 use grodex_protocol::{ClientFrame, ServerFrame};
 use grodex_rollout::store::{FileRolloutStore, RolloutStore};
@@ -499,11 +499,12 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
             Some(ServerFrame::Event(env))
         }
         LoopSessionEvent::IndeterminateToolCall { call_id, tool_name, message } => {
-            // Forward to frontend with full message so the user can make
-            // an informed decision about the indeterminate tool call.
-            let content = UpdateContent::ItemStarted {
-                item_id: call_id.clone(),
-                item_type: format!("indeterminate:{tool_name}"),
+            // Forward to frontend with the dedicated IndeterminateToolCall
+            // variant so the TUI can render a three-option resolution dialog.
+            let content = UpdateContent::IndeterminateToolCall {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                message: message.clone(),
             };
             let env = EventEnvelope::wrap(seq, session_id, content);
             // Also print to stderr for log visibility (ACP path).
@@ -527,6 +528,7 @@ async fn route_command(
         AcpCommand::Cancel(c) => Some(c.command_id.clone()),
         AcpCommand::ResolveApproval(r) => Some(r.command_id.clone()),
         AcpCommand::ResumeSession(r) => Some(r.command_id.clone()),
+        AcpCommand::ResolveIndeterminate(r) => Some(r.command_id.clone()),
     };
 
     if let Some(ref idem_key) = match &cmd {
@@ -534,6 +536,7 @@ async fn route_command(
         AcpCommand::Cancel(c) => c.idempotency_key.as_ref(),
         AcpCommand::ResolveApproval(r) => r.idempotency_key.as_ref(),
         AcpCommand::ResumeSession(r) => r.idempotency_key.as_ref(),
+        AcpCommand::ResolveIndeterminate(r) => r.idempotency_key.as_ref(),
     } {
         let now = Instant::now();
         if idem_cache.contains_with_ttl_reclaim(idem_key, now) {
@@ -939,6 +942,26 @@ async fn route_command(
             }
             rebind_session_id = Some(resume_sid);
             Ok(())
+        }
+        AcpCommand::ResolveIndeterminate(ri) => {
+            let resolution = match ri.resolution {
+                IndeterminateResolution::Succeeded => {
+                    grodex_loop::command::IndeterminateResolution::Succeeded
+                }
+                IndeterminateResolution::Failed => {
+                    grodex_loop::command::IndeterminateResolution::Failed
+                }
+                IndeterminateResolution::Retry => {
+                    grodex_loop::command::IndeterminateResolution::Retry
+                }
+            };
+            handle
+                .send(SessionCommand::ResolveIndeterminate {
+                    call_id: ri.call_id,
+                    resolution,
+                    content: ri.content,
+                })
+                .await
         }
     };
 

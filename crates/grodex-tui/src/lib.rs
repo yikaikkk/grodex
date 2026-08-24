@@ -13,8 +13,9 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use grodex_core::id::SessionId;
 use grodex_protocol::acp::{
-    ApprovalResolution, Command, EventEnvelope, ReplayCursor, ReplayMode, ResolveApprovalCommand,
-    ResumeSessionCommand, SessionCancel, SessionPrompt,
+    ApprovalResolution, Command, EventEnvelope, IndeterminateResolution, ReplayCursor, ReplayMode,
+    ResolveApprovalCommand, ResolveIndeterminateCommand, ResumeSessionCommand, SessionCancel,
+    SessionPrompt,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -897,6 +898,37 @@ impl GrodexTui {
                             TuiAction::ToggleMode(_) => {}
                             TuiAction::ToggleThinkingExpansion => {}
                             TuiAction::ToggleSubagentExpansion => {}
+                            TuiAction::ResolveIndeterminate {
+                                row_idx,
+                                resolution,
+                            } => {
+                                if let Some(row) = self
+                                    .state
+                                    .pending_indeterminates
+                                    .get(row_idx)
+                                    .cloned()
+                                {
+                                    let cmd = Command::ResolveIndeterminate(
+                                        ResolveIndeterminateCommand {
+                                            command_id: next_cmd_id(),
+                                            expected_generation: Some(
+                                                self.state.capability_generation,
+                                            ),
+                                            idempotency_key: None,
+                                            call_id: row.call_id.clone(),
+                                            resolution: resolution.clone(),
+                                            content: None,
+                                        },
+                                    );
+                                    if let Err(e) = self.transport.send_command(cmd) {
+                                        self.state.push_log(format!(
+                                            "发送 ResolveIndeterminate 失败: {e}"
+                                        ));
+                                    } else {
+                                        self.state.resolve_indeterminate(&row.call_id);
+                                    }
+                                }
+                            }
                             TuiAction::CopyLastAssistant => {
                                 // Walk messages in reverse and grab the
                                 // most-recent Assistant text. If the
