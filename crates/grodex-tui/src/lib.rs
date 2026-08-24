@@ -94,6 +94,54 @@ fn install_panic_hook() {
     }));
 }
 
+/// Flag set by SIGINT/SIGTERM handler; event loop polls it and breaks.
+static SHOULD_QUIT: AtomicBool = AtomicBool::new(false);
+
+/// Install SIGINT/SIGTERM handler so terminal is restored even when the
+/// process is killed by a signal (default handler skips all Drop guards).
+///
+/// Without this, Ctrl+C leaves the terminal in raw mode + alternate
+/// screen, and VSCode's integrated terminal can fail with
+/// `posix_openpt failed: Device not configured`.
+///
+/// Uses a background thread with a dedicated tokio runtime to catch
+/// signals safely (no unsafe FFI needed). On signal: reset terminal →
+/// set flag → event loop detects flag and breaks → RAII guards run.
+fn install_signal_handler() {
+    std::thread::spawn(|| {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(_) => return,
+        };
+        rt.block_on(async {
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            let term = async {
+                use tokio::signal::unix::{signal, SignalKind};
+                if let Ok(mut s) = signal(SignalKind::terminate()) {
+                    s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            #[cfg(not(unix))]
+            let term = std::future::pending::<()>();
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = term => {}
+            }
+        });
+        // 信号到达：先复位终端，再设置退出标志。
+        if TERMINAL_OWNED.load(Ordering::Acquire) {
+            hard_terminal_reset();
+        }
+        SHOULD_QUIT.store(true, Ordering::Release);
+    });
+}
+
 use ui::event_handler::{handle_key, TuiAction};
 use ui::state::SlashLocalKind;
 use ui::layout::{approvals_desired_rows, build_layout, prompt_desired_rows, turn_status_desired_rows};
@@ -191,6 +239,7 @@ impl GrodexTui {
 
     pub fn run_blocking(mut self) -> Result<()> {
         install_panic_hook();
+        install_signal_handler();
         enable_raw_mode().context("enable_raw_mode 失败")?;
         let _raw_guard = RawModeGuard;
         // 参考 grok：终端控制命令全部写入 stderr 而非 stdout。
@@ -687,6 +736,10 @@ impl GrodexTui {
             } else {
                 // 参考 grok event_loop.rs:1472-1517：poll/read 错误不能直接 ? 退出，
                 // 否则 VTE 终端 / macOS Terminal.app 鼠标滚轮产生的序列被 crossterm
+                // 信号处理：SIGINT/SIGTERM 会设置 SHOULD_QUIT 并已复位终端。
+                if SHOULD_QUIT.load(Ordering::Acquire) {
+                    break;
+                }
                 // 解析失败时，? 会传播错误导致整个 TUI 直接关闭。
                 // grok 的做法是跳过错误继续，只在连续 50 次错误后才放弃。
                 let poll_ok = event::poll(Duration::from_millis(poll_ms)).unwrap_or(false);

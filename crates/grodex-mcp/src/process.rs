@@ -48,7 +48,10 @@ impl McpProcess {
         cmd.args(&config.args);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::inherit());
+        // stderr 不继承 TTY：如果 MCP server 持有 TTY fd 且主进程
+        // 异常退出（信号/崩溃），子进程会变成孤儿继续持有 TTY fd，
+        // 导致终端无法释放。piped 后丢弃即可，MCP server 日志不重要。
+        cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
         for (key, value) in &config.env {
@@ -141,7 +144,19 @@ impl McpProcess {
 
 impl Drop for McpProcess {
     fn drop(&mut self) {
-        // Child is kill_on_drop, so it will be terminated.
+        // stderr 已改为 piped，子进程不再持有 TTY fd。
+        // kill_on_drop(true) 会在 Child drop 时发送 SIGKILL。
+        // 这里额外尝试 start_kill + 阻塞 wait 确保子进程退出，
+        // 防止僵尸进程残留（tokio 的 kill_on_drop 不保证 wait）。
+        let _ = self.child.start_kill();
+        // 阻塞等待退出（Drop 中不能 await，用 try_wait 轮询）
+        for _ in 0..100 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
     }
 }
 
