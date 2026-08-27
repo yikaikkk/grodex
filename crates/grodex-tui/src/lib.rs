@@ -29,8 +29,11 @@ static TERMINAL_OWNED: AtomicBool = AtomicBool::new(false);
 /// 兜底的终端复位序列（inline viewport 模式，不离开 alt screen）：
 ///   CSI ? 25 h    显示光标
 ///   CSI ? 2004 l  退出 bracketed paste
+///   CSI ? 1006 l  关闭 SGR 鼠标上报
+///   CSI ? 1000 l  关闭基础鼠标上报
+///   CSI ? 1007 l  关闭 alternate scroll
 ///   CSI r         重置 scroll region
-const TERMINAL_RESET_ESCAPE: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[r";
+const TERMINAL_RESET_ESCAPE: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[?1007l\x1b[r";
 
 /// 启动时发送：确保所有鼠标上报模式都关闭，防止上一个程序残留。
 const DISABLE_ALL_MOUSE: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
@@ -169,11 +172,8 @@ pub struct GrodexTui {
     queued_dispatch: bool,
     mouse_capture: bool,
     // ── Inline viewport 状态（对齐 codex：normal screen 渲染）──
-    /// Viewport 的 y 偏移量（viewport 起始行）。
-    /// 已完成的消息通过 ANSI scroll region 写入此行之上的真实 scrollback。
+    /// Viewport 的 y 偏移量（viewport 起始行）。0 = 全屏。
     viewport_y: u16,
-    /// 已插入 scrollback 的消息数量（避免重复插入）。
-    finalized_count: usize,
     /// 上一次实际执行 draw() 的时间（帧率节流，防光标高频闪烁）。
     last_frame_at: std::time::Instant,
 }
@@ -226,7 +226,6 @@ impl GrodexTui {
             queued_dispatch: false,
             mouse_capture: false,
             viewport_y: 0,
-            finalized_count: 0,
             // 倒推 1 秒，保证首帧无需等待节流窗口即可立即绘制。
             last_frame_at: std::time::Instant::now() - Duration::from_secs(1),
         })
@@ -247,26 +246,17 @@ impl GrodexTui {
         let _ = io::Write::flush(&mut stderr);
 
         // ── Inline viewport 启动（对齐 codex：normal screen 渲染，不进入 alternate screen）──
-        // 1. 探测当前光标位置 → 作为 viewport 起始行。
-        //    这样 shell 提示符 / 之前的输出留在真实 scrollback，viewport 从当前行开始。
-        let (_cursor_x, cursor_y) = self.terminal.backend_mut().probe_cursor_position();
-        // 直接从 crossterm 获取全屏尺寸（不经过 InlineBackend 的 y_offset 裁剪）。
+        // viewport 从屏幕顶行 (y=0) 开始，占满整个屏幕。
+        // 对话历史通过内部 scroll_conversation 偏移量滚动（Paragraph skip），
+        // 鼠标滚轮在所有终端上均被捕获以驱动滚动。
         let (_screen_w, screen_height) = crossterm::terminal::size().unwrap_or((80, 24));
-        // 2. 确保底部有足够空间放 viewport（至少需要若干行放 prompt/状态）。
-        let min_viewport_rows: u16 = 8;
-        let viewport_y = ui::inline_viewport::ensure_viewport_space(
-            &mut stderr,
-            cursor_y,
-            screen_height,
-            min_viewport_rows,
-        )
-        .context("inline viewport 空间不足")?;
+        let viewport_y: u16 = 0;
         self.viewport_y = viewport_y;
         self.terminal.backend_mut().set_y_offset(viewport_y);
-        // 3. 清除 viewport 区域的残留内容，避免首帧叠加。
+        // 清除整个屏幕区域的残留内容，避免首帧叠加。
         ui::inline_viewport::clear_viewport_area(&mut stderr, viewport_y, screen_height)
             .context("清除 viewport 区域失败")?;
-        // 4. 把光标移到 viewport 左上角，准备首帧渲染。
+        // 把光标移到 viewport 左上角，准备首帧渲染。
         let _ = crossterm::execute!(stderr, crossterm::cursor::MoveTo(0, viewport_y));
 
         // 再次关闭所有鼠标上报模式（部分终端在 scroll region 变化后会恢复默认）。
@@ -279,17 +269,16 @@ impl GrodexTui {
         // scrollback——这正是 inline viewport 想要的查看历史行为。
         let _ = io::Write::write_all(&mut stderr, ENABLE_ALT_SCROLL);
         let _ = io::Write::flush(&mut stderr);
-        // macOS 自带 Terminal.app 不实现 DECSET 1007：滚轮不会被翻译成方向键，
-        // 反而会滚动终端自己的回滚缓冲。只有在这个终端里才开启最小鼠标上报
-        //（只消费滚轮、忽略点击），其他终端保持零捕获，原生选择不受影响。
-        // 前提：Terminal.app 菜单 "显示 > 允许鼠标报告" 处于勾选状态（默认勾选）。
-        let is_apple_terminal =
-            std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal");
-        if is_apple_terminal {
-            let _ = io::Write::write_all(&mut stderr, ENABLE_MOUSE_CAPTURE);
-            let _ = io::Write::flush(&mut stderr);
-            self.mouse_capture = true;
-        }
+        // DECSET 1007 在 normal screen（inline viewport 模式）上部分终端不生效
+        // （Terminal.app、VSCode 内置终端等），滚轮会直接滚动终端 scrollback 而
+        // 不会翻译成方向键——但 viewport 内的对话内容不在 scrollback 里，用户无法
+        // 通过终端原生滚动查看。因此在所有终端都启用最小鼠标上报（SGR 1006 +
+        // 基础 1000），只消费 ScrollUp/ScrollDown 事件、忽略点击/拖拽，让滚轮
+        // 在所有终端上都能滚动对话。代价是拖拽文本选择不可用，但对话内容已通
+        // 过 scrollback 推入机制保留在终端原生 scrollback 中，用户仍可滚动查看。
+        let _ = io::Write::write_all(&mut stderr, ENABLE_MOUSE_CAPTURE);
+        let _ = io::Write::flush(&mut stderr);
+        self.mouse_capture = true;
         // 开启 bracketed paste：用户在输入框 Ctrl-V/Cmd-V 粘贴时，终端会
         // 发送 `CrosstermEvent::Paste(String)`，我们把它追加到输入框光标
         // 位置，而不是把一大段原始 CSI 文本塞进 input_buffer。
