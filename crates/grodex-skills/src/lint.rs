@@ -134,43 +134,44 @@ pub fn lint_skill(skill: &Skill) -> LintReport {
         });
     }
 
-    // 3. triggers/keywords exist (heuristically in body — the Skill struct has
-    //    no dedicated triggers field, so scan for a Triggers / When-to-Use /
-    //    Keywords heading).
-    if !has_trigger_section(&skill.content) {
-        findings.push(LintFinding {
-            severity: LintSeverity::Warning,
-            code: LintCode::MissingTriggers,
-            message: "No trigger keywords section found; add '## Triggers' or '## When to Use' for better discoverability".into(),
-        });
-    }
+    // 3-5. Body checks (progressive disclosure: skip when content is None
+    //      = not loaded at discover time. If content is Some(""), body is
+    //      explicitly empty → report error).
+    if let Some(content_str) = skill.content.as_deref() {
+        if !has_trigger_section(content_str) {
+            findings.push(LintFinding {
+                severity: LintSeverity::Warning,
+                code: LintCode::MissingTriggers,
+                message: "No trigger keywords section found; add '## Triggers' or '## When to Use' for better discoverability".into(),
+            });
+        }
 
-    // 4. body non-empty, >= 50 chars
-    if skill.content.is_empty() {
-        findings.push(LintFinding {
-            severity: LintSeverity::Error,
-            code: LintCode::EmptyBody,
-            message: "Skill body content is empty".into(),
-        });
-    } else if skill.content.len() < 50 {
-        findings.push(LintFinding {
-            severity: LintSeverity::Warning,
-            code: LintCode::BodyTooShort,
-            message: format!(
-                "Skill body too short ({} chars < 50)",
-                skill.content.len()
-            ),
-        });
-    }
+        // 4. body non-empty, >= 50 chars
+        if content_str.is_empty() {
+            findings.push(LintFinding {
+                severity: LintSeverity::Error,
+                code: LintCode::EmptyBody,
+                message: "Skill body content is empty".into(),
+            });
+        } else if content_str.len() < 50 {
+            findings.push(LintFinding {
+                severity: LintSeverity::Warning,
+                code: LintCode::BodyTooShort,
+                message: format!(
+                    "Skill body too short ({} chars < 50)",
+                    content_str.len()
+                ),
+            });
+        }
 
-    // 5. examples present (Info level — the Skill struct has no examples
-    //    field, so scan for a code block or an Example heading).
-    if !has_examples(&skill.content) {
-        findings.push(LintFinding {
-            severity: LintSeverity::Info,
-            code: LintCode::MissingExamples,
-            message: "No examples found; consider adding '## Examples' or a code block for clarity".into(),
-        });
+        // 5. examples present (Info level)
+        if !has_examples(content_str) {
+            findings.push(LintFinding {
+                severity: LintSeverity::Info,
+                code: LintCode::MissingExamples,
+                message: "No examples found; consider adding '## Examples' or a code block for clarity".into(),
+            });
+        }
     }
 
     LintReport {
@@ -257,7 +258,7 @@ mod tests {
         Skill {
             name: name.into(),
             description: description.into(),
-            content: content.into(),
+            content: Some(content.into()),
             source: SkillSource::Project,
             path: PathBuf::from("test.md"),
             content_hash: None,

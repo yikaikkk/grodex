@@ -36,7 +36,7 @@ pub struct SkillSnapshot {
     pub source: SkillSource,
     pub path: PathBuf,
     pub content_hash: String,
-    pub content: String,
+    pub content: Option<String>,
     /// Whether the skill was trusted at snapshot time (R14-6c).
     pub trusted: bool,
 }
@@ -79,13 +79,26 @@ impl SkillCatalog {
     }
 
     /// Read the full content of a skill by name.
-    /// Returns None if the skill is not found or content is not loaded.
-    /// This is separate from `list()` to support lazy loading (R14-6d).
+    /// If content is not loaded in memory, returns None (progressive
+    /// disclosure). Use `load_skill_content(name)` to load on demand.
     pub fn read_content(&self, name: &str) -> Option<&str> {
         self.skills
             .iter()
             .find(|s| s.name == name)
-            .map(|s| s.content.as_str())
+            .and_then(|s| s.content.as_ref().map(|c| c.as_str()))
+    }
+
+    /// Load a skill's content from disk on demand (progressive disclosure).
+    /// Returns the content as `&str` after loading, or `None` if the skill
+    /// is not found or loading failed.
+    pub fn load_skill_content(&mut self, name: &str) -> Option<&str> {
+        let idx = self.skills.iter().position(|s| s.name == name)?;
+        if self.skills[idx].content.is_none() {
+            if self.skills[idx].load_content().is_err() {
+                return None;
+            }
+        }
+        self.skills[idx].content.as_ref().map(|c| c.as_str())
     }
 
     /// List skill summaries (name + description + source) without loading content.
@@ -98,7 +111,7 @@ impl SkillCatalog {
                 description: s.description.clone(),
                 source: s.source.clone(),
                 trusted: s.trusted,
-                content_loaded: !s.content.is_empty(),
+                content_loaded: s.content.is_some(),
             })
             .collect()
     }
@@ -118,42 +131,43 @@ impl SkillCatalog {
         self.skills.is_empty()
     }
 
-    /// Format all skills as a compact prompt listing.
+    /// Format skills as a compact **summary listing** for the system prompt
+    /// (progressive disclosure). Only name + description + source + trusted
+    /// are listed — full content is NOT injected. The model can use the
+    /// `read_file` tool to read a skill's full content on-demand when it
+    /// actually needs the skill's detailed instructions.
     ///
-    /// Trusted skills include the full content so the model can follow
-    /// the instructions (Design Doc 08 §6: "正文加载"). Untrusted skills
-    /// (R14-6c: Project skills in an untrusted workspace) show name and
-    /// description only — the model is told the content is withheld.
+    /// Untrusted skills (R14-6c: Project skills in an untrusted workspace)
+    /// are marked as such; the model is told the content is withheld.
     pub fn format_for_prompt(&self) -> String {
         if self.skills.is_empty() {
             return String::new();
         }
 
         let mut out = String::from("## Available Skills\n\n");
+        out.push_str("| Name | Description | Source | Trusted |\n");
+        out.push_str("|------|-------------|--------|---------|\n");
         for skill in &self.skills {
-            if skill.trusted {
-                out.push_str(&format!(
-                    "### {}\n**Description**: {}\n\n{}\n\n",
-                    skill.name, skill.description, skill.content
-                ));
-            } else {
-                // R14-6c: untrusted skill — withhold content, show metadata only.
-                out.push_str(&format!(
-                    "### {} (untrusted)\n**Description**: {}\n\n\
-                     *Content withheld — workspace is not trusted. Run with `--trusted` \
-                     to enable this skill's full instructions.*\n\n",
-                    skill.name, skill.description
-                ));
-            }
+            let trust_tag = if skill.trusted { "yes" } else { "no" };
+            out.push_str(&format!(
+                "| {} | {} | {:?} | {} |\n",
+                skill.name, skill.description, skill.source, trust_tag
+            ));
         }
+        out.push_str("\n*Skill content is loaded on-demand. Use the `read_file` tool \
+            with the skill's path to read its full instructions when needed.*\n\n");
         out
     }
 
     /// Get the full content of all skills suitable for injection into the system prompt.
+    /// Only call this when explicit full injection is needed (most code paths
+    /// should use `format_for_prompt` for progressive disclosure).
     pub fn format_all_content(&self) -> String {
         let mut out = String::new();
         for skill in &self.skills {
-            out.push_str(&format!("## Skill: {}\n{}\n\n", skill.name, skill.content));
+            if let Some(ref content) = skill.content {
+                out.push_str(&format!("## Skill: {}\n{}\n\n", skill.name, content));
+            }
         }
         out
     }
@@ -265,7 +279,8 @@ mod tests {
 
         let deploy = catalog.find("deploy").expect("deploy skill not found");
         assert_eq!(deploy.description, "Deploy the app");
-        assert!(deploy.content.contains("Run `deploy.sh`"));
+        // 渐进式披露：discover 不加载正文，content 应为 None
+        assert!(deploy.content.is_none());
         assert!(deploy
             .path
             .file_name()
@@ -274,7 +289,7 @@ mod tests {
 
         let test = catalog.find("test").expect("test skill not found");
         assert_eq!(test.description, "Test Skill");
-        assert!(test.content.contains("cargo test"));
+        assert!(test.content.is_none());
 
         let prompt = catalog.format_for_prompt();
         assert!(prompt.contains("deploy"));

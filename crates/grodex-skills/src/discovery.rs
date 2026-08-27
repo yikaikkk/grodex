@@ -53,9 +53,30 @@ impl SkillDiscovery {
                     && path.extension().is_some_and(|e| e == "md")
                 {
                     // Case 2: <skills>/<name>.md  — legacy single-file skill (back-compat)
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        let skill = Skill::from_markdown(path.clone(), source, &content, trusted);
-                        skills.push(skill);
+                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                        let (fm_name, fm_desc, body) = Skill::parse_frontmatter_static(&raw);
+                        let name = fm_name.unwrap_or_else(|| {
+                            path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("unknown")
+                                .to_string()
+                        });
+                        let description = fm_desc.unwrap_or_else(|| {
+                            body.lines()
+                                .find(|l| l.starts_with('#'))
+                                .map(|l| l.trim_start_matches('#').trim().to_string())
+                                .unwrap_or_else(|| "A Grodex skill".to_string())
+                        });
+                        let hash = format!("{:x}", sha2::Sha256::digest(raw.as_bytes()));
+                        skills.push(Skill {
+                            name,
+                            description,
+                            content: None, // 渐进式披露：正文不加载
+                            source,
+                            path: path.clone(),
+                            content_hash: Some(hash),
+                            trusted,
+                        });
                     }
                 }
             }
@@ -65,19 +86,25 @@ impl SkillDiscovery {
         skills
     }
 
-    /// Load a directory-based skill.
+    /// Load a directory-based skill's **metadata only** (progressive
+    /// disclosure: content is NOT loaded at discovery time).
     ///
     /// Tries `SKILL.md` first, then `README.md`. Filename stem is overridden
     /// by the enclosing directory name so `my-skill/SKILL.md` produces a skill
     /// named `my-skill` (consistent with the directory layout).
+    ///
+    /// Reads the file only to parse frontmatter (name/description) and
+    /// compute the content hash. The body is discarded — `content` is
+    /// set to `None`. Call `Skill::load_content()` to load the body
+    /// on-demand when the model actually needs the skill's instructions.
     fn load_skill_from_dir(skill_dir: &Path, source: SkillSource, trusted: bool) -> Option<Skill> {
         let candidates: [&str; 2] = ["SKILL.md", "README.md"];
 
         for candidate in &candidates {
             let md_path = skill_dir.join(candidate);
             if md_path.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&md_path) {
-                    let (fm_name, fm_desc, body) = Skill::parse_frontmatter_static(&content);
+                if let Ok(raw) = std::fs::read_to_string(&md_path) {
+                    let (fm_name, fm_desc, body) = Skill::parse_frontmatter_static(&raw);
                     let name = fm_name.unwrap_or_else(|| {
                         skill_dir
                             .file_name()
@@ -91,11 +118,11 @@ impl SkillDiscovery {
                             .map(|l| l.trim_start_matches('#').trim().to_string())
                             .unwrap_or_else(|| "A Grodex skill".to_string())
                     });
-                    let hash = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+                    let hash = format!("{:x}", sha2::Sha256::digest(raw.as_bytes()));
                     return Some(Skill {
                         name,
                         description,
-                        content: body.to_string(),
+                        content: None, // 渐进式披露：正文不加载
                         source,
                         path: md_path,
                         content_hash: Some(hash),

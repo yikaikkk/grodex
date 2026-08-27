@@ -24,9 +24,10 @@ pub struct Skill {
     pub name: String,
     /// Short description for listing (from frontmatter or first heading).
     pub description: String,
-    /// Full skill content (markdown body). Empty when content has been
-    /// unloaded for on-demand loading (R14-6d); reload via `load_content`.
-    pub content: String,
+    /// Full skill content (markdown body). `None` = not loaded (progressive
+    /// disclosure: only metadata is loaded at discovery time; content is
+    /// loaded on-demand when the model requests it via `load_content`).
+    pub content: Option<String>,
     /// Where this skill was discovered.
     pub source: SkillSource,
     /// Filesystem path to the skill file.
@@ -74,7 +75,7 @@ impl Skill {
         Self {
             name,
             description,
-            content: content.to_string(),
+            content: Some(content.to_string()),
             source,
             path,
             content_hash: Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes()))),
@@ -82,22 +83,27 @@ impl Skill {
         }
     }
 
-    /// Reload skill content from disk (R14-6d: on-demand loading).
-    /// Reads the file at `self.path` and repopulates `content` and
-    /// `content_hash`. Returns `Err` if the file cannot be read.
+    /// Reload skill content from disk (progressive disclosure: on-demand
+    /// loading). Reads the file at `self.path` and repopulates `content`
+    /// and `content_hash`. Returns `Err` if the file cannot be read.
     pub fn load_content(&mut self) -> std::io::Result<()> {
         let raw = std::fs::read_to_string(&self.path)?;
         let (_, _, content) = Self::parse_frontmatter(&raw);
-        self.content = content.to_string();
+        self.content = Some(content.to_string());
         self.content_hash = Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes())));
         Ok(())
     }
 
-    /// Unload skill content to free memory (R14-6d: on-demand loading).
+    /// Unload skill content to free memory (progressive disclosure).
     /// The content hash is preserved so change detection still works.
     /// Call `load_content` to reload when the skill is needed again.
     pub fn unload_content(&mut self) {
-        self.content.clear();
+        self.content = None;
+    }
+
+    /// Whether this skill's content is currently loaded in memory.
+    pub fn is_content_loaded(&self) -> bool {
+        self.content.is_some()
     }
 
     /// Parse YAML frontmatter from markdown.
@@ -143,8 +149,8 @@ mod tests {
         let skill = Skill::from_markdown(PathBuf::from("test.md"), SkillSource::Project, raw, true);
         assert_eq!(skill.name, "test-skill");
         assert_eq!(skill.description, "A test");
-        assert!(skill.content.contains("# Hello"));
-        assert!(!skill.content.contains("---"));
+        assert!(skill.content.as_ref().unwrap().contains("# Hello"));
+        assert!(!skill.content.as_ref().unwrap().contains("---"));
         assert!(skill.trusted);
     }
 

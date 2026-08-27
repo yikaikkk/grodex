@@ -1059,35 +1059,32 @@ impl SessionSupervisor {
 
         // Build system instructions via PromptBuilder + Memory + Discovery.
         //
-        // Skill discovery + change detection (Design Doc 08 §6):
-        //   - Re-discover skills every Turn (cheap filesystem walk)
-        //   - Compare content_hash against previous Turn's snapshot
-        //   - If changed, bump skill_generation so the model sees updates
-        //   - Freeze a Turn-level snapshot (immutable mid-Turn)
-        //   - Write SkillSnapshotRecorded to journal for version auditing
-        let new_catalog = SkillCatalog::discover(&self.cwd, self.workspace_trusted);
-        if let Some(prev) = &self.prev_skill_snapshot {
-            if new_catalog.has_changed_since(prev) {
-                self.skill_generation = self.skill_generation.wrapping_add(1);
+        // Skill management (progressive disclosure, like Tool registration):
+        //   - SkillCatalog is discovered ONCE at session start (in `new()`)
+        //   - Per-Turn: just reuse the registered catalog (no disk re-scan)
+        //   - Only skill metadata (name + description + hash) is in memory
+        //   - Content is loaded on-demand when the model reads the file
+        //   - Snapshot is written to journal once for version auditing
+        if self.skill_catalog.is_none() {
+            let catalog = SkillCatalog::discover(&self.cwd, self.workspace_trusted);
+            let snapshot = catalog.snapshot();
+            if let Some(ref writer) = self.writer {
+                let skills_json: Vec<serde_json::Value> = snapshot.iter().map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "source": format!("{:?}", s.source),
+                        "path": s.path.to_string_lossy(),
+                        "content_hash": s.content_hash,
+                        "trusted": s.trusted,
+                    })
+                }).collect();
+                let _ = writer
+                    .write_skill_snapshot(turn_id, &skills_json, self.skill_generation)
+                    .await;
             }
+            self.prev_skill_snapshot = Some(snapshot);
+            self.skill_catalog = Some(catalog);
         }
-        let snapshot = new_catalog.snapshot();
-        if let Some(ref writer) = self.writer {
-            let skills_json: Vec<serde_json::Value> = snapshot.iter().map(|s| {
-                serde_json::json!({
-                    "name": s.name,
-                    "source": format!("{:?}", s.source),
-                    "path": s.path.to_string_lossy(),
-                    "content_hash": s.content_hash,
-                    "trusted": s.trusted,
-                })
-            }).collect();
-            let _ = writer
-                .write_skill_snapshot(turn_id, &skills_json, self.skill_generation)
-                .await;
-        }
-        self.prev_skill_snapshot = Some(snapshot);
-        self.skill_catalog = Some(new_catalog);
         if self.cached_discovered_nodes.is_none() {
             let mut tmp = grodex_prompt::PromptBuilder::new()
                 .with_discovery_config(self.discovery_config.clone());
