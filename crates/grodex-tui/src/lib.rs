@@ -31,8 +31,9 @@ static TERMINAL_OWNED: AtomicBool = AtomicBool::new(false);
 ///   CSI ? 1006 l  关闭 SGR 鼠标上报
 ///   CSI ? 1000 l  关闭基础鼠标上报
 ///   CSI ? 1007 l  关闭 alternate scroll
+///   CSI ? 1049 l  退出 alternate screen
 ///   CSI r         重置 scroll region
-const TERMINAL_RESET_ESCAPE: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[?1007l\x1b[r";
+const TERMINAL_RESET_ESCAPE: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[?1007l\x1b[?1049l\x1b[r";
 
 /// 启动时发送：确保所有鼠标上报模式都关闭，防止上一个程序残留。
 const DISABLE_ALL_MOUSE: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
@@ -52,15 +53,9 @@ const ARROW_BURST_CONTINUE: Duration = Duration::from_millis(700);
 const ARROW_GESTURE_MAX_DUR: Duration = Duration::from_secs(3);
 
 /// 帧率节流：限制 draw() 的最高频率，防止高频事件造成“每个事件一次
-/// draw + set_cursor”的终端硬光标闪烁。8ms ≈ 120fps：对齐 VS Code 在
+/// draw + set_cursor"的终端硬光标闪烁。8ms ≈ 120fps：对齐 VS Code 在
 /// ProMotion 屏上的滚动帧率；事件到达超过上限时自动合批到下一帧。
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
-
-/// DECSET 1007 (Alternate Scroll Mode)：把滚轮翻译成 ↑/↓ 方向键。
-/// 对齐 codex：不捕获鼠标，终端原生的文本选择（拖拽选中 + 右键复制）始终可用。
-/// 注意：该模式在部分终端只对 alternate screen 生效；在 normal screen 上，
-/// 滚轮会原生滚动 scrollback（这正是 inline viewport 想要的行为——查看历史）。
-const ENABLE_ALT_SCROLL: &[u8] = b"\x1b[?1007h";
 
 fn hard_terminal_reset() {
     // 不用 crossterm Command：panic context 里不能分配/unwrap。
@@ -232,6 +227,13 @@ impl GrodexTui {
         // 输出（session 列表等）完成之后。Viewport::Inline 捕获当前光标位置
         // 作为 viewport 底部锚点，向上延伸 desired_height 行。
         let (_screen_w, screen_height) = crossterm::terminal::size().unwrap_or((80, 24));
+        // 先将光标移动到屏幕底部，确保 viewport 从底部开始向上延伸。
+        // 这样 viewport 才能正确占据整个屏幕，scrollback 内容在 viewport 上方。
+        let _ = crossterm::execute!(
+            stderr,
+            crossterm::cursor::MoveTo(0, screen_height.saturating_sub(1))
+        );
+        let _ = io::Write::flush(&mut stderr);
         let crossterm_backend = CrosstermBackend::new(io::stderr());
         let terminal = Terminal::with_options(
             crossterm_backend,
@@ -255,12 +257,11 @@ impl GrodexTui {
         // 再次关闭所有鼠标上报模式（部分终端在 scroll region 变化后会恢复默认）。
         let _ = io::Write::write_all(&mut stderr, DISABLE_ALL_MOUSE);
         let _ = io::Write::flush(&mut stderr);
-        // 启用 DECSET 1007 (Alternate Scroll Mode)：滚轮 → 方向键。
-        // 不捕获鼠标，终端原生的文本选择（拖拽选中 + 右键复制）始终可用，
-        // 参考 codex 的设计。触控板箭头直接应用（无平滑），手感接近 codex。
-        // 注意：该模式在 normal screen 上部分终端不生效，滚轮会原生滚动
-        // scrollback——这正是 inline viewport 想要的查看历史行为。
-        let _ = io::Write::write_all(&mut stderr, ENABLE_ALT_SCROLL);
+        // ── 进入 alternate screen（对齐 codex 设计）──
+        // Alternate screen 有独立的 scrollback 缓冲区，对话历史可以正确滚动。
+        // DECSET 1007 在 alternate screen 上正常工作（滚轮转方向键）。
+        let _ = crossterm::execute!(stderr, crossterm::terminal::EnterAlternateScreen);
+        let _ = io::Write::write_all(&mut stderr, b"\x1b[?1007h"); // Enable alternate scroll
         let _ = io::Write::flush(&mut stderr);
         // 对齐 codex：不捕获鼠标。已完成对话通过 scrollback 推入机制写入
         // 终端原生 scrollback，用户通过终端原生滚轮浏览历史。终端原生
@@ -3427,8 +3428,7 @@ impl Drop for InlineViewportGuard {
         // 只有 TUI 仍持有终端所有权时才跑 reset。
         // 双重保险：防止 panic hook 已经跑过 hard_terminal_reset() 之后，
         // drop guard 又被再次调用，造成 stderr 被二次写入。
-        // inline viewport 模式：reset 序列只复位 scroll region + 显示光标，
-        // 不需要 LeaveAlternateScreen（从未进入 alt screen）。
+        // hard_terminal_reset() 已包含退出 alternate screen 的序列。
         if !TERMINAL_OWNED.swap(false, Ordering::AcqRel) {
             return;
         }
