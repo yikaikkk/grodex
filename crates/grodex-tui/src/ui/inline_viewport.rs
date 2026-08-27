@@ -24,20 +24,20 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use crossterm::cursor::MoveTo;
+use crossterm::cursor::{MoveTo, SavePosition, RestorePosition};
 use crossterm::style::Print;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::Command;
 use crossterm::queue;
-use ratatui::backend::{Backend, WindowSize};
+use ratatui::backend::{Backend, ClearType as RatatuiClearType, WindowSize};
 use ratatui::buffer::Cell;
-use ratatui::layout::{Rect, Size};
+use ratatui::layout::{Position, Size};
 
 /// Set scroll region (DECSTBM): `CSI <top>;<bottom> r`.
 /// 1-based: row 1 is the first line.
-struct SetScrollRegion(pub std::ops::Range<u16>);
+pub struct SetScrollRegionCmd(pub std::ops::Range<u16>);
 
-impl Command for SetScrollRegion {
+impl Command for SetScrollRegionCmd {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
         write!(f, "\x1b[{};{}r", self.0.start, self.0.end)
     }
@@ -48,9 +48,9 @@ impl Command for SetScrollRegion {
 }
 
 /// Reset scroll region: `CSI r`.
-struct ResetScrollRegion;
+pub struct ResetScrollRegionCmd;
 
-impl Command for ResetScrollRegion {
+impl Command for ResetScrollRegionCmd {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
         write!(f, "\x1b[r")
     }
@@ -68,7 +68,7 @@ impl Command for ResetScrollRegion {
 /// but all draw commands are translated to the correct absolute position.
 pub struct InlineBackend<B>
 where
-    B: Backend,
+    B: Backend<Error = io::Error>,
 {
     inner: B,
     /// The y-offset (row number) where the viewport starts.
@@ -78,7 +78,7 @@ where
 
 impl<B> InlineBackend<B>
 where
-    B: Backend,
+    B: Backend<Error = io::Error>,
 {
     pub fn new(inner: B, y_offset: u16) -> Self {
         Self { inner, y_offset }
@@ -97,14 +97,19 @@ where
     /// Probe the current cursor position using the inner backend.
     /// Returns the (x, y) position, or (0, 0) if probing fails.
     pub fn probe_cursor_position(&mut self) -> (u16, u16) {
-        self.inner.get_cursor().unwrap_or((0, 0))
+        self.inner
+            .get_cursor_position()
+            .map(|p| (p.x, p.y))
+            .unwrap_or((0, 0))
     }
 }
 
 impl<B> Backend for InlineBackend<B>
 where
-    B: Backend,
+    B: Backend<Error = io::Error>,
 {
+    type Error = io::Error;
+
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
@@ -123,15 +128,23 @@ where
         self.inner.show_cursor()
     }
 
-    fn get_cursor(&mut self) -> io::Result<(u16, u16)> {
+    fn get_cursor_position(&mut self) -> Result<Position, io::Error> {
         // Translate the absolute position to viewport-relative.
-        let (x, y) = self.inner.get_cursor()?;
-        Ok((x, y.saturating_sub(self.y_offset)))
+        let pos = self.inner.get_cursor_position()?;
+        Ok(Position {
+            x: pos.x,
+            y: pos.y.saturating_sub(self.y_offset),
+        })
     }
 
-    fn set_cursor(&mut self, x: u16, y: u16) -> io::Result<()> {
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
         // Translate viewport-relative to absolute.
-        self.inner.set_cursor(x, y + self.y_offset)
+        let pos: Position = position.into();
+        self.inner
+            .set_cursor_position(Position {
+                x: pos.x,
+                y: pos.y + self.y_offset,
+            })
     }
 
     fn clear(&mut self) -> io::Result<()> {
@@ -142,19 +155,22 @@ where
         Ok(())
     }
 
-    fn size(&self) -> io::Result<Rect> {
+    fn clear_region(&mut self, _clear_type: RatatuiClearType) -> io::Result<()> {
+        // Same as clear(): never clear in inline viewport mode.
+        Ok(())
+    }
+
+    fn size(&self) -> Result<Size, io::Error> {
         // Return viewport size, not full screen size.
         // This tells ratatui how much space it has to render.
         let full = self.inner.size()?;
-        Ok(Rect::new(
-            0,
-            0,
-            full.width,
-            full.height.saturating_sub(self.y_offset),
-        ))
+        Ok(Size {
+            width: full.width,
+            height: full.height.saturating_sub(self.y_offset),
+        })
     }
 
-    fn window_size(&mut self) -> io::Result<WindowSize> {
+    fn window_size(&mut self) -> Result<WindowSize, io::Error> {
         let full = self.inner.window_size()?;
         let viewport_cols_rows = Size::new(
             full.columns_rows.width,
@@ -173,24 +189,70 @@ where
     }
 }
 
-// ── History insertion ──────────────────────────────────────────────
+// ── Scroll region operations (对齐 codex) ─────────────────────────
 
-/// Insert finalized chat lines into the terminal scrollback above the viewport.
+/// Scroll the rows in `region` upward by `scroll_by` rows.
 ///
-/// Uses `SetScrollRegion` to limit scrolling to the area above the viewport,
-/// then writes lines using `MoveTo` + `Print`. This pushes old content up
-/// into the real terminal scrollback, exactly like Codex.
+/// This is equivalent to ratatui's `Backend::scroll_region_up` (available
+/// with the `scrolling-regions` feature in ratatui ≥ 0.30). Since grodex
+/// uses ratatui 0.27, we implement it manually via ANSI escape sequences.
 ///
-/// After insertion, the viewport's y_offset is updated to account for the
-/// new lines (viewport moves down).
+/// Mechanism:
+/// 1. Set scroll region (DECSTBM) to cover `region`
+/// 2. Move cursor to the bottom row of the region
+/// 3. Output `scroll_by` line-feeds — each LF scrolls the region up by 1
+/// 4. Reset scroll region
+///
+/// The top `scroll_by` rows are pushed into the terminal's real scrollback.
+pub fn scroll_region_up<W: Write>(
+    writer: &mut W,
+    region: std::ops::Range<u16>,
+    scroll_by: u16,
+) -> io::Result<()> {
+    if scroll_by == 0 || region.is_empty() {
+        return Ok(());
+    }
+    // DECSTBM uses 1-based row numbers.
+    let top_1based = region.start + 1;
+    let bottom_1based = region.end; // region.end is exclusive in 0-based = last_row+1, which equals 1-based bottom
+    queue!(writer, SetScrollRegionCmd(top_1based..bottom_1based))?;
+    // Move cursor to the bottom row of the scroll region.
+    queue!(writer, MoveTo(0, region.end - 1))?;
+    for _ in 0..scroll_by {
+        // LF at the bottom of a scroll region scrolls the region up by 1.
+        queue!(writer, Print("\n"))?;
+    }
+    queue!(writer, ResetScrollRegionCmd)?;
+    writer.flush()
+}
+
+// ── History insertion (对齐 codex insert_history.rs Standard mode) ───
+
+/// Insert finalized chat lines above the viewport, pushing them into the
+/// terminal's real scrollback.
+///
+/// The mechanism (from codex):
+/// 1. Set scroll region to rows `1..viewport_y` (1-based: rows above viewport)
+/// 2. Place cursor at `viewport_y - 1` (bottom row of the scroll region)
+/// 3. For each line: `\r\n` then write the text
+///    - `\r\n` at the bottom of the scroll region: the region scrolls up
+///      by 1 row, cursor stays at the bottom (standard terminal behavior)
+///    - Text is written at the cursor position (bottom of scroll region)
+/// 4. Reset scroll region, restore cursor
+///
+/// Result: history lines appear contiguously above the viewport. The
+/// oldest rows are pushed into the terminal's native scrollback, where
+/// the user can browse them with the terminal's native scroll wheel.
+///
+/// Returns the new viewport_y (shifted down by the number of inserted rows).
 pub fn insert_history_lines<W: Write>(
     writer: &mut W,
     lines: &[String],
     viewport_y: u16,
-    screen_height: u16,
+    _screen_height: u16,
     wrap_width: usize,
 ) -> io::Result<u16> {
-    if lines.is_empty() {
+    if lines.is_empty() || viewport_y == 0 {
         return Ok(viewport_y);
     }
 
@@ -201,55 +263,42 @@ pub fn insert_history_lines<W: Write>(
         .collect();
     let wrapped_count = wrapped.len() as u16;
 
-    // If viewport is not at the bottom of the screen, scroll it down
-    // to make room for the history lines.
-    let viewport_bottom = viewport_y.saturating_add(1); // viewport includes at least 1 row
-    let actual_viewport_bottom = screen_height;
-    if viewport_bottom < actual_viewport_bottom {
-        let scroll_amount = wrapped_count.min(actual_viewport_bottom - viewport_bottom);
-        let top_1based = viewport_y + 1;
-        queue!(writer, SetScrollRegion(top_1based..screen_height))?;
-        queue!(writer, MoveTo(0, viewport_y))?;
-        for _ in 0..scroll_amount {
-            // ESC M = Reverse Index (scroll up by 1 line within scroll region)
-            queue!(writer, Print("\x1bM"))?;
-        }
-        queue!(writer, ResetScrollRegion)?;
+    // Clamp to available space above viewport.
+    let insert_count = wrapped_count.min(viewport_y);
+
+    // Save cursor position so we can restore it after the operation.
+    queue!(writer, SavePosition)?;
+
+    // Set scroll region to the area above the viewport (1-based).
+    // Row 0 → 1-based 1, row viewport_y-1 → 1-based viewport_y.
+    queue!(writer, SetScrollRegionCmd(1..viewport_y))?;
+
+    // Place cursor at the bottom row of the scroll region.
+    let cursor_row = viewport_y - 1;
+    queue!(writer, MoveTo(0, cursor_row))?;
+
+    // Write each line: \r\n scrolls the region up, then write text.
+    // The cursor stays at cursor_row (bottom of scroll region) after
+    // each \r\n, so successive writes stack upward naturally.
+    for line in &wrapped[..insert_count as usize] {
+        queue!(writer, Print("\r\n"))?;
+        queue!(writer, Clear(ClearType::UntilNewLine))?;
+        queue!(writer, Print(line.as_str()))?;
     }
 
-    // Set scroll region to the area ABOVE the viewport.
-    // Lines written here will scroll within this region, pushing
-    // old content up into real terminal scrollback.
-    //
-    // ┌─Screen───────────────────────┐
-    // │┌╌Scroll region╌╌╌╌╌╌╌╌╌╌╌╌╌╌┐│
-    // │┆  (old content scrolls up)  ┆│
-    // │┆  (new history lines)       ┆│
-    // │█╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘│
-    // │╭─Viewport───────────────────╮│
-    // ││  (live ratatui rendering)  ││
-    // │╰────────────────────────────╯│
-    // └──────────────────────────────┘
-    if viewport_y > 0 {
-        queue!(writer, SetScrollRegion(1..viewport_y))?;
-        let cursor_top = viewport_y.saturating_sub(1);
-        queue!(writer, MoveTo(0, cursor_top))?;
-        for line in &wrapped {
-            queue!(writer, Print("\r\n"))?;
-            // Truncate line to terminal width
-            let truncated = if line.len() > wrap_width {
-                &line[..wrap_width]
-            } else {
-                line.as_str()
-            };
-            queue!(writer, Print(truncated))?;
-            queue!(writer, Clear(ClearType::UntilNewLine))?;
-        }
-        queue!(writer, ResetScrollRegion)?;
-    }
-
+    // Reset scroll region and restore cursor.
+    queue!(writer, ResetScrollRegionCmd)?;
+    queue!(writer, RestorePosition)?;
     writer.flush()?;
-    Ok(viewport_y + wrapped_count)
+
+    // The viewport effectively moves down by the number of inserted rows
+    // (the rows that were just written now sit above the viewport).
+    Ok(viewport_y + insert_count)
+}
+
+/// Simple word-wrap for a single line. Returns wrapped sub-lines.
+pub fn wrap_line_public(text: &str, width: usize) -> Vec<String> {
+    wrap_line(text, width)
 }
 
 /// Simple word-wrap for a single line. Returns wrapped sub-lines.

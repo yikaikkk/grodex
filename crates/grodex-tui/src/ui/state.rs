@@ -609,6 +609,9 @@ pub struct TuiAppState {
     pub events: Vec<TimestampedEvent>,
     /// Chat-style messages for the main conversation view.
     pub messages: Vec<ChatMessage>,
+    /// Number of messages already pushed to terminal scrollback.
+    /// Messages before this index are NOT rendered in the viewport.
+    pub finalized_count: usize,
     pub pending_approvals: Vec<PendingApprovalRow>,
     /// Indeterminate tool calls discovered during crash recovery.
     /// The user must inspect the real-world state and resolve each one
@@ -730,6 +733,7 @@ impl TuiAppState {
             capability_generation: 0,
             events: Vec::new(),
             messages: Vec::new(),
+            finalized_count: 0,
             pending_approvals: Vec::new(),
             pending_indeterminates: Vec::new(),
             selected_indeterminate_idx: 0,

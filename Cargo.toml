@@ -52,8 +52,8 @@ futures = "0.3"
 async-stream = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 base64 = "0.22"
-ratatui = { version = "0.27", default-features = false, features = ["crossterm"] }
-crossterm = "0.28"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
 tracing = "0.1"
 
 # Internal crates

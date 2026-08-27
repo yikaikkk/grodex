@@ -782,6 +782,16 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
             ]));
         }
         rows.push(Line::from(vec![Span::raw("")]));
+    } else if state.finalized_count >= state.messages.len() {
+        // All messages have been pushed to terminal scrollback.
+        // Show a minimal prompt — user can scroll up to see history.
+        rows.push(Line::from(vec![Span::raw("")]));
+        rows.push(Line::from(vec![
+            Span::raw("  "),
+            style_s(c_muted(), "↑ Scroll up in terminal to see history.  "),
+            style_s(c_accent(), "Type to continue…"),
+        ]));
+        rows.push(Line::from(vec![Span::raw("")]));
     } else {
         // ── Turn-anchored linear render + turn-foot tool summary ────────
         //
@@ -801,11 +811,13 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
         //     from the previous round to fix the classic "orphan tool
         //     printed above the next Grodex header" race.
 
-        // Slice turns anchored at User messages
+        // Slice turns anchored at User messages.
+        // Skip messages before `finalized_count` (already in scrollback).
+        let active_start = state.finalized_count;
         let turns: Vec<std::ops::Range<usize>> = {
             let mut v: Vec<std::ops::Range<usize>> = Vec::new();
             let mut cur_start: Option<usize> = None;
-            for (i, m) in state.messages.iter().enumerate() {
+            for (i, m) in state.messages.iter().enumerate().skip(active_start) {
                 if matches!(m, ChatMessage::User { .. }) {
                     if let Some(s) = cur_start.take() {
                         v.push(s..i);
@@ -815,7 +827,7 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
             }
             match cur_start {
                 Some(s) => v.push(s..state.messages.len()),
-                None if !state.messages.is_empty() => v.push(0..state.messages.len()),
+                None if state.messages.len() > active_start => v.push(active_start..state.messages.len()),
                 None => {}
             }
             // Diagnostic guard — messages is non-empty (so we entered this
@@ -1662,7 +1674,7 @@ fn render_prompt_widget(f: &mut Frame<'_>, state: &TuiAppState, area: Rect) {
         let cy = input_subarea.y
             .saturating_add(cur_row)
             .min(input_subarea.y + input_subarea.height.saturating_sub(1));
-        f.set_cursor(cx, cy);
+        f.set_cursor_position((cx, cy));
     }
 
     // ── Info row: model · flags · multiline · Enter hint ────────────────
