@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{self, Event as CrosstermEvent};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
 };
 use crossterm::ExecutableCommand;
 use grodex_core::id::SessionId;
@@ -19,34 +19,21 @@ use grodex_protocol::acp::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ui::inline_viewport::InlineBackend;
 
-/// 是否当前 TUI 仍拥有终端（已进入 alternate screen + 开了鼠标捕获）。
+/// 是否当前 TUI 仍拥有终端（已进入 raw mode）。
 /// signal handler / panic hook / drop guard 都会读取这个 flag，保证
 /// teardown 序列只跑一次，且进程退出前终端一定会被复位。
 static TERMINAL_OWNED: AtomicBool = AtomicBool::new(false);
 
-/// 兜底的终端复位序列。与 grok 的 MOUSE_PASTE_RESET 一致：
+/// 兜底的终端复位序列（inline viewport 模式，不离开 alt screen）：
 ///   CSI ? 25 h    显示光标
-///   CSI ? 1006 l  关闭 SGR 鼠标模式
-///   CSI ? 1003 l  关闭所有鼠标上报（含拖动）
-///   CSI ? 1002 l  关闭事件鼠标拖动
-///   CSI ? 1000 l  关闭普通鼠标上报
-///   CSI ? 1007 l  退出 alternate scroll mode
-///   CSI ? 1049 l  退出 alternate screen + 清空 buffer
 ///   CSI ? 2004 l  退出 bracketed paste
-const TERMINAL_RESET_ESCAPE: &[u8] =
-    b"\x1b[?25h\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1007l\x1b[?1049l\x1b[?2004l";
+///   CSI r         重置 scroll region
+const TERMINAL_RESET_ESCAPE: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[r";
 
 /// 启动时发送：确保所有鼠标上报模式都关闭，防止上一个程序残留。
-/// 不含 1007（alternate scroll），那是在 EnterAlternateScreen 之后单独开启。
 const DISABLE_ALL_MOUSE: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
-
-/// DECSET 1007: Alternate Scroll Mode.
-/// 在 alt-screen 模式下让终端把滚轮事件翻译成方向键（↑/↓），
-/// 而不是鼠标坐标事件。这样 TUI 既能响应滚轮滚动，又不捕获鼠标，
-/// 终端原生的文本选择（拖拽选中 + 右键复制）始终可用。
-/// 参考 codex-rs tui/src/tui.rs:240-280 的 EnableAlternateScroll。
-const ENABLE_ALT_SCROLL: &[u8] = b"\x1b[?1007h";
 
 /// 触控板滚轮突发识别参数（配合 DECSET 1007，不捕获鼠标）。
 /// 1007 把滚轮翻译成 ↑/↓ 方向键：触控板轻轻一划会在极短时间内爆发几十个箭头键。
@@ -71,6 +58,12 @@ const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 /// Terminal.app 不实现 DECSET 1007，滚轮不会被翻译成方向键；不开上报时滚轮会滚动终端自己的回滚缓冲，
 /// 把整个 TUI 从 alternate screen "卷走"。只有在这个终端里才开启，且只消费滚轮事件、忽略点击/拖拽。
 const ENABLE_MOUSE_CAPTURE: &[u8] = b"\x1b[?1006h\x1b[?1000h";
+
+/// DECSET 1007 (Alternate Scroll Mode)：把滚轮翻译成 ↑/↓ 方向键。
+/// 对齐 codex：不捕获鼠标，终端原生的文本选择（拖拽选中 + 右键复制）始终可用。
+/// 注意：该模式在部分终端只对 alternate screen 生效；在 normal screen 上，
+/// 滚轮会原生滚动 scrollback（这正是 inline viewport 想要的行为——查看历史）。
+const ENABLE_ALT_SCROLL: &[u8] = b"\x1b[?1007h";
 
 fn hard_terminal_reset() {
     // 不用 crossterm Command：panic context 里不能分配/unwrap。
@@ -163,27 +156,24 @@ pub trait TransportAdapter {
 }
 
 pub struct GrodexTui {
-    terminal: Terminal<CrosstermBackend<io::Stderr>>,
+    terminal: Terminal<InlineBackend<CrosstermBackend<io::Stderr>>>,
     state: TuiAppState,
     transport: Box<dyn TransportAdapter>,
-    /// 上一个裸箭头键到达时间（滚轮突发识别用）。
+    // ── 触控板滚轮突发识别状态（对齐 codex 不捕获鼠标的设计）──
     arrow_last_at: Option<std::time::Instant>,
-    /// 当前连续箭头键计数（滚轮突发识别用）。
     arrow_burst: u32,
-    /// 当前手势是否已确认为滚轮（用于惯性尾部的延续判定）。
     burst_confirmed: bool,
-    /// 当前滚轮手势的确认时刻（延续窗口的总时长上限用）。
     burst_started_at: Option<std::time::Instant>,
-    /// 暂存待判定的箭头键：突发确认前不派发，避免滚轮手势的前几个箭头键
-    /// 误触发选择/历史导航。超时未续发则还原为真实按键派发。
     held_arrows: Vec<crossterm::event::KeyEvent>,
-    /// 待派发队列：还原的暂存箭头键按原顺序逐个消费，优先于终端新事件。
     queued_keys: std::collections::VecDeque<crossterm::event::KeyEvent>,
-    /// 当前迭代的事件来自待派发队列：直接派发，跳过突发检测（避免重复计数）。
     queued_dispatch: bool,
-    /// 鼠标上报（滚轮）是否开启：仅 macOS Terminal.app 自动开启（它不支持 1007），
-    /// 其他终端保持关闭以保留终端原生选择（对齐 codex）。
     mouse_capture: bool,
+    // ── Inline viewport 状态（对齐 codex：normal screen 渲染）──
+    /// Viewport 的 y 偏移量（viewport 起始行）。
+    /// 已完成的消息通过 ANSI scroll region 写入此行之上的真实 scrollback。
+    viewport_y: u16,
+    /// 已插入 scrollback 的消息数量（避免重复插入）。
+    finalized_count: usize,
     /// 上一次实际执行 draw() 的时间（帧率节流，防光标高频闪烁）。
     last_frame_at: std::time::Instant,
 }
@@ -196,8 +186,11 @@ impl GrodexTui {
         // 一半走 stderr 导致的时序错乱（这正是 macOS Terminal.app 上
         // 鼠标 CSI < ... M 泄漏到 shell 的根因）。
         let stderr = io::stderr();
-        let backend = CrosstermBackend::new(stderr);
-        let terminal = Terminal::new(backend).context("初始化 Terminal 失败")?;
+        let crossterm_backend = CrosstermBackend::new(stderr);
+        // 对齐 codex：normal screen 上的 inline viewport，不进入 alternate screen。
+        // 初始 y_offset=0，run_blocking 里探测光标位置后再 set_y_offset。
+        let inline_backend = InlineBackend::new(crossterm_backend, 0);
+        let terminal = Terminal::new(inline_backend).context("初始化 Terminal 失败")?;
         let mut state = TuiAppState::new();
 
         // Read model/provider from ~/.grodex/config.toml for header display.
@@ -232,6 +225,8 @@ impl GrodexTui {
             queued_keys: std::collections::VecDeque::new(),
             queued_dispatch: false,
             mouse_capture: false,
+            viewport_y: 0,
+            finalized_count: 0,
             // 倒推 1 秒，保证首帧无需等待节流窗口即可立即绘制。
             last_frame_at: std::time::Instant::now() - Duration::from_secs(1),
         })
@@ -243,31 +238,50 @@ impl GrodexTui {
         enable_raw_mode().context("enable_raw_mode 失败")?;
         let _raw_guard = RawModeGuard;
         // 参考 grok：终端控制命令全部写入 stderr 而非 stdout。
-        // macOS Terminal.app / iTerm2 / Linux VTE 上 alternate screen + mouse
-        // 命令如果走 stdout，可能因为 stdout 被管道/缓冲而丢失顺序，导致：
-        //   1. 退出时 LeaveAlternateScreen 没有 flush，终端停在 alternate screen
-        //   2. 鼠标事件序列（CSI < M）作为原始文本泄漏到用户 shell
+        // macOS Terminal.app / iTerm2 / Linux VTE 上 mouse 命令如果走 stdout，
+        // 可能因为 stdout 被管道/缓冲而丢失顺序，导致鼠标事件序列（CSI < M）
+        // 作为原始文本泄漏到用户 shell。
         let mut stderr = io::stderr();
-        // 进入前先关闭残留鼠标模式。
+        // 启动前先关闭残留鼠标模式。
         let _ = io::Write::write_all(&mut stderr, DISABLE_ALL_MOUSE);
         let _ = io::Write::flush(&mut stderr);
-        stderr
-            .execute(EnterAlternateScreen)
-            .context("进入 alternate screen 失败")?;
-        // 进入 alternate screen 后再次关闭所有鼠标上报模式。
-        // 某些终端在切换到 alternate buffer 时会恢复默认的 mouse reporting
-        // 状态，必须在这里再关一次，否则点击会出现整行灰色高亮。
+
+        // ── Inline viewport 启动（对齐 codex：normal screen 渲染，不进入 alternate screen）──
+        // 1. 探测当前光标位置 → 作为 viewport 起始行。
+        //    这样 shell 提示符 / 之前的输出留在真实 scrollback，viewport 从当前行开始。
+        let (_cursor_x, cursor_y) = self.terminal.backend_mut().probe_cursor_position();
+        // 直接从 crossterm 获取全屏尺寸（不经过 InlineBackend 的 y_offset 裁剪）。
+        let (_screen_w, screen_height) = crossterm::terminal::size().unwrap_or((80, 24));
+        // 2. 确保底部有足够空间放 viewport（至少需要若干行放 prompt/状态）。
+        let min_viewport_rows: u16 = 8;
+        let viewport_y = ui::inline_viewport::ensure_viewport_space(
+            &mut stderr,
+            cursor_y,
+            screen_height,
+            min_viewport_rows,
+        )
+        .context("inline viewport 空间不足")?;
+        self.viewport_y = viewport_y;
+        self.terminal.backend_mut().set_y_offset(viewport_y);
+        // 3. 清除 viewport 区域的残留内容，避免首帧叠加。
+        ui::inline_viewport::clear_viewport_area(&mut stderr, viewport_y, screen_height)
+            .context("清除 viewport 区域失败")?;
+        // 4. 把光标移到 viewport 左上角，准备首帧渲染。
+        let _ = crossterm::execute!(stderr, crossterm::cursor::MoveTo(0, viewport_y));
+
+        // 再次关闭所有鼠标上报模式（部分终端在 scroll region 变化后会恢复默认）。
         let _ = io::Write::write_all(&mut stderr, DISABLE_ALL_MOUSE);
         let _ = io::Write::flush(&mut stderr);
         // 启用 DECSET 1007 (Alternate Scroll Mode)：滚轮 → 方向键。
         // 不捕获鼠标，终端原生的文本选择（拖拽选中 + 右键复制）始终可用，
         // 参考 codex 的设计。触控板箭头直接应用（无平滑），手感接近 codex。
+        // 注意：该模式在 normal screen 上部分终端不生效，滚轮会原生滚动
+        // scrollback——这正是 inline viewport 想要的查看历史行为。
         let _ = io::Write::write_all(&mut stderr, ENABLE_ALT_SCROLL);
         let _ = io::Write::flush(&mut stderr);
         // macOS 自带 Terminal.app 不实现 DECSET 1007：滚轮不会被翻译成方向键，
-        // 反而会滚动终端自己的回滚缓冲，把整个 TUI 从屏幕上"卷走"。
-        // 只有在这个终端里才开启最小鼠标上报（只消费滚轮、忽略点击），
-        // 其他终端（iTerm2/WezTerm/Alacritty 等）保持零捕获，原生选择不受影响。
+        // 反而会滚动终端自己的回滚缓冲。只有在这个终端里才开启最小鼠标上报
+        //（只消费滚轮、忽略点击），其他终端保持零捕获，原生选择不受影响。
         // 前提：Terminal.app 菜单 "显示 > 允许鼠标报告" 处于勾选状态（默认勾选）。
         let is_apple_terminal =
             std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal");
@@ -281,7 +295,8 @@ impl GrodexTui {
         // 位置，而不是把一大段原始 CSI 文本塞进 input_buffer。
         let _ = stderr.execute(crossterm::event::EnableBracketedPaste);
         TERMINAL_OWNED.store(true, Ordering::Release);
-        let _alt_guard = AltScreenGuard;
+        // inline viewport 模式下不进入 alt screen；guard 只需复位 scroll region。
+        let _viewport_guard = InlineViewportGuard;
 
         let mut last_command_id: u64 = 0;
         let mut next_cmd_id = || -> String {
@@ -3141,11 +3156,11 @@ impl GrodexTui {
 
         // ── Terminal restore BEFORE printing the resume hint.
         //
-        // Guards are dropped explicitly so the alternate screen is left
+        // Guards are dropped explicitly so the scroll region is reset
         // and raw mode is disabled — otherwise the hint would be written
-        // inside the alternate screen and vanish the instant the
-        // process exits.
-        drop(_alt_guard);
+        // while still in raw mode / restricted scroll region and vanish
+        // the instant the process exits.
+        drop(_viewport_guard);
         drop(_raw_guard);
 
         // Resume hint: only print when we actually had a session going.
@@ -3289,13 +3304,15 @@ impl Drop for RawModeGuard {
     }
 }
 
-struct AltScreenGuard;
+struct InlineViewportGuard;
 
-impl Drop for AltScreenGuard {
+impl Drop for InlineViewportGuard {
     fn drop(&mut self) {
         // 只有 TUI 仍持有终端所有权时才跑 reset。
         // 双重保险：防止 panic hook 已经跑过 hard_terminal_reset() 之后，
         // drop guard 又被再次调用，造成 stderr 被二次写入。
+        // inline viewport 模式：reset 序列只复位 scroll region + 显示光标，
+        // 不需要 LeaveAlternateScreen（从未进入 alt screen）。
         if !TERMINAL_OWNED.swap(false, Ordering::AcqRel) {
             return;
         }
