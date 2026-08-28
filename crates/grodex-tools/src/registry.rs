@@ -1,6 +1,7 @@
 //! ToolRegistry — collects all built-in tools into a single registry.
 
 use crate::edit::EditTool;
+use crate::load_skill::LoadSkillTool;
 use crate::exec::ExecTool;
 use crate::patch::ApplyPatchTool;
 use crate::process_io::{ProcessIoTool, ProcessManager};
@@ -34,6 +35,12 @@ impl ToolRegistry {
         registry.register(ApplyPatchTool::new().metadata());
         registry.register(ProcessIoTool::new(process_manager).metadata());
         registry.register(ReadArtifactTool::new().metadata());
+        registry.register(
+            LoadSkillTool::new(std::sync::Arc::new(std::sync::Mutex::new(
+                grodex_skills::SkillCatalog::default(),
+            )))
+            .metadata(),
+        );
 
         registry
     }
@@ -79,7 +86,7 @@ mod tests {
     #[test]
     fn builtin_registry_has_all_tools() {
         let registry = ToolRegistry::builtin();
-        assert_eq!(registry.len(), 7);
+        assert_eq!(registry.len(), 8);
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("write_file").is_some());
         assert!(registry.get("edit_file").is_some());
@@ -87,5 +94,6 @@ mod tests {
         assert!(registry.get("apply_patch").is_some(), "apply_patch must be in the builtin registry");
         assert!(registry.get("process_io").is_some(), "process_io must be in the builtin registry");
         assert!(registry.get("read_artifact").is_some(), "read_artifact must be in the builtin registry");
+        assert!(registry.get("load_skill").is_some(), "load_skill must be in the builtin registry");
     }
 }

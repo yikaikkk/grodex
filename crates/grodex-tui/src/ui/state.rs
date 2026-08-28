@@ -602,6 +602,46 @@ pub struct SlashMenuState {
     pub ghost: Option<InlineGhost>,
 }
 
+/// 应用内文本选区:(列, 行) 对,viewport 坐标,0-based。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenSelection {
+    pub anchor: (u16, u16),
+    pub end: (u16, u16),
+}
+
+impl ScreenSelection {
+    /// 归一化:返回 (起始行, 结束行)（含两端）。
+    pub fn row_range(&self) -> (u16, u16) {
+        (
+            self.anchor.1.min(self.end.1),
+            self.anchor.1.max(self.end.1),
+        )
+    }
+    /// 某一行内被选中的列区间 [start, end)（半开）。
+    /// 不在该行范围内时返回 None。
+    pub fn col_range_on_row(&self, row: u16) -> Option<(u16, u16)> {
+        let (r0, r1) = self.row_range();
+        if row < r0 || row > r1 {
+            return None;
+        }
+        let (ac, ae) = if self.anchor.1 <= self.end.1 {
+            (self.anchor.0, self.end.0)
+        } else {
+            (self.end.0, self.anchor.0)
+        };
+        if r0 == r1 {
+            // 单行:左右排序
+            Some((ac.min(ae), ac.max(ae) + 1))
+        } else if row == r0 {
+            Some((ac, u16::MAX)) // 首行:从起点到行尾
+        } else if row == r1 {
+            Some((0, ae.saturating_add(1))) // 末行:行首到终点
+        } else {
+            Some((0, u16::MAX)) // 中间整行
+        }
+    }
+}
+
 pub struct TuiAppState {
     pub session_id: Option<String>,
     pub turn_id: Option<String>,
@@ -611,7 +651,15 @@ pub struct TuiAppState {
     pub messages: Vec<ChatMessage>,
     /// Number of messages already pushed to terminal scrollback.
     /// Messages before this index are NOT rendered in the viewport.
+    /// （当前设计:内容全部在应用内渲染,此字段不再前移,保留供回退。）
     pub finalized_count: usize,
+    /// ── 应用内文本选择（grok-build 模式:捕获鼠标后自建选中/复制）──
+    /// 当前拖拽/已完成的选区,(列,行) 为 viewport 坐标,anchor=起点 end=终点。
+    /// None 表示没有选区。
+    pub selection: Option<ScreenSelection>,
+    /// 上一帧 viewport 的纯文本快照（每行一个 String,由渲染闭包在 draw
+    /// 末尾写入）。选中释放时用它提取被选中的文本。
+    pub screen_text: Vec<String>,
     pub pending_approvals: Vec<PendingApprovalRow>,
     /// Indeterminate tool calls discovered during crash recovery.
     /// The user must inspect the real-world state and resolve each one
@@ -750,6 +798,8 @@ impl TuiAppState {
             approval_option_idx: 0,
             scroll_conversation: 0,
             scroll_follow_bottom: true,
+            selection: None,
+            screen_text: Vec::new(),
             cancel_sent: false,
             compacting: false,
             thinking_expanded: false,
@@ -1784,6 +1834,84 @@ impl TuiAppState {
             if let Some(max) = max_offset {
                 if next >= max {
                     self.scroll_follow_bottom = true;
+                }
+            }
+        }
+    }
+
+    /// 当前是否存在有效的（非空的）文本选区。
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some() && !self.selection_text().is_empty()
+    }
+
+    /// 从上一帧的屏幕文本快照中提取选区文本。
+    /// 每行 trim_end 后用 '\n' 连接;单点选区（无拖拽）返回空串。
+    pub fn selection_text(&self) -> String {
+        let Some(sel) = self.selection else {
+            return String::new();
+        };
+        let (r0, r1) = sel.row_range();
+        let mut out = String::new();
+        for row in r0..=r1 {
+            let Some(line) = self.screen_text.get(row as usize) else {
+                continue;
+            };
+            let text = if let Some((c0, c1)) = sel.col_range_on_row(row) {
+                // 按字符（而非字节）切列:screen_text 是屏幕上可见字符序列。
+                let chars: Vec<char> = line.chars().collect();
+                let start = (c0 as usize).min(chars.len());
+                let end = if c1 == u16::MAX {
+                    chars.len()
+                } else {
+                    (c1 as usize).min(chars.len())
+                };
+                if start >= end {
+                    String::new()
+                } else {
+                    chars[start..end].iter().collect::<String>()
+                }
+            } else {
+                String::new()
+            };
+            out.push_str(text.trim_end());
+            if row != r1 {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// 渲染闭包每帧末尾调用:把 viewport buffer 的可见文本写入快照,
+    /// 供选区提取使用。宽字符的占位 cell 符号为空,直接拼接即还原文本。
+    pub fn snapshot_screen_text(&mut self, buf: &ratatui::buffer::Buffer) {
+        self.screen_text = (0..buf.area.height)
+            .map(|y| {
+                let mut s = String::new();
+                for x in 0..buf.area.width {
+                    s.push_str(buf[(x, y)].symbol());
+                }
+                s
+            })
+            .collect();
+    }
+
+    /// 对选区覆盖的 cell 应用 REVERSED 高亮（在 render 之后、flush 之前调用）。
+    pub fn highlight_selection(&self, buf: &mut ratatui::buffer::Buffer) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let (r0, r1) = sel.row_range();
+        for row in r0..=r1 {
+            let Some((c0, c1)) = sel.col_range_on_row(row) else {
+                continue;
+            };
+            for col in c0..c1 {
+                if col >= buf.area.width {
+                    break;
+                }
+                if let Some(cell) = buf.cell_mut((col, row)) {
+                    let st = cell.style();
+                    cell.set_style(st.patch(ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::REVERSED)));
                 }
             }
         }

@@ -1,3 +1,5 @@
+pub mod custom_terminal;
+pub mod insert_history;
 pub mod ui;
 pub mod transport;
 
@@ -13,12 +15,16 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use grodex_core::id::SessionId;
 use grodex_protocol::acp::{
-    ApprovalResolution, Command, EventEnvelope, IndeterminateResolution, ReplayCursor, ReplayMode,
+    Command, EventEnvelope, ReplayCursor, ReplayMode,
     ResolveApprovalCommand, ResolveIndeterminateCommand, ResumeSessionCommand, SessionCancel,
     SessionPrompt,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::layout::Rect;
+
+/// codex 式自定义 Terminal(inline viewport,手动管理 viewport_area)。
+type TuiBackend = CrosstermBackend<io::Stderr>;
+type TuiTerminal = custom_terminal::Terminal<TuiBackend>;
 
 /// 是否当前 TUI 仍拥有终端（已进入 raw mode）。
 /// signal handler / panic hook / drop guard 都会读取这个 flag，保证
@@ -33,7 +39,7 @@ static TERMINAL_OWNED: AtomicBool = AtomicBool::new(false);
 ///   CSI ? 1007 l  关闭 alternate scroll
 ///   CSI ? 1049 l  退出 alternate screen
 ///   CSI r         重置 scroll region
-const TERMINAL_RESET_ESCAPE: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[?1007l\x1b[?1049l\x1b[r";
+const TERMINAL_RESET_ESCAPE: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1007l\x1b[?1049l\x1b[r";
 
 /// 启动时发送：确保所有鼠标上报模式都关闭，防止上一个程序残留。
 const DISABLE_ALL_MOUSE: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
@@ -148,9 +154,9 @@ pub trait TransportAdapter {
 }
 
 pub struct GrodexTui {
-    /// Terminal 延迟到 run_blocking() 中创建，确保 Viewport::Inline
+    /// Terminal 延迟到 run_blocking() 中创建，确保 inline viewport
     /// 的光标锚点在所有前置输出（如 session 列表）完成之后。
-    terminal: Option<Terminal<CrosstermBackend<io::Stderr>>>,
+    terminal: Option<TuiTerminal>,
     state: TuiAppState,
     transport: Box<dyn TransportAdapter>,
     // ── 触控板滚轮突发识别状态（对齐 codex 不捕获鼠标的设计）──
@@ -222,57 +228,44 @@ impl GrodexTui {
         let _ = io::Write::write_all(&mut stderr, DISABLE_ALL_MOUSE);
         let _ = io::Write::flush(&mut stderr);
 
-        // ── Inline viewport 启动（使用 ratatui 0.30 内置 Viewport::Inline）──
-        // 关键：Terminal 在此处创建（而非 init_with），确保光标锚点在所有前置
-        // 输出（session 列表等）完成之后。Viewport::Inline 捕获当前光标位置
-        // 作为 viewport 底部锚点，向上延伸 desired_height 行。
-        let (_screen_w, screen_height) = crossterm::terminal::size().unwrap_or((80, 24));
-        // 先将光标移动到屏幕底部，确保 viewport 从底部开始向上延伸。
-        // 这样 viewport 才能正确占据整个屏幕，scrollback 内容在 viewport 上方。
-        let _ = crossterm::execute!(
-            stderr,
-            crossterm::cursor::MoveTo(0, screen_height.saturating_sub(1))
-        );
-        let _ = io::Write::flush(&mut stderr);
-        let crossterm_backend = CrosstermBackend::new(io::stderr());
-        let terminal = Terminal::with_options(
-            crossterm_backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(screen_height),
-            },
-        )
-        .context("初始化 Terminal 失败")?;
-        self.terminal = Some(terminal);
-        // 清除 viewport 区域残留内容，避免首帧叠加。
-        let viewport_area = self.terminal.as_mut().unwrap().get_frame().area();
-        for row in viewport_area.top()..viewport_area.bottom() {
-            let _ = crossterm::execute!(
-                stderr,
-                crossterm::cursor::MoveTo(0, row),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine)
-            );
-        }
-        let _ = io::Write::flush(&mut stderr);
-
-        // 再次关闭所有鼠标上报模式（部分终端在 scroll region 变化后会恢复默认）。
-        let _ = io::Write::write_all(&mut stderr, DISABLE_ALL_MOUSE);
-        let _ = io::Write::flush(&mut stderr);
-        // ── 进入 alternate screen（对齐 codex 设计）──
-        // Alternate screen 有独立的 scrollback 缓冲区，对话历史可以正确滚动。
-        // DECSET 1007 在 alternate screen 上正常工作（滚轮转方向键）。
+        // ── Fullscreen 启动（对齐 grok-build 模式）──
+        // alternate screen + 整屏 viewport + 捕获鼠标,三者配合实现
+        // 「全屏 + 滚轮滚动 + 拖拽选中复制」并存:
+        //   * alt screen:独立缓冲区,退出时还原进入前的屏幕
+        //     （session 列表等前置输出不丢,回 shell 后仍可见）;
+        //   * 鼠标上报（1000 按钮滚轮 + 1002 拖拽 + 1006 SGR 编码）:
+        //     滚轮驱动应用内对话滚动,拖拽驱动应用内文本选中;
+        //   * 选中复制由应用自己实现（屏幕文本快照 + OSC 52 写剪贴板）——
+        //     捕获鼠标后终端原生选中不可用,这是 grok-build 同款取舍;
+        //     原生选中可用 Shift+拖拽 代替（Terminal.app/iTerm2）。
+        // 前置输出（session 列表）在进入 alt screen 之前打印,不会被冲掉。
         let _ = crossterm::execute!(stderr, crossterm::terminal::EnterAlternateScreen);
-        let _ = io::Write::write_all(&mut stderr, b"\x1b[?1007h"); // Enable alternate scroll
+        let _ = io::Write::write_all(&mut stderr, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
         let _ = io::Write::flush(&mut stderr);
-        // 对齐 codex：不捕获鼠标。已完成对话通过 scrollback 推入机制写入
-        // 终端原生 scrollback，用户通过终端原生滚轮浏览历史。终端原生
-        // 拖拽选中、右键复制等功能全部可用。
+        // 跳过 CPR 光标探测（fullscreen 下光标锚点无意义;不应答 ESC[6n
+        // 的终端上可避免 crossterm 内部超时阻塞启动约 2 秒）。
+        let crossterm_backend = CrosstermBackend::new(io::stderr());
+        let terminal = TuiTerminal::with_backend(crossterm_backend)
+            .context("初始化 Terminal 失败")?;
+        self.terminal = Some(terminal);
         // 开启 bracketed paste：用户在输入框 Ctrl-V/Cmd-V 粘贴时，终端会
         // 发送 `CrosstermEvent::Paste(String)`，我们把它追加到输入框光标
         // 位置，而不是把一大段原始 CSI 文本塞进 input_buffer。
         let _ = stderr.execute(crossterm::event::EnableBracketedPaste);
         TERMINAL_OWNED.store(true, Ordering::Release);
-        // inline viewport 模式下不进入 alt screen；guard 只需复位 scroll region。
+        // alt screen 模式:guard 复位时会发送 LeaveAlternateScreen +
+        // 关闭鼠标/滚轮上报 + 复位 scroll region（见 TERMINAL_RESET_ESCAPE）。
         let _viewport_guard = InlineViewportGuard;
+
+        // VS Code 集成终端:Cmd+C 被编辑器截留（无原生选中时还会向应用
+        // 发送 Ctrl+C,有误触取消/退出风险）。提示用户复制选区的正确姿势。
+        if std::env::var("TERM_PROGRAM").map(|v| v == "vscode").unwrap_or(false) {
+            self.state.push_log(
+                "VS Code 终端:Cmd+C 不会到达应用。复制选区请按 Ctrl+Y,\
+                或在 VS Code 键位设置中将 Cmd+C(终端聚焦)绑定为发送 Ctrl+Y 字节。\
+                粘贴 Cmd+V 不受影响。".to_string(),
+            );
+        }
 
         let mut last_command_id: u64 = 0;
         let mut next_cmd_id = || -> String {
@@ -696,19 +689,7 @@ impl GrodexTui {
             let frame_now = std::time::Instant::now();
             if frame_now.duration_since(self.last_frame_at) >= MIN_FRAME_INTERVAL {
                 self.last_frame_at = frame_now;
-                let draw_res = self.terminal.as_mut().unwrap().draw(|f| {
-                    let area = f.area();
-                    let approvals_rows = approvals_desired_rows(self.state.pending_approvals.len());
-                    let turn_status_rows = turn_status_desired_rows(
-                        self.state.is_streaming(), self.state.active_tool_count(),
-                        self.state.compacting);
-                    let wrap_w = (area.width as usize).saturating_sub(7).max(20);
-                    let content_rows = self.state.prompt_content_lines(wrap_w);
-                    let slash_rows = self.state.slash_menu_rows();
-                    let prompt_rows = prompt_desired_rows(content_rows + slash_rows);
-                    let layout = build_layout(area, approvals_rows, turn_status_rows, prompt_rows);
-                    render_full(f, &mut self.state, &layout);
-                });
+                let draw_res = self.draw_frame();
                 if let Err(e) = draw_res {
                     self.state.push_log(format!("[render] draw 错误（已跳过）：{e}"));
                 }
@@ -871,10 +852,6 @@ impl GrodexTui {
                             match action {
                             TuiAction::Quit => break,
                             TuiAction::SubmitPrompt { text } => {
-                                // ── 对齐 codex：发送新消息前，将上一轮已完成的内容推入 scrollback ──
-                                // 使用 ratatui 0.30 内置的 insert_before()，它会自动处理
-                                // scroll region 操作和 buffer 失效。
-                                self.push_finalized_to_scrollback();
                                 // Show user message in chat view immediately.
                                 self.state.push_user_message(&text);
                                 // 记入输入历史，供 ↑/↓ 自动填充。
@@ -1003,6 +980,29 @@ impl GrodexTui {
                                     }
                                 } else {
                                     self.state.push_log("当前没有可复制的 Grodex 消息".to_string());
+                                }
+                            }
+                            TuiAction::CopySelection => {
+                                // 拖拽选中的应用内选区 → 系统剪贴板(OSC 52)。
+                                // 选区保持高亮不清除,用户可继续 Cmd-C 或拖新选区。
+                                let text = self.state.selection_text();
+                                if text.is_empty() {
+                                    self.state.push_log(
+                                        "当前没有选区:先按住左键拖拽选中文字,再按 Cmd-C / Ctrl-Y 复制。"
+                                            .to_string(),
+                                    );
+                                    continue;
+                                }
+                                match set_clipboard(&text) {
+                                    Ok(n) => {
+                                        let lines = text.lines().count();
+                                        self.state.push_log(format!(
+                                            "已复制选区到剪贴板（{n} 字符,{lines} 行）。"
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        self.state.push_log(format!("[clipboard] 写入失败:{e}"));
+                                    }
                                 }
                             }
                             TuiAction::CopyInputBuffer => {
@@ -3113,9 +3113,53 @@ impl GrodexTui {
                             }
                         }
                     }
-                    CrosstermEvent::Mouse(_) => {
-                        // 对齐 codex：不捕获鼠标，所有鼠标事件交给终端原生处理。
-                        // 滚轮滚动终端 scrollback 查看历史，拖拽选中文本，右键复制。
+                    CrosstermEvent::Mouse(m) => {
+                        // ── 鼠标:滚轮滚动 + 拖拽选中（grok-build 模式）──
+                        // 滚轮驱动应用内对话滚动;左键按下/拖拽/松开构成
+                        // 一次选中,松开时用 OSC 52 把选中文本写入系统剪贴板。
+                        // slash 菜单或审批卡打开时不劫持滚轮（与按键突发
+                        // 识别的覆盖层直通策略一致）。
+                        use crossterm::event::{MouseButton, MouseEventKind};
+                        let overlay_open = (self.state.slash.open
+                            && !self.state.slash.matches.is_empty())
+                            || !self.state.pending_approvals.is_empty();
+                        match m.kind {
+                            MouseEventKind::ScrollUp if !overlay_open => {
+                                // 滚动后选区的屏幕坐标失效,一并清除。
+                                self.state.selection = None;
+                                for _ in 0..3 {
+                                    self.state.scroll_up();
+                                }
+                            }
+                            MouseEventKind::ScrollDown if !overlay_open => {
+                                self.state.selection = None;
+                                for _ in 0..3 {
+                                    self.state.scroll_down(None);
+                                }
+                            }
+                            // 左键按下:开始新选区（替换旧选区）。
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                self.state.selection = Some(ui::state::ScreenSelection {
+                                    anchor: (m.column, m.row),
+                                    end: (m.column, m.row),
+                                });
+                            }
+                            // 按住左键移动:扩展选区(需 DECSET 1002)。
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                if let Some(sel) = &mut self.state.selection {
+                                    sel.end = (m.column, m.row);
+                                }
+                            }
+                            // 左键松开:仅保留高亮,不自动复制 —— 复制由
+                            // Cmd-C（CopySelection）显式触发。单击(空选区)
+                            // 清除高亮。
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                if self.state.selection_text().is_empty() {
+                                    self.state.selection = None;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     _ => {}
                 }
@@ -3144,156 +3188,66 @@ impl GrodexTui {
         Ok(())
     }
 
-    /// 对齐 codex：将已完成的 turn 消息推入终端真实 scrollback。
+    // ── Inline viewport draw（对齐 codex `Tui::draw`）─────────────────
+
+    /// 每帧渲染:inline viewport 版本的 draw。
     ///
-    /// 在 ratatui 渲染之后调用。使用 ratatui 0.30 内置的
-    /// `Terminal::insert_before()` 将已完成消息格式化为纯文本行，
-    /// 插入到 viewport 上方。ratatui 自动处理 scroll region 操作
-    /// 和 buffer 失效，最旧内容推入终端原生 scrollback。
-    fn push_finalized_to_scrollback(&mut self) {
-        // 没有新完成的消息或正在 streaming 时不处理。
-        if self.state.messages.is_empty() || self.state.is_streaming() {
-            return;
+    /// 1. 计算本帧 UI 期望高度（desired height）;
+    /// 2. viewport 增长到期望高度 —— 超出屏幕底部时,把 viewport 上方的
+    ///    内容用 scroll region 上推（进入终端原生 scrollback）;
+    /// 3. `draw_with_size` 渲染一帧到 viewport 区域。
+    ///
+    /// 与 codex 的差异:codex 的 viewport 高度由 bottom pane（composer）决定,
+    /// 对话内容已推入 scrollback;grodex 的会话区仍有未完成的活跃 turn 需要
+    /// 在 viewport 内渲染,因此期望高度 = 底部面板 + 会话区需求:
+    ///   * 启动空状态 → 建议/引导内容 ~10 行;
+    ///   * 有未推入 scrollback 的消息（活跃 turn）→ 会话区尽量占满屏幕;
+    ///   * 全部已推入 scrollback（空闲）→ 只留提示行,viewport 收缩到底部
+    ///     面板,把上方空间留给下一轮 insert_history。
+    fn draw_frame(&mut self) -> Result<()> {
+        let (screen_w, screen_h) = crossterm::terminal::size().context("查询终端尺寸失败")?;
+        let screen_size = ratatui::layout::Size::new(screen_w, screen_h);
+
+        // 面板行数需求（与 draw 闭包内 build_layout 同一套公式）。
+        let approvals_rows = approvals_desired_rows(self.state.pending_approvals.len());
+        let turn_status_rows = turn_status_desired_rows(
+            self.state.is_streaming(),
+            self.state.active_tool_count(),
+            self.state.compacting,
+        );
+        let wrap_w = (screen_w as usize).saturating_sub(7).max(20);
+        let content_rows = self.state.prompt_content_lines(wrap_w);
+        let slash_rows = self.state.slash_menu_rows();
+        let prompt_rows = prompt_desired_rows(content_rows + slash_rows);
+
+        // ── 设计决策（grok-build 模式）──
+        // alt screen + 整屏 viewport:对话内容全部在 TUI 内部渲染,
+        // 应用内滚动（滚轮/方向键）浏览历史;拖拽选中 + OSC 52 复制。
+        // viewport 恒为整屏,无需 codex 式的增量增长/scroll-region 上推。
+        let Some(terminal) = self.terminal.as_mut() else {
+            return Ok(());
+        };
+        let full = Rect::new(0, 0, screen_w, screen_h);
+        if full != terminal.viewport_area {
+            // 覆盖启动首帧(空 viewport)与终端 resize 两种情况。
+            terminal.set_viewport_area(full);
         }
-        // 找到第一个未完成的 turn 起始位置。
-        let mut active_start = self.state.messages.len();
-        for (i, msg) in self.state.messages.iter().enumerate().rev() {
-            match msg {
-                crate::ui::state::ChatMessage::Assistant { done: false, .. }
-                | crate::ui::state::ChatMessage::Thinking { done: false, .. } => {
-                    active_start = i;
-                    for k in (0..i).rev() {
-                        if matches!(self.state.messages[k], crate::ui::state::ChatMessage::User { .. }) {
-                            active_start = k;
-                            break;
-                        }
-                    }
-                    break;
-                }
-                _ => {}
-            }
-        }
-        if active_start == self.state.messages.len() {
-            let all_done = self.state.messages.iter().all(|m| match m {
-                crate::ui::state::ChatMessage::Assistant { done, .. } => *done,
-                crate::ui::state::ChatMessage::Thinking { done, .. } => *done,
-                crate::ui::state::ChatMessage::Subagent { done, .. } => *done,
-                _ => true,
-            });
-            if all_done {
-                active_start = self.state.messages.len();
-            }
-        }
-        let fc = self.state.finalized_count;
-        if active_start <= fc {
-            return;
-        }
-        let to_push = &self.state.messages[fc..active_start];
-        if to_push.is_empty() {
-            return;
-        }
-        let lines = format_messages_for_scrollback(to_push);
-        if lines.is_empty() {
-            return;
-        }
-        let (screen_w, _screen_h) = crossterm::terminal::size().unwrap_or((80, 24));
-        let wrap_w = (screen_w as usize).saturating_sub(2).max(20);
-        // Pre-wrap lines to terminal width.
-        let wrapped: Vec<String> = lines
-            .iter()
-            .flat_map(|line| ui::inline_viewport::wrap_line_public(line, wrap_w))
-            .collect();
-        if wrapped.is_empty() {
-            return;
-        }
-        let line_count = wrapped.len() as u16;
-        // 使用 ratatui 内置的 insert_before() 将已完成消息插入 viewport 上方。
-        // 该方法自动处理 scroll region 操作和 buffer 失效，
-        // 最旧内容推入终端原生 scrollback。
-        let result = self.terminal.as_mut().unwrap().insert_before(line_count, |buf| {
-            use ratatui::text::{Line, Span};
-            use ratatui::style::Style;
-            for (row_idx, line_text) in wrapped.iter().enumerate() {
-                if row_idx < buf.area.height as usize {
-                    let line = Line::from(vec![Span::styled(
-                        line_text.as_str(),
-                        Style::default(),
-                    )]);
-                    buf.set_string(
-                        buf.area.x,
-                        buf.area.y + row_idx as u16,
-                        line.to_string(),
-                        Style::default(),
-                    );
-                }
-            }
-        });
-        if let Err(e) = result {
-            self.state.push_log(format!("[scrollback] insert_before 错误：{e}"));
-        }
-        self.state.finalized_count = active_start;
+
+        terminal.draw_with_size(screen_size, |f| {
+            let area = f.area();
+            let layout = build_layout(area, approvals_rows, turn_status_rows, prompt_rows);
+            render_full(f, &mut self.state, &layout);
+            // 选中高亮:在内容之上反色选区覆盖的 cell。
+            self.state.highlight_selection(f.buffer_mut());
+            // 屏幕纯文本快照:供松开鼠标时提取选中文本复制。
+            self.state.snapshot_screen_text(f.buffer_mut());
+        })?;
+        Ok(())
     }
+
+
 }
 
-/// 将已完成的 ChatMessage 格式化为纯文本行，用于写入终端 scrollback。
-fn format_messages_for_scrollback(
-    messages: &[crate::ui::state::ChatMessage],
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    for msg in messages {
-        match msg {
-            crate::ui::state::ChatMessage::User { text } => {
-                lines.push(String::new());
-                for line in text.lines() {
-                    lines.push(format!("You: {}", line));
-                }
-            }
-            crate::ui::state::ChatMessage::Assistant { text, .. } => {
-                lines.push(String::new());
-                if text.is_empty() {
-                    lines.push("Assistant: (empty)".to_string());
-                } else {
-                    for line in text.lines() {
-                        lines.push(format!("Assistant: {}", line));
-                    }
-                }
-            }
-            crate::ui::state::ChatMessage::Thinking { segments, .. } => {
-                let mut tool_count = 0;
-                for seg in segments {
-                    match seg {
-                        crate::ui::state::ThinkingSegment::Text(t) => {
-                            for line in t.lines() {
-                                lines.push(format!("  {}", line));
-                            }
-                        }
-                        crate::ui::state::ThinkingSegment::Tool(card) => {
-                            tool_count += 1;
-                            let status = if card.is_error { "error" } else { "ok" };
-                            lines.push(format!("  [tool] {} ... {}", card.name, status));
-                        }
-                    }
-                }
-                if tool_count > 0 && lines.last().map_or(true, |l| !l.starts_with("  [tool]")) {
-                    // Already logged inline above.
-                }
-            }
-            crate::ui::state::ChatMessage::System { text, is_error } => {
-                let prefix = if *is_error { "[error]" } else { "[system]" };
-                lines.push(format!("{} {}", prefix, text));
-            }
-            crate::ui::state::ChatMessage::Subagent { label, done, ok, .. } => {
-                let status = if *done {
-                    if *ok { "done" } else { "failed" }
-                } else {
-                    "running"
-                };
-                lines.push(format!("[subagent: {}] {}", label, status));
-            }
-        }
-    }
-    lines
-}
 
 fn handle_cli_command<F: FnMut() -> String>(
     cmd: &str,

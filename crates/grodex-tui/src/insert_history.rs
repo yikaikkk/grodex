@@ -1,0 +1,349 @@
+//! 将最终化的对话行写入终端 scrollback — 移植自 codex
+//! (`codex-rs/tui/src/insert_history.rs`,Standard 模式)。
+//!
+//! codex 用终端 scrollback 本身承载已完成的聊天历史:插入一行历史是一次
+//! escape-sequence 操作,而不是正常的 ratatui 渲染。
+//!
+//! 机制（Standard 模式）:
+//! 1. 若 viewport 不在屏幕底部,先把 viewport 向下滚出空间（scroll region
+//!    + 反向换行 `ESC M`）;
+//! 2. 把 scroll region 限制为「屏幕顶部 .. viewport 顶部」,光标置于区域
+//!    底行,逐行写 `\r\n` + 文本 —— 区域内滚动,最旧的行被推入终端原生
+//!    scrollback;
+//! 3. 复位 scroll region,光标回到原位（对 ratatui 状态零破坏）。
+//!
+//! ```text
+//! ┌─Screen───────────────────────┐
+//! │┌╌Scroll region╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┐│
+//! │┆  (历史写入这里,向上推)      ┆│ → 最旧内容进入终端原生 scrollback
+//! │█╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘│
+//! │╭─Viewport──────────────────╮│
+//! ││ 输入框 / 状态 / 活跃 turn  ││
+//! │╰──────────────────────────╯│
+//! └──────────────────────────────┘
+//! ```
+
+use std::fmt;
+use std::io;
+
+use crossterm::cursor::MoveDown;
+use crossterm::cursor::MoveTo;
+use crossterm::cursor::MoveToColumn;
+use crossterm::cursor::RestorePosition;
+use crossterm::cursor::SavePosition;
+use crossterm::queue;
+use crossterm::style::Color as CColor;
+use crossterm::style::Colors;
+use crossterm::style::Print;
+use crossterm::style::SetAttribute;
+use crossterm::style::SetBackgroundColor;
+use crossterm::style::SetColors;
+use crossterm::style::SetForegroundColor;
+use crossterm::terminal::Clear;
+use crossterm::terminal::ClearType;
+use crossterm::Command;
+use ratatui::backend::IntoCrossterm;
+use ratatui::layout::Size;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
+use ratatui::text::Line;
+use ratatui::text::Span;
+
+use crate::custom_terminal::Terminal;
+use crate::ui::inline_viewport::wrap_line_public;
+
+/// Insert `lines` above the viewport using the terminal's backend writer.
+///
+/// 调用时机（对齐 codex）:在两次 draw 之间的安全点（如发送新消息前）,
+/// 不在 `terminal.draw()` 闭包内部 —— 本函数直接操作终端,会移动光标,
+/// 但始终通过 `MoveTo(last_known_cursor_pos)` 恢复,对渲染状态中性。
+pub fn insert_history_lines<B>(
+    terminal: &mut Terminal<B>,
+    lines: Vec<Line<'static>>,
+) -> io::Result<()>
+where
+    B: ratatui::backend::Backend<Error = io::Error> + io::Write,
+{
+    let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
+
+    let mut area = terminal.viewport_area;
+    let mut should_update_area = false;
+    let last_cursor_pos = terminal.last_known_cursor_pos;
+
+    let wrap_width = area.width.max(1) as usize;
+
+    // 预折行:能放进一行的保留完整样式;超长的退化为纯文本按词折行
+    //（对齐 grodex 现有 scrollback 行为;codex 的 span-aware 折行引擎
+    // 过重,后续有需求再引入）。
+    let mut wrapped: Vec<Line<'static>> = Vec::new();
+    let mut wrapped_rows = 0usize;
+    for line in lines {
+        let line_wrapped = wrap_for_scrollback(line, wrap_width);
+        wrapped_rows += line_wrapped
+            .iter()
+            .map(|l| l.width().max(1).div_ceil(wrap_width))
+            .sum::<usize>();
+        wrapped.extend(line_wrapped);
+    }
+    let wrapped_lines = wrapped_rows as u16;
+
+    if wrapped.is_empty() || area.top() == 0 {
+        // viewport 顶到屏幕顶部:上方没有可操作的区域（正常布局不会出现;
+        // 极小终端下的保护）。
+        return Ok(());
+    }
+
+    let writer = terminal.backend_mut();
+    let cursor_top = if area.bottom() < screen_size.height {
+        // viewport 不在屏幕底部:先把它向下滚,腾出写入空间。
+        // 不滚出屏幕底部。
+        let scroll_amount = wrapped_lines.min(screen_size.height - area.bottom());
+
+        let top_1based = area.top() + 1;
+        queue!(writer, SetScrollRegion(top_1based..screen_size.height))?;
+        queue!(writer, MoveTo(0, area.top()))?;
+        for _ in 0..scroll_amount {
+            // RI (reverse index):区域内向下滚一行
+            queue!(writer, Print("\x1bM"))?;
+        }
+        queue!(writer, ResetScrollRegion)?;
+
+        let cursor_top = area.top().saturating_sub(1);
+        area.y += scroll_amount;
+        should_update_area = true;
+        cursor_top
+    } else {
+        area.top().saturating_sub(1)
+    };
+
+    // 把 scroll region 限制为「屏幕顶 .. viewport 顶」。此后区域内写入
+    // 只滚动这部分行,最旧的被推入终端原生 scrollback。
+    //
+    // ┌─Screen───────────────────────┐
+    // │┌╌Scroll region╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┐│
+    // │┆                            ┆│
+    // │█╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘│
+    // │╭─Viewport──────────────────╮│
+    // │╰──────────────────────────╯│
+    // └──────────────────────────────┘
+    queue!(writer, SetScrollRegion(1..area.top()))?;
+
+    // NB: 用 MoveTo 而非 set_cursor_position,避免污染 terminal 的
+    // last_known_cursor_pos —— insert_history 应当是光标位置中性的。
+    queue!(writer, MoveTo(0, cursor_top))?;
+
+    for line in &wrapped {
+        queue!(writer, Print("\r\n"))?;
+        write_history_line(writer, line, wrap_width)?;
+    }
+
+    queue!(writer, ResetScrollRegion)?;
+    queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+    // writer 同时实现 Backend::flush 与 io::Write::flush,显式消歧。
+    io::Write::flush(writer)?;
+
+    if should_update_area {
+        terminal.set_viewport_area(area);
+    }
+    if wrapped_lines > 0 {
+        terminal.note_history_rows_inserted(wrapped_lines);
+    }
+
+    Ok(())
+}
+
+/// 单行折行策略:放得下 → 原样（保留全部 span 样式）;放不下 → 拍平为
+/// 纯文本按词折行。
+fn wrap_for_scrollback(line: Line<'static>, wrap_width: usize) -> Vec<Line<'static>> {
+    if line.width() <= wrap_width || wrap_width == 0 {
+        return vec![line];
+    }
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    wrap_line_public(&text, wrap_width)
+        .into_iter()
+        .map(Line::from)
+        .collect()
+}
+
+/// Render a single wrapped history line: clear continuation rows for wide lines,
+/// set foreground/background colors, and write styled spans. Caller is responsible
+/// for cursor positioning and any leading `\r\n`.
+fn write_history_line<W: io::Write>(
+    writer: &mut W,
+    line: &Line<'static>,
+    wrap_width: usize,
+) -> io::Result<()> {
+    let physical_rows = line.width().max(1).div_ceil(wrap_width) as u16;
+    if physical_rows > 1 {
+        queue!(writer, SavePosition)?;
+        for _ in 1..physical_rows {
+            queue!(writer, MoveDown(1), MoveToColumn(0))?;
+            queue!(writer, Clear(ClearType::UntilNewLine))?;
+        }
+        queue!(writer, RestorePosition)?;
+    }
+    queue!(
+        writer,
+        SetColors(Colors::new(
+            line.style
+                .fg
+                .map(IntoCrossterm::into_crossterm)
+                .unwrap_or(CColor::Reset),
+            line.style
+                .bg
+                .map(IntoCrossterm::into_crossterm)
+                .unwrap_or(CColor::Reset)
+        ))
+    )?;
+    queue!(writer, Clear(ClearType::UntilNewLine))?;
+    // Merge line-level style into each span so that ANSI colors reflect
+    // line styles (e.g., blockquotes with green fg).
+    let merged_spans: Vec<Span> = line
+        .spans
+        .iter()
+        .map(|s| Span {
+            style: s.style.patch(line.style),
+            content: s.content.clone(),
+        })
+        .collect();
+    write_spans(writer, merged_spans.iter())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetScrollRegion(pub std::ops::Range<u16>);
+
+impl Command for SetScrollRegion {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write!(f, "\x1b[{};{}r", self.0.start, self.0.end)
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        panic!("tried to execute SetScrollRegion command using WinAPI, use ANSI instead");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetScrollRegion;
+
+impl Command for ResetScrollRegion {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write!(f, "\x1b[r")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        panic!("tried to execute ResetScrollRegion command using WinAPI, use ANSI instead");
+    }
+}
+
+struct ModifierDiff {
+    pub from: Modifier,
+    pub to: Modifier,
+}
+
+impl ModifierDiff {
+    fn queue<W>(self, mut w: W) -> io::Result<()>
+    where
+        W: io::Write,
+    {
+        use crossterm::style::Attribute as CAttribute;
+        let removed = self.from - self.to;
+        if removed.contains(Modifier::REVERSED) {
+            queue!(w, SetAttribute(CAttribute::NoReverse))?;
+        }
+        if removed.contains(Modifier::BOLD) {
+            queue!(w, SetAttribute(CAttribute::NormalIntensity))?;
+            if self.to.contains(Modifier::DIM) {
+                queue!(w, SetAttribute(CAttribute::Dim))?;
+            }
+        }
+        if removed.contains(Modifier::ITALIC) {
+            queue!(w, SetAttribute(CAttribute::NoItalic))?;
+        }
+        if removed.contains(Modifier::UNDERLINED) {
+            queue!(w, SetAttribute(CAttribute::NoUnderline))?;
+        }
+        if removed.contains(Modifier::DIM) {
+            queue!(w, SetAttribute(CAttribute::NormalIntensity))?;
+        }
+        if removed.contains(Modifier::CROSSED_OUT) {
+            queue!(w, SetAttribute(CAttribute::NotCrossedOut))?;
+        }
+        if removed.contains(Modifier::SLOW_BLINK) || removed.contains(Modifier::RAPID_BLINK) {
+            queue!(w, SetAttribute(CAttribute::NoBlink))?;
+        }
+
+        let added = self.to - self.from;
+        if added.contains(Modifier::REVERSED) {
+            queue!(w, SetAttribute(CAttribute::Reverse))?;
+        }
+        if added.contains(Modifier::BOLD) {
+            queue!(w, SetAttribute(CAttribute::Bold))?;
+        }
+        if added.contains(Modifier::ITALIC) {
+            queue!(w, SetAttribute(CAttribute::Italic))?;
+        }
+        if added.contains(Modifier::UNDERLINED) {
+            queue!(w, SetAttribute(CAttribute::Underlined))?;
+        }
+        if added.contains(Modifier::DIM) {
+            queue!(w, SetAttribute(CAttribute::Dim))?;
+        }
+        if added.contains(Modifier::CROSSED_OUT) {
+            queue!(w, SetAttribute(CAttribute::CrossedOut))?;
+        }
+        if added.contains(Modifier::SLOW_BLINK) {
+            queue!(w, SetAttribute(CAttribute::SlowBlink))?;
+        }
+        if added.contains(Modifier::RAPID_BLINK) {
+            queue!(w, SetAttribute(CAttribute::RapidBlink))?;
+        }
+
+        Ok(())
+    }
+}
+
+fn write_spans<'a, I>(mut writer: &mut impl io::Write, content: I) -> io::Result<()>
+where
+    I: IntoIterator<Item = &'a Span<'a>>,
+{
+    let mut fg = Color::Reset;
+    let mut bg = Color::Reset;
+    let mut last_modifier = Modifier::empty();
+    for span in content {
+        let mut modifier = Modifier::empty();
+        modifier.insert(span.style.add_modifier);
+        modifier.remove(span.style.sub_modifier);
+        if modifier != last_modifier {
+            let diff = ModifierDiff {
+                from: last_modifier,
+                to: modifier,
+            };
+            diff.queue(&mut writer)?;
+            last_modifier = modifier;
+        }
+        let next_fg = span.style.fg.unwrap_or(Color::Reset);
+        let next_bg = span.style.bg.unwrap_or(Color::Reset);
+        if next_fg != fg || next_bg != bg {
+            queue!(
+                writer,
+                SetColors(Colors::new(
+                    next_fg.into_crossterm(),
+                    next_bg.into_crossterm()
+                ))
+            )?;
+            fg = next_fg;
+            bg = next_bg;
+        }
+
+        queue!(writer, Print(span.content.clone()))?;
+    }
+
+    queue!(
+        writer,
+        SetForegroundColor(CColor::Reset),
+        SetBackgroundColor(CColor::Reset),
+        SetAttribute(crossterm::style::Attribute::Reset),
+    )
+}

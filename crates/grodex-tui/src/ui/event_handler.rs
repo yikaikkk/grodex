@@ -68,6 +68,11 @@ pub enum TuiAction {
     /// without having to reach for Ctrl-Shift-C (which copies the
     /// most-recent *assistant* output — a different scoped action).
     CopyInputBuffer,
+    /// Copy the current mouse-drag screen selection (grok-build 模式的
+    /// 应用内选中) to the system clipboard. Dispatched from Cmd-C when
+    /// a non-empty selection exists — selection alone no longer copies
+    /// (松开鼠标不再自动复制,由 Cmd-C 显式触发)。
+    CopySelection,
     /// Select-all in the active input buffer. Cmd-A on macOS.
     /// For now this just places the cursor at the end (no visual
     /// selection rect yet) so Cmd-A → Cmd-C still captures the
@@ -112,12 +117,19 @@ fn handle_normal(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
     if let KeyCode::Char(ch) = key.code {
         match (ctrl, shift, super_, ch) {
             (true, true, _, 'c') => return Some(TuiAction::CopyLastAssistant),
+            // Ctrl+Y:复制应用内选区（grok 同款 yank 键）。部分终端会截留
+            // Cmd-C 不转发给应用,Ctrl+Y 是始终可达的复制路径。
+            (true, false, _, 'y') => return Some(TuiAction::CopySelection),
             (true, true, _, 'v') => return Some(TuiAction::PasteText { text: String::new() }),
             // macOS: Cmd-C without an active input buffer falls back to
             // copying the last assistant message so "Cmd-C to copy the
             // thing I'm looking at" still works intuitively even in
             // Normal mode.
             (_, _, true, 'c') => {
+                // 优先复制应用内选区（拖拽选中的可见文本）。
+                if state.has_selection() {
+                    return Some(TuiAction::CopySelection);
+                }
                 if state.input_buffer.is_empty() {
                     return Some(TuiAction::CopyLastAssistant);
                 } else {
@@ -462,12 +474,23 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
         }
     }
 
+    // Ctrl+Y:复制应用内选区(grok 同款 yank;Prompt 模式同样可用)。
+    if matches!(key.code, KeyCode::Char('y'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        return Some(TuiAction::CopySelection);
+    }
     let ret = match key.code {
         // ——— macOS ⌘ Cmd shortcuts (SUPER modifier) — runs before
         //    anything else so Ctrl-C can still mean "cancel turn" even
         //    when Cmd-C does "copy input buffer". These are the
         //    bindings users intuitively reach for on a Mac.
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::SUPER) => {
+            // 有应用内选区时优先复制选区。
+            if state.has_selection() {
+                return Some(TuiAction::CopySelection);
+            }
             return Some(TuiAction::CopyInputBuffer);
         }
         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::SUPER) => {

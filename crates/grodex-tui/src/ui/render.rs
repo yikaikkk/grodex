@@ -33,7 +33,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders as B, Paragraph, Wrap, List, ListItem};
-use ratatui::Frame;
+use crate::custom_terminal::Frame;
 
 use super::layout::AppLayout;
 use super::state::{ApprovalOption, BUILTIN_SLASH_COMMANDS, ChatMessage, InputMode, ThinkingSegment, TuiAppState};

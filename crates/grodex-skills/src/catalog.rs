@@ -133,8 +133,8 @@ impl SkillCatalog {
 
     /// Format skills as a compact **summary listing** for the system prompt
     /// (progressive disclosure). Only name + description + source + trusted
-    /// are listed — full content is NOT injected. The model can use the
-    /// `read_file` tool to read a skill's full content on-demand when it
+    /// are listed — full content is NOT injected. The model uses the
+    /// `load_skill` tool to load a skill's full content on-demand when it
     /// actually needs the skill's detailed instructions.
     ///
     /// Untrusted skills (R14-6c: Project skills in an untrusted workspace)
@@ -154,8 +154,9 @@ impl SkillCatalog {
                 skill.name, skill.description, skill.source, trust_tag
             ));
         }
-        out.push_str("\n*Skill content is loaded on-demand. Use the `read_file` tool \
-            with the skill's path to read its full instructions when needed.*\n\n");
+        out.push_str("\n*Skill content is loaded on-demand. When a skill is relevant to the \
+            current task, call the `load_skill` tool with the skill's name to load its \
+            full instructions (do NOT use `read_file` on the skill file path).*\n\n");
         out
     }
 

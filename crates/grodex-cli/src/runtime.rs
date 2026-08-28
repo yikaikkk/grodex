@@ -39,7 +39,7 @@ use grodex_rollout::store::{FileRolloutStore, RolloutStore};
 use grodex_sampler::{ModelRoute, SamplingActor, SamplingClient, SamplingClientConfig};
 use grodex_sandbox::SandboxRuntimeClient;
 use grodex_subagent::supervisor::SubAgentConfig;
-use grodex_tools::{ApplyPatchTool, EditTool, ExecTool, ReadFileTool, WriteFileTool};
+use grodex_tools::{ApplyPatchTool, EditTool, ExecTool, LoadSkillTool, ReadFileTool, WriteFileTool};
 use tokio::sync::mpsc;
 
 /// A fully-wired session runtime ready to serve turns.
@@ -554,6 +554,18 @@ impl SessionRuntimeBuilder {
         //   - a RolloutWriter clone (so spawn/complete are journaled)
         coordinator
             .register_tool("read_file", Arc::new(ReadFileTool::new()), ReadFileTool::new().input_schema())
+            .await;
+        // load_skill:复用 supervisor 的 SkillCatalog 发现(cwd/trusted 一致),
+        // 共享一份 Arc<Mutex<_>>,避免重复扫描且保证 load 的是同一批 skill。
+        let skill_catalog = Arc::new(std::sync::Mutex::new(
+            grodex_skills::SkillCatalog::discover(&self.cwd, workspace_trusted),
+        ));
+        coordinator
+            .register_tool(
+                "load_skill",
+                Arc::new(LoadSkillTool::new(skill_catalog)),
+                LoadSkillTool::default().input_schema(),
+            )
             .await;
         coordinator
             .register_tool("write_file", Arc::new(WriteFileTool::new()), WriteFileTool::new().input_schema())

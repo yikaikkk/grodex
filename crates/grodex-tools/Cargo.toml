@@ -9,6 +9,7 @@ description = "Built-in tools (Read, Write, Edit, Exec) for Grodex"
 
 [dependencies]
 grodex-core.workspace = true
+grodex-skills.workspace = true
 grodex-sandbox.workspace = true
 grodex-sandbox-types.workspace = true
 serde.workspace = true
