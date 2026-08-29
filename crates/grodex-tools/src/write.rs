@@ -14,6 +14,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// 写入内容的硬上限（T6 大内容输入预算）。单次 `write_file` 调用的
+/// `content` 不得超过此大小，防止模型/调用方一次性写入超大文件撑爆
+/// 内存与磁盘。需要写更大文件时用 `append=true` 分块写入。
+const WRITE_HARD_CAP_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteFileArgs {
     pub path: String,
@@ -22,6 +27,12 @@ pub struct WriteFileArgs {
     /// If provided and the file has changed since, the write is rejected.
     #[serde(default)]
     pub expected_hash: Option<String>,
+    /// T6 大内容写入模式：当为 true 时，以追加方式写入而非整文件覆盖。
+    /// 用于分块构建大文件（每块 ≤ WRITE_HARD_CAP_BYTES），避免一次性
+    /// 重新生成整文件内容。追加模式下 `expected_hash` 校验的是追加前
+    /// 已有文件的哈希。
+    #[serde(default)]
+    pub append: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +41,9 @@ pub struct WriteFileOutput {
     pub bytes_written: u64,
     pub file_existed: bool,
     pub content_hash: String,
+    /// T6：是否以追加模式写入。
+    #[serde(default)]
+    pub append: bool,
 }
 
 pub struct WriteFileTool;
@@ -54,7 +68,7 @@ impl Tool for WriteFileTool {
         ToolMetadata {
             name: "write_file".into(),
             display_name: "Write File".into(),
-            description: "Create or overwrite a file with the given content.".into(),
+            description: "Create or overwrite a file with the given content. Supports append mode for chunked large-file writes.".into(),
             concurrency_class: ConcurrencyClass::Serial,
             side_effect_class: SideEffectClass::NonIdempotent,
             default_policy: grodex_core::policy::PolicyDecision::Ask,
@@ -66,7 +80,9 @@ impl Tool for WriteFileTool {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path to the file to write"},
-                "content": {"type": "string", "description": "Content to write to the file"}
+                "content": {"type": "string", "description": "Content to write to the file (max 16MB per call; use append=true for larger files)"},
+                "expected_hash": {"type": "string", "description": "SHA-256 from the last read; refuse the write if the file changed since then"},
+                "append": {"type": "boolean", "description": "Append to the file instead of overwriting. Use for chunked large-file construction (each chunk ≤ 16MB)."}
             },
             "required": ["path", "content"]
         })
@@ -78,7 +94,8 @@ impl Tool for WriteFileTool {
             "properties": {
                 "path": {"type": "string"},
                 "bytes_written": {"type": "integer"},
-                "file_existed": {"type": "boolean"}
+                "file_existed": {"type": "boolean"},
+                "append": {"type": "boolean"}
             }
         })
     }
@@ -94,40 +111,111 @@ impl ToolRuntime for WriteFileTool {
         let args: WriteFileArgs =
             serde_json::from_value(args).map_err(|e| GrodexError::ToolExecution(format!("invalid args: {e}")))?;
 
-        let file_existed = std::path::Path::new(&args.path).exists();
+        // 把 exists / hash-check 读 / 原子写 / SHA-256 等阻塞操作移到
+        // spawn_blocking 线程池，并经全局 Semaphore 限流（T3）。
+        let result = crate::blocking::run_blocking_io(move || -> Result<WriteFileOutput, GrodexError> {
+            // T6 大内容输入预算：单次写入不得超过硬上限，防止一次性
+            // 写入超大文件撑爆内存与磁盘。需写更大文件请用 append=true
+            // 分块写入。
+            if args.content.len() > WRITE_HARD_CAP_BYTES {
+                return Err(GrodexError::ToolExecution(format!(
+                    "write_file content too large: {} bytes > hard cap {} bytes. \
+                     Use append=true to write large files in chunks.",
+                    args.content.len(),
+                    WRITE_HARD_CAP_BYTES
+                )));
+            }
 
-        // File version fence.
-        if let Some(ref expected) = args.expected_hash {
-            if file_existed {
-                let current = std::fs::read_to_string(&args.path)
-                    .map_err(|e| GrodexError::ToolExecution(format!("hash check: {e}")))?;
-                let mut h = Sha256::new();
-                h.update(current.as_bytes());
-                if format!("{:x}", h.finalize()) != *expected {
-                    return Err(GrodexError::ToolExecution(
-                        "file modified since last read — re-read before writing".into(),
-                    ));
+            let file_existed = std::path::Path::new(&args.path).exists();
+
+            // File version fence (applies to both overwrite and append:
+            // in append mode it guards the *existing* pre-append content).
+            if let Some(ref expected) = args.expected_hash {
+                if file_existed {
+                    let current = std::fs::read_to_string(&args.path)
+                        .map_err(|e| GrodexError::ToolExecution(format!("hash check: {e}")))?;
+                    let mut h = Sha256::new();
+                    h.update(current.as_bytes());
+                    if format!("{:x}", h.finalize()) != *expected {
+                        return Err(GrodexError::ToolExecution(
+                            "file modified since last read — re-read before writing".into(),
+                        ));
+                    }
                 }
             }
-        }
 
-        std::fs::write(&args.path, &args.content)
-            .map_err(|e| GrodexError::ToolExecution(format!("cannot write {}: {e}", args.path)))?;
+            if args.append {
+                // T6 追加模式：分块构建大文件。直接 append 新字节（不
+                // 重写整文件），fsync 持久化，再流式哈希整文件得到
+                // content_hash。
+                use std::io::Write;
+                {
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&args.path)
+                        .map_err(|e| GrodexError::ToolExecution(format!("cannot open(append) {}: {e}", args.path)))?;
+                    f.write_all(args.content.as_bytes())
+                        .map_err(|e| GrodexError::ToolExecution(format!("append write {}: {e}", args.path)))?;
+                    let _ = f.sync_all();
+                }
+                let content_hash = stream_hash_file(&args.path)?;
+                let result = WriteFileOutput {
+                    path: args.path,
+                    bytes_written: args.content.len() as u64,
+                    file_existed,
+                    content_hash,
+                    append: true,
+                };
+                return Ok(result);
+            }
 
-        let content_hash = {
-            let mut h = Sha256::new();
-            h.update(args.content.as_bytes());
-            format!("{:x}", h.finalize())
-        };
-        let result = WriteFileOutput {
-            path: args.path,
-            bytes_written: args.content.len() as u64,
-            file_existed,
-            content_hash,
-        };
+            // 原子写（T7）：tempfile + fsync + atomic rename，崩溃时
+            // 目标文件要么完整旧、要么完整新，绝不半写。
+            crate::fsutil::atomic_write(std::path::Path::new(&args.path), args.content.as_bytes())
+                .map_err(|e| GrodexError::ToolExecution(format!("cannot write {}: {e}", args.path)))?;
+
+            // T9：content_hash 只算一次（旧实现这里也是一次，但与
+            // atomic_write 的临时文件写入不重复，保持单次）。
+            let content_hash = {
+                let mut h = Sha256::new();
+                h.update(args.content.as_bytes());
+                format!("{:x}", h.finalize())
+            };
+            let result = WriteFileOutput {
+                path: args.path,
+                bytes_written: args.content.len() as u64,
+                file_existed,
+                content_hash,
+                append: false,
+            };
+
+            Ok(result)
+        })
+        .await?;
 
         serde_json::to_value(result).map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
     }
+}
+
+/// 流式哈希整个文件（T6 追加模式用）：用 BufReader 逐块喂 SHA-256，
+/// 避免把整个（可能很大的）文件读进一个 String。
+fn stream_hash_file(path: &str) -> Result<String, GrodexError> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| GrodexError::ToolExecution(format!("hash read {}: {e}", path)))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| GrodexError::ToolExecution(format!("hash read {}: {e}", path)))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[derive(Debug, Clone)]
@@ -258,14 +346,19 @@ impl BuiltInTool for WriteFileTool {
 
         let before_hash_for_changed = prepared.before_hash.clone();
 
-        std::fs::write(&prepared.args.path, &prepared.args.content)
-            .map_err(|e| GrodexError::ToolExecution(format!("cannot write {}: {e}", prepared.args.path)))?;
+        // 原子写（T7）：tempfile + fsync + atomic rename。
+        crate::fsutil::atomic_write(
+            std::path::Path::new(&prepared.args.path),
+            prepared.args.content.as_bytes(),
+        )
+        .map_err(|e| GrodexError::ToolExecution(format!("cannot write {}: {e}", prepared.args.path)))?;
 
         let result = WriteFileOutput {
             path: prepared.args.path.clone(),
             bytes_written: prepared.args.content.len() as u64,
             file_existed: prepared.file_existed,
             content_hash: prepared.after_hash.clone(),
+            append: prepared.args.append,
         };
 
         let output_serialized = serde_json::to_string(&result).ok();

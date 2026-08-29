@@ -18,6 +18,7 @@
 
 pub mod blob_refs;
 pub mod blob_store;
+pub mod blocking;
 pub mod cancel;
 pub mod common;
 pub mod edit;
@@ -34,6 +35,7 @@ pub mod write;
 pub use blob_refs::{BlobOwnerKind, BlobRefLedger, BlobRefKind, BlobRefRecord};
 pub use blob_store::{BlobRef, BlobStore, BoundedView, FileBlobStore, InMemoryBlobStore, ManagedBlobStore};
 pub use cancel::{CancelPipeline, CancelRegistry, CancelResult, CancellationToken};
+pub use blocking::run_blocking_io;
 pub use common::{
     ArtifactRef, AtomicityLevel, BuiltInTool, ChangedResource, ChangeType, ExecOutput, ExecStatus,
     FileSnapshot, FileType, HashlineAnchor, HeadTailBuffer, LineEnding, ModelContent,

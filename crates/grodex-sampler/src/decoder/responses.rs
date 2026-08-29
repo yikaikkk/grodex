@@ -245,8 +245,22 @@ impl ResponsesDecoder {
         }
 
         // Determine stop reason.
+        // 优先级：有 pending tool call → ToolCalls；否则读 wire.status：
+        //   incomplete + reason=max_output_tokens → Length（截断，需要 continuation）
+        //   incomplete + reason=content_filter  → ContentFilter
+        //   其他 → Stop
         let stop_reason = if !self.pending_tool_calls.is_empty() {
             Some(StopReason::ToolCalls)
+        } else if wire.status.as_deref() == Some("incomplete") {
+            match wire
+                .incomplete_details
+                .as_ref()
+                .map(|d| d.reason.as_str())
+            {
+                Some("max_output_tokens") => Some(StopReason::Length),
+                Some("content_filter") => Some(StopReason::ContentFilter),
+                _ => Some(StopReason::Stop), // 未知 incomplete reason
+            }
         } else {
             Some(StopReason::Stop)
         };
@@ -431,6 +445,7 @@ mod tests {
                 id: "resp_123".into(),
                 object: "response".into(),
                 status: Some("completed".into()),
+                incomplete_details: None,
                 output: vec![],
                 usage: None,
                 model: Some("gpt-5".into()),
@@ -561,5 +576,63 @@ mod tests {
         // Unknown event should not panic.
         let events = dec.process_event(ResponseStreamEvent::Unknown);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn incomplete_max_output_tokens_maps_to_length() {
+        // WireResponse with status=incomplete + reason=max_output_tokens
+        // must map to StopReason::Length, not Stop.
+        let event = ResponseStreamEvent::ResponseCompleted {
+            response: WireResponse {
+                id: "resp_inc".into(),
+                object: "response".into(),
+                status: Some("incomplete".into()),
+                incomplete_details: Some(crate::wire_types::WireIncompleteDetails {
+                    reason: "max_output_tokens".into(),
+                }),
+                output: vec![],
+                usage: None,
+                model: None,
+            },
+        };
+        let mut dec = ResponsesDecoder::new("req_inc".into());
+        dec.process_event(event);
+        let events = dec.finalize().unwrap();
+        let resp = events
+            .iter()
+            .find_map(|e| match e {
+                CanonicalModelEvent::ResponseCompleted(r) => Some(r),
+                _ => None,
+            })
+            .expect("ResponseCompleted event not found");
+        assert_eq!(resp.stop_reason, Some(StopReason::Length));
+    }
+
+    #[test]
+    fn incomplete_content_filter_maps_to_content_filter() {
+        let event = ResponseStreamEvent::ResponseCompleted {
+            response: WireResponse {
+                id: "resp_cf".into(),
+                object: "response".into(),
+                status: Some("incomplete".into()),
+                incomplete_details: Some(crate::wire_types::WireIncompleteDetails {
+                    reason: "content_filter".into(),
+                }),
+                output: vec![],
+                usage: None,
+                model: None,
+            },
+        };
+        let mut dec = ResponsesDecoder::new("req_cf".into());
+        dec.process_event(event);
+        let events = dec.finalize().unwrap();
+        let resp = events
+            .iter()
+            .find_map(|e| match e {
+                CanonicalModelEvent::ResponseCompleted(r) => Some(r),
+                _ => None,
+            })
+            .expect("ResponseCompleted event not found");
+        assert_eq!(resp.stop_reason, Some(StopReason::ContentFilter));
     }
 }

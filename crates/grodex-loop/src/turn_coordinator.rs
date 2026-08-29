@@ -12,7 +12,7 @@ use crate::capability_manager::{CapabilityManager, TurnCapabilityOverlay};
 use crate::chat_state::ChatStateHandle;
 use crate::context::state_capsule::StateCapsule;
 use crate::context::CompactionManager;
-use crate::step::TurnOutcome;
+use crate::step::{classify_step, StepDisposition, TurnOutcome};
 use crate::turn::{StepResult, TurnContext};
 use grodex_capability::id::{CapabilityId, CapabilityKind};
 use grodex_capability::authority::Authority;
@@ -28,7 +28,7 @@ use grodex_permission::{
     PermissionManager, PermissionPolicy, PermissionResult,
 };
 use grodex_subagent::delegation::DelegationEnvelope;
-use grodex_provider::canonical_event::{CanonicalResponseItem, StopReason};
+use grodex_provider::canonical_event::CanonicalResponseItem;
 use grodex_provider::canonical_request::{CanonicalModelRequest, ToolChoice};
 use grodex_provider::prompt_snapshot::PromptSnapshot;
 use grodex_sampler::{SamplingActor, StreamFragment};
@@ -36,6 +36,17 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
+
+/// Per-turn budget for repair sampling (P0-1).
+///
+/// 当模型以 `StopReason::Stop` 结束且没有产生 Tool Call、文本非空时，它
+/// 很可能只是「描述了下一步计划」而非真正完成。此时注入一条 repair prompt
+/// 让模型二选一（总结收尾 / 调用工具继续），并重新采样。
+///
+/// 预算防止无限循环：连续两次无工具 `Stop`（中间没有工具调度）即视为自然
+/// 完成。取值 1 对齐文档「一次 repair sampling」，同时把真正完成的 turn 的
+/// 额外采样成本限制在 1 次以内。
+const REPAIR_SAMPLING_BUDGET: u8 = 1;
 
 /// Result of one tool execution.
 struct ToolExecResult {
@@ -49,6 +60,11 @@ struct ToolExecResult {
     /// `ToolResultCommitted` journal writes — completing the
     /// operation_id chain across all lifecycle events.
     operation_id: Option<String>,
+    /// T10: tool execution wall-clock duration in milliseconds (from
+    /// `ToolExecutionStarted` to result return). `None` when the tool
+    /// failed before reaching the execution phase (permission denied,
+    /// journal write fail, etc.).
+    duration_ms: Option<u64>,
 }
 
 /// Context passed into `execute_single_tool` so it can write the
@@ -65,6 +81,23 @@ struct ToolExecCtx {
     /// JSON Schema for the tool being executed (if available).
     /// Used by Narrow flow to validate narrowed_args structure.
     tool_schema: Option<serde_json::Value>,
+    /// T5: oversized-result offload threshold. When the tool output
+    /// exceeds this many bytes, it is offloaded to the blob store (or
+    /// temp file) RIGHT HERE — before the result enters the channel —
+    /// so the channel and receiver loop never hold the full payload.
+    /// `0` disables early offload (results flow through unchanged).
+    max_tool_result_bytes: usize,
+    /// T5: managed blob store for oversized result offload. When
+    /// present, early offload writes to the blob store; otherwise it
+    /// falls back to the temp-file path.
+    blob_store: Option<Arc<grodex_tools::ManagedBlobStore<grodex_tools::FileBlobStore>>>,
+    /// T5: session_id for blob ownership + temp-dir isolation.
+    session_id: String,
+    /// T10: per-tool execution timeout in seconds. `0` = no timeout.
+    /// When the tool runs longer than this, it is cancelled and an
+    /// error result is returned (the underlying tool future is dropped,
+    /// which for async tools cancels the pending operation).
+    tool_timeout_secs: u64,
 }
 
 /// Manages one Turn from start to finish.
@@ -123,6 +156,11 @@ pub struct TurnCoordinator {
     /// governed by the `blob_refs` projection instead of scattered temp
     /// files; when absent, the legacy temp-file path is used.
     blob_store: Option<Arc<grodex_tools::ManagedBlobStore<grodex_tools::FileBlobStore>>>,
+    /// T10: per-tool execution timeout in seconds. `0` = no timeout.
+    /// When a tool runs longer than this, it is cancelled and an error
+    /// result is returned to the model. Prevents a single long-running
+    /// tool (e.g. a hung network call) from blocking the entire turn.
+    tool_timeout_secs: u64,
 }
 
 impl TurnCoordinator {
@@ -195,6 +233,14 @@ impl TurnCoordinator {
         self
     }
 
+    /// T10: set the per-tool execution timeout. When a tool runs longer
+    /// than this, it is cancelled and an error result is returned.
+    /// `0` (default) disables the timeout.
+    pub fn with_tool_timeout_secs(mut self, secs: u64) -> Self {
+        self.tool_timeout_secs = secs;
+        self
+    }
+
     /// Reclaim all blobs owned by `session_id`'s offloaded tool results
     /// (Doc 11 §22): revoke the owner's references, then run GC at a
     /// point past the retention grace so the backing files are deleted
@@ -252,6 +298,7 @@ impl TurnCoordinator {
             max_tool_result_bytes: 32 * 1024,
             max_steps: 40,
             blob_store: None,
+            tool_timeout_secs: 0,
         }
     }
 
@@ -374,6 +421,8 @@ impl TurnCoordinator {
         // cancelled, the step budget was exhausted — we then force a
         // wrap-up summary instead of ending the turn silently.
         let mut finished = false;
+        // P0-1：无工具 `Stop` 响应的 repair sampling 剩余预算。
+        let mut repair_budget = REPAIR_SAMPLING_BUDGET;
 
         // ── Approval notification forwarder ───────────────────────────
         // Drains `approval_rx` (fed by `PermissionManager::check()` when
@@ -594,11 +643,13 @@ impl TurnCoordinator {
                     }
 
                     if !has_tools {
-                        // Check if the model was truncated (hit max_output_tokens)
-                        // rather than voluntarily stopping. If so, inject a
-                        // continuation prompt and keep sampling instead of
-                        // ending the turn.
-                        let was_truncated = response.stop_reason == Some(StopReason::Length);
+                        // ── 结构化终止判断（StepDisposition）──
+                        // 把散落的 if/else 收拢成 classify_step 分类函数，
+                        // 终止协议可读、可单测。
+                        let disposition = classify_step(&response, repair_budget);
+
+                        // 非工具分支统一 push step result（工具分支在下方
+                        // dispatch 段自行 push）。
                         steps.push(StepResult {
                             step_id: StepId::new(),
                             response: Some(response.clone()),
@@ -607,29 +658,85 @@ impl TurnCoordinator {
                             tool_calls: Vec::new(),
                             elapsed_ms,
                         });
-                        if was_truncated {
-                            // The model's output was cut off mid-generation.
-                            // Push a nudge so the next sample can continue
-                            // where it left off.
-                            // NOTE: assistant_text was already pushed to
-                            // chat_state above (line ~534), so we only need
-                            // to add the continuation user message.
-                            tracing::info!(
-                                step_id = %step_id,
-                                "output truncated (StopReason::Length) — injecting continuation prompt"
-                            );
-                            self.chat_state.push_user_message(
-                                ContextItem::User {
-                                    content: "[System: Your previous response was truncated because it exceeded the output length limit. \
-                                     Continue exactly from where you left off. If you were in the middle of a tool call, \
-                                     re-issue the complete tool call now.]".into(),
-                                    message_id: None,
-                                }
-                            ).await;
-                            continue; // keep sampling
+
+                        match disposition {
+                            StepDisposition::ContinueForTools => {
+                                // 防御：classify_step 返回 ContinueForTools
+                                // 但 has_tools=false，说明 items 里有
+                                // ToolCall 但 tool_calls() 返回空——
+                                // 不应发生，落入 FinalAnswer 兜底。
+                                tracing::warn!(
+                                    step_id = %step_id,
+                                    "classify_step returned ContinueForTools but has_tools=false — treating as final"
+                                );
+                                finished = true;
+                                break;
+                            }
+                            StepDisposition::Truncated => {
+                                // 输出被截断（max_output_tokens）。
+                                // 注入 continuation prompt 让模型从断点继续。
+                                // NOTE: assistant_text 已在上方 push 到
+                                // chat_state，这里只加 continuation user msg。
+                                tracing::info!(
+                                    step_id = %step_id,
+                                    "output truncated (StopReason::Length) — injecting continuation prompt"
+                                );
+                                self.chat_state.push_user_message(
+                                    ContextItem::User {
+                                        content: "[System: Your previous response was truncated because it exceeded the output length limit. \
+                                         Continue exactly from where you left off. If you were in the middle of a tool call, \
+                                         re-issue the complete tool call now.]".into(),
+                                        message_id: None,
+                                    }
+                                ).await;
+                                continue;
+                            }
+                            StepDisposition::Repair => {
+                                // 无工具自然 Stop + 非空文本 + 预算未耗尽。
+                                // 注入 repair prompt 迫使模型二选一：
+                                //   总结收尾 → turn 结束
+                                //   调用工具 → turn 继续
+                                repair_budget -= 1;
+                                tracing::info!(
+                                    step_id = %step_id,
+                                    repair_budget,
+                                    "no-tool natural stop — injecting repair prompt"
+                                );
+                                self.chat_state.push_user_message(
+                                    ContextItem::User {
+                                        content: "[System: You stopped without calling a tool. \
+                                         If the user's request is fully resolved, give a concise final summary. \
+                                         If you were already in the middle of multi-step tool work that you \
+                                         started earlier in this turn, continue with the next tool call now. \
+                                         IMPORTANT: If your previous message asked the user a question or \
+                                         proposed an action requiring their confirmation (e.g. \"要不要我…\" / \
+                                         \"shall I…\" / \"do you want me to…\"), you MUST NOT auto-execute \
+                                         that proposed action. Wait for the user's response instead. \
+                                         Do not merely describe what you would do next — either summarize \
+                                         your findings or continue already-started work.]".into(),
+                                        message_id: None,
+                                    }
+                                ).await;
+                                continue;
+                            }
+                            StepDisposition::FinalAnswer => {
+                                // 无工具 Stop + 预算耗尽 → 自然结束。
+                                finished = true;
+                                break;
+                            }
+                            StepDisposition::Failed => {
+                                // ContentFilter / 空文本 / Refusal → 报错结束。
+                                // 旧代码这里落入 finished=true 但无任何标记，
+                                // 现在显式记录失败原因。
+                                tracing::warn!(
+                                    step_id = %step_id,
+                                    stop_reason = ?response.stop_reason,
+                                    "step failed (ContentFilter / empty / Refusal) — ending turn"
+                                );
+                                finished = true;
+                                break;
+                            }
                         }
-                        finished = true;
-                        break; // no tools → turn complete
                     }
 
                     // ── Parallel tool dispatch + model-order commit ──
@@ -696,6 +803,7 @@ impl TurnCoordinator {
                                 },
                                 index: CommitSequence::new(idx as u64),
                                 operation_id: None,
+                                duration_ms: None,
                             });
                             continue;
                         }
@@ -793,6 +901,7 @@ impl TurnCoordinator {
                                     },
                                     index: CommitSequence::new(idx as u64),
                                     operation_id: Some(op_id_str.clone()),
+                                    duration_ms: None,
                                 });
                                 continue;
                             }
@@ -843,6 +952,7 @@ impl TurnCoordinator {
                                 },
                                 index: CommitSequence::new(idx as u64),
                                 operation_id: Some(op_id_str.clone()),
+                                duration_ms: None,
                             });
                             continue;
                         }
@@ -864,6 +974,10 @@ impl TurnCoordinator {
                                 let cap = self.capability.lock().await;
                                 cap.tool_schema(name.as_str())
                             },
+                            max_tool_result_bytes: self.max_tool_result_bytes,
+                            blob_store: self.blob_store.clone(),
+                            session_id: turn_ctx.session_id.to_string(),
+                            tool_timeout_secs: self.tool_timeout_secs,
                         };
                         let op_id_for_result = op_id_str.clone();
 
@@ -871,30 +985,39 @@ impl TurnCoordinator {
                             // R14-6: Serial mode — execute sequentially,
                             // waiting for each tool to finish before
                             // starting the next. Respects ConcurrencyClass::Serial.
+                            // T10: measure the full execute_single_tool
+                            // wall-clock (permission + sandbox + execute).
+                            let t0 = std::time::Instant::now();
                             let result = execute_single_tool(
                                 &prepared, runtime.clone(), perm.clone(), sb.clone(),
                                 envelope.as_ref(), &exec_ctx,
                             ).await;
+                            let duration_ms = t0.elapsed().as_millis() as u64;
                             let _ = tx.send(ToolExecResult {
                                 call_id,
                                 name: name.clone(),
                                 result,
                                 index: CommitSequence::new(idx as u64),
                                 operation_id: Some(op_id_for_result),
+                                duration_ms: Some(duration_ms),
                             });
                         } else {
                             // Parallel mode — spawn and collect via channel.
                             tokio::spawn(async move {
+                                // T10: measure duration in the spawned task.
+                                let t0 = std::time::Instant::now();
                                 let result = execute_single_tool(
                                     &prepared, runtime, perm, sb, envelope.as_ref(), &exec_ctx,
                                 )
                                 .await;
+                                let duration_ms = t0.elapsed().as_millis() as u64;
                                 let _ = tx.send(ToolExecResult {
                                     call_id,
                                     name: name.clone(),
                                     result,
                                     index: CommitSequence::new(idx as u64),
                                     operation_id: Some(op_id_for_result),
+                                    duration_ms: Some(duration_ms),
                                 });
                             });
                         }
@@ -1004,7 +1127,7 @@ impl TurnCoordinator {
                                     tr_is_error,
                                     tr_content.as_deref(),
                                     tr_exit_code,
-                                    None, // duration_ms: measured later
+                                    tr.duration_ms, // T10: measured at call site
                                     None, // output_truncated
                                 )
                                 .await
@@ -2037,15 +2160,68 @@ async fn execute_single_tool(
     // Execute against the bound capability revision, using the prepared
     // operation id (audit/idempotency key). Uses `effective_args` which
     // may be the narrowed version if the user approved a Narrow resolution.
+    //
+    // T10: wrap rt.execute() in a per-tool timeout. When the timeout
+    // fires, the tool future is dropped (cancelling the pending async
+    // operation) and an error result is returned to the model so the
+    // turn does not hang indefinitely on a single slow tool.
+    //
+    // T5: after a successful execution, immediately check whether the
+    // output exceeds the offload threshold and offload it to the blob
+    // store / temp file RIGHT HERE — before the result enters the channel
+    // and receiver loop. This avoids the full payload sitting in the
+    // channel and the receiver's memory.
     match runtime {
         Some(rt) => {
             tracing::debug!("executing tool");
-            match rt.execute(effective_args, prepared.operation_id).await {
+            let exec_future = rt.execute(effective_args, prepared.operation_id);
+            let output = if ctx.tool_timeout_secs > 0 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(ctx.tool_timeout_secs),
+                    exec_future,
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_secs = ctx.tool_timeout_secs,
+                            tool = %name,
+                            "tool execution timed out"
+                        );
+                        return ContextItem::ToolResult {
+                            call_id,
+                            content: format!(
+                                "Error: tool execution timed out after {}s",
+                                ctx.tool_timeout_secs
+                            ),
+                            is_error: true,
+                        };
+                    }
+                }
+            } else {
+                exec_future.await
+            };
+            match output {
                 Ok(output) => {
                     tracing::info!("tool executed successfully");
+                    let content = output.to_string();
+                    // T5: early offload oversized results before they
+                    // enter the channel, so the receiver loop and all
+                    // downstream consumers only see the small preview +
+                    // path reference.
+                    let content = early_offload_tool_result(
+                        content,
+                        ctx.max_tool_result_bytes,
+                        ctx.blob_store.as_ref(),
+                        &ctx.session_id,
+                        &name,
+                        call_id,
+                    )
+                    .await;
                     ContextItem::ToolResult {
                         call_id,
-                        content: output.to_string(),
+                        content,
                         is_error: false,
                     }
                 }
@@ -2147,6 +2323,70 @@ async fn offload_large_result(
         "offloaded oversized tool result to temp file"
     );
     Some(path)
+}
+
+/// T5: early offload an oversized tool result right at the execution site,
+/// BEFORE the result enters the channel and receiver loop. This avoids
+/// the full payload sitting in the channel/receiver memory — only the
+/// small preview + path reference travels downstream.
+///
+/// When `max_bytes` is 0 or the content fits, returns the content
+/// unchanged (no offload). When offloading succeeds, returns a preview +
+/// path reference string. When offloading fails (e.g. disk full), returns
+/// a truncated preview with a warning — better to give the model a
+/// truncated result than to fail the entire turn.
+async fn early_offload_tool_result(
+    content: String,
+    max_bytes: usize,
+    blob_store: Option<&Arc<grodex_tools::ManagedBlobStore<grodex_tools::FileBlobStore>>>,
+    session_id: &str,
+    tool_name: &str,
+    call_id: grodex_core::id::ToolCallId,
+) -> String {
+    if max_bytes == 0 || content.len() <= max_bytes {
+        return content;
+    }
+    let orig_len = content.len();
+    let path = if let Some(store) = blob_store {
+        let (_blob_ref, hash) = store
+            .store_owned(
+                content.as_bytes().to_vec(),
+                "text/plain".to_string(),
+                grodex_tools::BlobOwnerKind::ToolResult,
+                session_id.to_string(),
+                grodex_tools::BlobRefKind::ToolOutputBody,
+                None,
+            )
+            .await;
+        let p = store.inner().path_of(&hash);
+        tracing::info!(
+            bytes = orig_len,
+            path = %p.display(),
+            "early-offloaded oversized tool result to blob store"
+        );
+        Some(p)
+    } else {
+        offload_large_result(&content, tool_name, call_id, session_id).await
+    };
+    match path {
+        Some(path) => {
+            let preview = truncate_utf8(&content, 2048);
+            format!(
+                "工具结果过大（{orig_len} 字节），完整内容已保存到临时文件：{}\n\
+                 以下为前 2048 字节预览：\n{preview}\n\n\
+                 [预览截断] 如需完整内容，请用 read_artifact 工具读取：path=\"{}\"",
+                path.display(),
+                path.display()
+            )
+        }
+        None => {
+            // Offload failed — truncate in-place as a fallback.
+            let preview = truncate_utf8(&content, 2048);
+            format!(
+                "工具结果过大（{orig_len} 字节），offload 失败。以下为前 2048 字节预览：\n{preview}\n\n[预览截断]"
+            )
+        }
+    }
 }
 
 /// Truncate a string at a UTF-8 char boundary (never splits a multibyte char).

@@ -14,12 +14,23 @@ pub struct WireResponse {
     pub object: String,
     #[serde(default)]
     pub status: Option<String>,
+    /// OpenAI Responses API: 当 status = "incomplete" 时携带截断原因。
+    /// reason = "max_output_tokens" → 输出被截断；"content_filter" → 内容被过滤。
+    #[serde(default)]
+    pub incomplete_details: Option<WireIncompleteDetails>,
     #[serde(default)]
     pub output: Vec<WireOutputItem>,
     #[serde(default)]
     pub usage: Option<WireUsage>,
     #[serde(default)]
     pub model: Option<String>,
+}
+
+/// `response.incomplete_details` — 解释为何 response 状态是 incomplete。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireIncompleteDetails {
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// One output item in a response.

@@ -501,6 +501,15 @@ impl SessionRuntimeBuilder {
             .and_then(|v| v.as_integer())
             .filter(|v| *v > 0)
             .map(|v| v as usize);
+        // T10: per-tool execution timeout. When a tool runs longer than
+        // this, it is cancelled and an error result is returned. `0` (default)
+        // disables the timeout. Prevents a single hung tool from blocking
+        // the entire turn indefinitely.
+        let tool_timeout_secs = cfg
+            .get("tool_timeout_secs")
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v >= 0)
+            .map(|v| v as u64);
 
         let model_config = self.model_config_override.unwrap_or_else(|| {
             // context_window: explicit config > built-in model table > 1M
@@ -546,6 +555,9 @@ impl SessionRuntimeBuilder {
         }
         if let Some(steps) = max_steps_per_turn {
             coordinator = coordinator.with_max_steps(steps);
+        }
+        if let Some(secs) = tool_timeout_secs {
+            coordinator = coordinator.with_tool_timeout_secs(secs);
         }
 
         // Register built-in tools. Each gets a fresh runtime instance +

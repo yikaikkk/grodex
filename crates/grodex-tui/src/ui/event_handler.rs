@@ -149,6 +149,9 @@ fn handle_normal(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
         }
     }
     match (key.code, key.modifiers) {
+        // SUPER+char not handled above (only c/v/a) = drop, don't scroll
+        // or navigate. Prevents garbage from non-bracketed Cmd+V paste.
+        (KeyCode::Char(_), mods) if mods.contains(KeyModifiers::SUPER) => None,
         // 'q' 单键退出已移除：避免用户在 Normal 模式滚动时误触 q 直接
         // 退出（Grok / Codex / Claude Code 都没有单字母退出）。
         // 正确的退出方式是：两次 Ctrl+C 或者 /exit /quit。
@@ -728,6 +731,16 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
                 }
                 return None;
             }
+            // SUPER (Cmd) modifier: on macOS, Cmd+char is ALWAYS a system
+            // shortcut, never a character to type into the buffer. When a
+            // terminal doesn't support bracketed paste, Cmd+V may send the
+            // clipboard contents as individual SUPER+char key events —
+            // inserting them would produce garbage (e.g. "h e l l o" with
+            // spaces from interleaved events). Drop all SUPER+char events
+            // that weren't caught by the known-shortcut patterns above.
+            if key.modifiers.contains(KeyModifiers::SUPER) {
+                return None;
+            }
             insert_at_cursor(&mut state.input_buffer, &mut state.input_cursor,
                 &c.to_string());
             // 编辑动作：退出历史导航。
@@ -885,6 +898,12 @@ fn handle_command(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             // Same gate as prompt: only '\r'/'\n' are rejected by us, the
             // terminal layer is trusted for everything else.
             if matches!(c, '\r' | '\n') {
+                return None;
+            }
+            // SUPER+char that wasn't caught above = not a known shortcut;
+            // drop it (same rationale as prompt mode — prevents garbage
+            // from non-bracketed Cmd+V paste).
+            if key.modifiers.contains(KeyModifiers::SUPER) {
                 return None;
             }
             let buf = &mut state.command_buffer;

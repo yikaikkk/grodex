@@ -169,48 +169,47 @@ impl ToolRuntime for EditTool {
         let args: EditArgs =
             serde_json::from_value(args).map_err(|e| GrodexError::ToolExecution(format!("invalid args: {e}")))?;
 
+        // 把整文件读 / hash fence / replace / 原子写等阻塞操作移到
+        // spawn_blocking 线程池，并经全局 Semaphore 限流（T3）。
+        let result = crate::blocking::run_blocking_io(move || -> Result<EditOutput, GrodexError> {
         let content = std::fs::read_to_string(&args.path)
             .map_err(|e| GrodexError::ToolExecution(format!("cannot read {}: {e}", args.path)))?;
 
+        let bytes_before = content.len() as u64;
+        // T9：整文件 SHA-256 只算一次，复用于 lost-update fence、snapshot
+        // fence 与 content_hash_before。旧实现对同一份旧内容最多哈希 3
+        // 次（hash fence、snapshot fence、content_hash_before 各一次）。
+        let content_hash_before = compute_content_hash(&content);
+
         // Lost-update fence (hash-based).
         if let Some(expected) = &args.expected_content_hash {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(content.as_bytes());
-            let actual = format!("{:x}", h.finalize());
-            if &actual != expected {
+            if &content_hash_before != expected {
                 return Err(GrodexError::ToolExecution(format!(
                     "lost-update fence: {} changed since last read (expected hash {}, got {}). Re-read before editing.",
-                    args.path, expected, actual
+                    args.path, expected, content_hash_before
                 )));
             }
         }
 
         // Structured version fence (snapshot-based, §9.2).
         if let Some(ref expected_snap) = args.expected_snapshot {
-            let actual_size = content.len() as u64;
-            let mut h = Sha256::new();
-            h.update(content.as_bytes());
-            let actual_hash = format!("{:x}", h.finalize());
             // Verify content_hash.
             if let Some(ref expected_hash) = expected_snap.content_hash {
-                if &actual_hash != expected_hash {
+                if &content_hash_before != expected_hash {
                     return Err(GrodexError::ToolExecution(format!(
                         "stale_file: {} content_hash mismatch (expected {}, actual {}). Re-read before editing.",
-                        args.path, expected_hash, actual_hash
+                        args.path, expected_hash, content_hash_before
                     )));
                 }
             }
             // Verify size.
-            if expected_snap.size != actual_size {
+            if expected_snap.size != bytes_before {
                 return Err(GrodexError::ToolExecution(format!(
                     "stale_file: {} size mismatch (expected {}, actual {}). Re-read before editing.",
-                    args.path, expected_snap.size, actual_size
+                    args.path, expected_snap.size, bytes_before
                 )));
             }
         }
-
-        let bytes_before = content.len() as u64;
 
         // ── Batch edit mode ──
         if let Some(ref edits) = args.edits {
@@ -221,9 +220,13 @@ impl ToolRuntime for EditTool {
             crate::fsutil::atomic_write(std::path::Path::new(&args.path), new_content.as_bytes())
                 .map_err(|e| GrodexError::ToolExecution(format!("cannot write {}: {e}", args.path)))?;
 
-            let fresh = build_fresh_snapshot(&args.path, &new_content);
-            let content_hash_before = compute_content_hash(&content);
+            // T9：新内容哈希只算一次，fresh_snapshot 复用之（旧实现算 2 次）。
             let content_hash_after = compute_content_hash(&new_content);
+            let fresh = build_fresh_snapshot(
+                &args.path,
+                new_content.len() as u64,
+                content_hash_after.clone(),
+            );
             let line_ending = detect_line_ending(&content);
             let result = EditOutput {
                 path: args.path,
@@ -238,8 +241,7 @@ impl ToolRuntime for EditTool {
                 lines_after: new_content.lines().count(),
                 no_op: content == new_content,
             };
-            return serde_json::to_value(result)
-                .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")));
+            return Ok(result);
         }
 
         // ── Single edit mode (backward-compatible) ──
@@ -275,9 +277,12 @@ impl ToolRuntime for EditTool {
         crate::fsutil::atomic_write(std::path::Path::new(&args.path), new_content.as_bytes())
             .map_err(|e| GrodexError::ToolExecution(format!("cannot write {}: {e}", args.path)))?;
 
-        let fresh = build_fresh_snapshot(&args.path, &new_content);
-        let content_hash_before = compute_content_hash(&content);
         let content_hash_after = compute_content_hash(&new_content);
+        let fresh = build_fresh_snapshot(
+            &args.path,
+            new_content.len() as u64,
+            content_hash_after.clone(),
+        );
         let line_ending = detect_line_ending(&content);
         let result = EditOutput {
             path: args.path,
@@ -293,6 +298,10 @@ impl ToolRuntime for EditTool {
             no_op: content == new_content,
         };
 
+        Ok(result)
+        })
+        .await?;
+
         serde_json::to_value(result).map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
     }
 }
@@ -303,8 +312,12 @@ impl ToolRuntime for EditTool {
 ///
 /// Each operation finds its `old_string` in the content and records the
 /// byte range. If any two ranges overlap, the batch is rejected. Otherwise
-/// edits are applied bottom-up (last position first) so earlier edits
-/// don't shift the byte offsets of later ones.
+/// the result is stitched in a single forward pass: copy `[cursor, start)`
+/// verbatim, then splice the replacement, advancing `cursor` to `end`.
+///
+/// T8：旧实现 `content.to_string()` 整文件复制 + 对每个编辑调用
+/// `replace_range`（每次因字节平移为 O(n)），k 个编辑共 O(k·n)。单遍
+/// 拼接为 O(n + Σ replacement)，无整文件复制、无逐次平移。
 ///
 /// Returns `(new_content, total_replacements)`.
 fn apply_batch_edits(
@@ -352,28 +365,34 @@ fn apply_batch_edits(
         }
     }
 
-    // 4. Apply bottom-up (reverse order by position) so offsets stay valid.
-    let mut result = content.to_string();
-    for m in matches.iter().rev() {
-        result.replace_range(m.start..m.end, &m.replacement);
+    // 4. T8：单遍正向拼接。按 start 排序且已验证不重叠，逐段复制未改
+    // 动部分并插入替换串，一次成型，无需整文件复制与逐次字节平移。
+    let mut result = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    for m in &matches {
+        result.push_str(&content[cursor..m.start]);
+        result.push_str(&m.replacement);
+        cursor = m.end;
     }
+    result.push_str(&content[cursor..]);
 
     Ok((result, edits.len()))
 }
 
 /// Build a fresh `FileSnapshot` after a successful write, so the caller
 /// can chain subsequent edits without re-reading (§9.2 / §10.5).
-fn build_fresh_snapshot(path: &str, new_content: &str) -> FileSnapshot {
-    let mut h = Sha256::new();
-    h.update(new_content.as_bytes());
-    let content_hash = format!("{:x}", h.finalize());
+///
+/// T9：接收调用方已算好的 `content_hash` 与 `size`，不再重复哈希整文件
+/// 内容——旧实现对写入后的新内容会哈希 2 次（fresh_snapshot 一次 +
+/// `content_hash_after` 一次）。
+fn build_fresh_snapshot(path: &str, size: u64, content_hash: String) -> FileSnapshot {
     let canonical_path = crate::fsutil::canonicalize(std::path::Path::new(path));
     let canonical_resource_id = format!("fs://{}", canonical_path.display());
     FileSnapshot {
         canonical_resource_id,
         display_path: PathBuf::from(path),
         file_type: FileType::Text,
-        size: new_content.len() as u64,
+        size,
         mtime_secs: std::fs::metadata(path)
             .ok()
             .and_then(|m| m.modified().ok())
@@ -397,13 +416,25 @@ fn compute_content_hash(content: &str) -> String {
 }
 
 /// Detect line ending style in content. Returns "lf", "crlf", or "mixed".
+///
+/// T9：单遍字节扫描统计 `\r\n` 与裸 `\n`，替代旧的多次
+/// `contains`/`matches` 扫描（旧实现约 5 次 O(n) 扫描）。
 fn detect_line_ending(content: &str) -> String {
-    let has_crlf = content.contains("\r\n");
-    let has_lf = content.contains('\n') && !content.contains("\r\n");
-    let has_bare_lf = content.matches('\n').count() > content.matches("\r\n").count();
-    if has_crlf && has_bare_lf {
+    let bytes = content.as_bytes();
+    let mut crlf = 0usize;
+    let mut bare_lf = 0usize;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'\n' {
+            if i > 0 && bytes[i - 1] == b'\r' {
+                crlf += 1;
+            } else {
+                bare_lf += 1;
+            }
+        }
+    }
+    if crlf > 0 && bare_lf > 0 {
         "mixed".to_string()
-    } else if has_crlf {
+    } else if crlf > 0 {
         "crlf".to_string()
     } else {
         "lf".to_string()
@@ -602,15 +633,21 @@ impl BuiltInTool for EditTool {
             ))
         })?;
 
-        let content_hash_before = compute_content_hash(&prepared.original_content);
-        let content_hash_after = compute_content_hash(&prepared.new_content);
+        // T9：`prepare` 已算好 before_hash / after_hash，execute 复用之，
+        // 不再对旧/新内容重复哈希（旧实现这里又各算一次）。
+        let content_hash_before = prepared.before_hash.clone();
+        let content_hash_after = prepared.after_hash.clone();
         let line_ending = detect_line_ending(&prepared.original_content);
         let result = EditOutput {
             path: prepared.args.path.clone(),
             replacements: prepared.replacements,
             bytes_before: prepared.original_content.len() as u64,
             bytes_after: prepared.new_content.len() as u64,
-            fresh_snapshot: Some(build_fresh_snapshot(&prepared.args.path, &prepared.new_content)),
+            fresh_snapshot: Some(build_fresh_snapshot(
+                &prepared.args.path,
+                prepared.new_content.len() as u64,
+                content_hash_after.clone(),
+            )),
             content_hash_before,
             content_hash_after,
             line_ending,

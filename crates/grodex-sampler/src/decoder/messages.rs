@@ -260,7 +260,9 @@ impl StreamingDecoder for MessagesDecoder {
         }
 
         let stop_reason = match self.stop_reason.as_deref() {
-            Some("end_turn") => Some(StopReason::Stop),
+            Some("end_turn") | Some("stop_sequence") | Some("pause_turn") => {
+                Some(StopReason::Stop)
+            }
             Some("max_tokens") => Some(StopReason::Length),
             Some("tool_use") => Some(StopReason::ToolCalls),
             _ if !self.pending_tool_calls.is_empty() => Some(StopReason::ToolCalls),

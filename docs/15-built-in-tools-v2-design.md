@@ -719,3 +719,28 @@ Codex Unified Exec / head+tail
 ```
 
 这比简单选择一家的 Tool 集合更有价值：它把模型编辑成功率、外部并发安全、进程恢复和上下文预算放进同一套可测试协议。
+
+## 22. 性能优化（T1–T10）
+
+以下优化消除 Tool 执行路径中的多次全量扫描、内存复制和重复哈希，同时增加超时和耗时追踪。
+
+### T1b/T4：read_file 字节范围零分配映射
+旧实现在 `ReadRange::Bytes` 分支调用 `all_lines.join("\n")` 仅为取总长度，这会分配整文件副本。新实现用前缀和公式零分配得到等价总长（`Σ line.len() + (行数-1) 个 '\n'`），再单遍扫描把字节偏移映射到行索引。O(n) 时间、O(1) 额外空间。
+
+### T8：apply_batch_edits 单遍正向拼接
+旧实现 `content.to_string()` 整文件复制后对每个编辑调用 `replace_range`，每次因字节平移为 O(n)，k 个编辑共 O(k·n)。新实现先收集所有 match 位置并排序验证不重叠，然后单遍正向拼接：`result.push_str(&content[cursor..m.start]); result.push_str(&m.replacement); cursor = m.end;`。时间复杂度降为 O(n + Σ replacement)，无整文件复制、无逐次平移。
+
+### T9：build_fresh_snapshot 接收预计算哈希
+旧实现在 edit/write 操作后对新内容哈希 2 次（`fresh_snapshot` 一次 + `content_hash_after` 一次）。新实现让 `build_fresh_snapshot` 接收调用方已算好的 `content_hash` 与 `size`，不再重复哈希整文件内容。
+
+### T6：write_file 大内容预算 + Artifact 追加模式
+- `WRITE_HARD_CAP_BYTES = 16MB`：单次写入不得超过此大小，防止一次性写入超大文件撑爆内存与磁盘。
+- `append = true` 追加模式：用于分块构建大文件（每块 ≤ 16MB），直接 append 新字节（不重写整文件），fsync 持久化。
+- `stream_hash_file`：追加模式后用 BufReader 逐块（64KB）喂 SHA-256 计算整文件哈希，避免把整个大文件读进 String。
+
+### T5：Tool Result offload 时机提前
+旧实现在 receiver 循环中收到完整结果后才 offload 大结果到 blob store / temp file，大 payload 先经过 channel 再被替换。新实现在 `execute_single_tool` 内 `rt.execute()` 返回后立即调用 `early_offload_tool_result`，在结果进入 channel 之前就替换为预览 + 路径引用。并行工具各自独立 offload，不再排队等待 receiver 顺序处理。
+
+### T10：Tool 执行超时 + 分阶段耗时
+- `tool_timeout_secs` 配置（默认 0 = 不限）：用 `tokio::time::timeout` 包装 `rt.execute()`，超时时取消 tool future（async 工具直接 drop），返回 error 结果防止单个卡死工具阻塞整个 turn。
+- `duration_ms` 追踪：在 call site 用 `Instant::now` 测量 `execute_single_tool` 的完整墙钟时间（含权限检查、沙箱验证、审批流程），写入 `ToolExecutionFinished` journal 事件的 `duration_ms` 字段，旧值为 `None`（"measured later" 但从未测量）。

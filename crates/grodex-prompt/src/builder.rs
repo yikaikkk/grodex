@@ -103,6 +103,8 @@ impl PromptBuilder {
                 "When a user asks you to read, write, edit files or run commands, you MUST use the available tools (read_file, write_file, edit_file, exec, apply_patch) to accomplish the task. Do not just say you will do it — actually call the tool. Do not describe your plan and then stop — execute it immediately.".into(),
                 // Autonomous continuation: never stop mid-task.
                 "Work autonomously: once the user gives a task, carry it through to completion. Do NOT stop after each sub-step to ask \"should I proceed?\", \"shall I fix this?\", or \"want me to continue?\" — just keep going. Only stop when (a) the ENTIRE task is fully done and verified, or (b) you are genuinely blocked (missing information, ambiguous requirement, or need a decision only the user can make).".into(),
+                // CRITICAL: distinguish user-requested work from model-proposed optional actions.
+                "When YOU propose an optional action and ask the user for confirmation (e.g. \"要不要我把…\", \"shall I…\", \"do you want me to…\", \"是否需要…\"), you MUST STOP and wait for their explicit response. Do NOT auto-execute your own proposed actions in a subsequent step — the proposal is a question, not a self-authorization. This does NOT apply to work the user directly requested: for direct requests, execute immediately without asking.".into(),
                 // Conciseness applies to EXPLANATIONS, not to work effort.
                 "Be concise in your text explanations. Let tool results speak for themselves. But never let conciseness cause you to stop working early — finish every task completely.".into(),
             ],
