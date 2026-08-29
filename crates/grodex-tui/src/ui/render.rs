@@ -759,22 +759,18 @@ fn render_conversation(f: &mut Frame<'_>, state: &mut TuiAppState, area: Rect) {
     if state.messages.is_empty() {
         rows.push(Line::from(vec![
             Span::raw("  "),
-            style_s(c_muted(), "Type a question below — no "),
-            style_s(c_kbd(), " i "),
-            style_s(c_muted(), " needed.  "),
-            style_s(c_accent(), "Try typing `/`"),
-            style_s(c_muted(), " to see built-in commands."),
+            style_s(c_muted(), "在下方直接输入问题即可开始对话;输入 "),
+            style_s(c_kbd(), "/"),
+            style_s(c_muted(), " 查看内置命令。"),
         ]));
         rows.push(Line::from(vec![Span::raw("")]));
         rows.push(Line::from(vec![
             Span::raw("  "),
-            style_s(c_muted(), "Suggestions:"),
+            style_s(c_muted(), "试试:"),
         ]));
         for idea in [
-            "Summarise the project structure and suggest next steps",
-            "List the current open TODO items from the task docs",
-            "Open `docs/10-tool-skill-mcp-v2-design.md` and summarise the gaps",
-            "Run `cargo check --workspace` and fix warnings",
+            "总结当前项目结构,并给出下一步建议",
+            "查找并解释某个函数或文件的实现",
         ] {
             rows.push(Line::from(vec![
                 Span::raw("    • "),

@@ -169,6 +169,10 @@ pub struct GrodexTui {
     queued_dispatch: bool,
     /// 上一次实际执行 draw() 的时间（帧率节流，防光标高频闪烁）。
     last_frame_at: std::time::Instant,
+    /// 上一次鼠标事件时间(用于空闲时重同步鼠标上报模式)。
+    last_mouse_at: std::time::Instant,
+    /// 当前空闲间隙是否已重同步过(每个间隙只做一次,避免刷屏)。
+    mouse_idle_reenabled: bool,
 }
 
 impl GrodexTui {
@@ -211,6 +215,8 @@ impl GrodexTui {
             queued_dispatch: false,
             // 倒推 1 秒，保证首帧无需等待节流窗口即可立即绘制。
             last_frame_at: std::time::Instant::now() - Duration::from_secs(1),
+            last_mouse_at: std::time::Instant::now() - Duration::from_secs(1),
+            mouse_idle_reenabled: false,
         })
     }
 
@@ -686,6 +692,22 @@ impl GrodexTui {
             // draw()，render_prompt_widget 每帧 set_cursor() 会让终端硬光标在
             // 高频重绘中闪烁。这里把重绘压到最高 ~60fps；两次 draw 之间到达
             // 的事件照常累积，下一帧一并呈现——只影响呈现节奏，不影响正确性。
+            // ── 鼠标空闲重同步(VSCode 右键降级修复)──
+            // VSCode 终端右键会把鼠标上报降级(先是 Up 丢失,再是 Drag 丢失,
+            // 累积退化),且在按钮按下期间重发 1000h 会破坏进行中的手势。
+            // 因此只在"鼠标空闲 ≥150ms"(即两次手势之间、无按钮按下)时重发
+            // 完整三件套 1000h+1002h+1006h,为下一次手势重建上报。每个空闲
+            // 间隙只做一次,避免高频刷屏。
+            let idle_now = std::time::Instant::now();
+            if !self.mouse_idle_reenabled
+                && idle_now.duration_since(self.last_mouse_at) >= Duration::from_millis(150)
+            {
+                let mut stderr = io::stderr();
+                let _ = io::Write::write_all(&mut stderr, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+                let _ = io::Write::flush(&mut stderr);
+                self.mouse_idle_reenabled = true;
+            }
+
             let frame_now = std::time::Instant::now();
             if frame_now.duration_since(self.last_frame_at) >= MIN_FRAME_INTERVAL {
                 self.last_frame_at = frame_now;
@@ -3114,6 +3136,43 @@ impl GrodexTui {
                         }
                     }
                     CrosstermEvent::Mouse(m) => {
+                        // 任何鼠标活动:刷新空闲计时器,标记本间隙尚未重同步。
+                        self.last_mouse_at = std::time::Instant::now();
+                        self.mouse_idle_reenabled = false;
+                        // DEBUG: 记录每个鼠标事件 + 当前选区状态,排查右键后拖拽丢失。
+                        {
+                            use std::io::Write as _;
+                            let kind = match m.kind {
+                                crossterm::event::MouseEventKind::Down(b) => format!("Down({b:?})"),
+                                crossterm::event::MouseEventKind::Up(b) => format!("Up({b:?})"),
+                                crossterm::event::MouseEventKind::Drag(b) => format!("Drag({b:?})"),
+                                crossterm::event::MouseEventKind::Moved => "Moved".into(),
+                                crossterm::event::MouseEventKind::ScrollUp => "ScrollUp".into(),
+                                crossterm::event::MouseEventKind::ScrollDown => "ScrollDown".into(),
+                                _ => "Other".into(),
+                            };
+                            let (a, e) = self
+                                .state
+                                .selection
+                                .as_ref()
+                                .map(|s| (format!("{:?}", s.anchor), format!("{:?}", s.end)))
+                                .unwrap_or(("None".into(), "None".into()));
+                            let t = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() % 100000)
+                                .unwrap_or(0);
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/tmp/grodex_mouse_debug.log")
+                            {
+                                let _ = writeln!(
+                                    f,
+                                    "[{t}] kind={kind} col={} row={} sel.anchor={a} sel.end={e}",
+                                    m.column, m.row
+                                );
+                            }
+                        }
                         // ── 鼠标:滚轮滚动 + 拖拽选中（grok-build 模式）──
                         // 滚轮驱动应用内对话滚动;左键按下/拖拽/松开构成
                         // 一次选中,松开时用 OSC 52 把选中文本写入系统剪贴板。
@@ -3137,7 +3196,11 @@ impl GrodexTui {
                                     self.state.scroll_down(None);
                                 }
                             }
-                            // 左键按下:开始新选区（替换旧选区）。
+                            // 左键按下:开始新选区(替换旧选区)。
+                            // 注意:不要在此处重发鼠标上报序列。实测在按钮
+                            // 按下期间重发 1000h 会让 xterm.js 重置"按钮按下"
+                            // 状态,反而破坏进行中的拖拽(连正常左键都选不中)。
+                            // 上报模式恢复只在 Down(Right) 做(那时左键未按下)。
                             MouseEventKind::Down(MouseButton::Left) => {
                                 self.state.selection = Some(ui::state::ScreenSelection {
                                     anchor: (m.column, m.row),
@@ -3150,13 +3213,33 @@ impl GrodexTui {
                                     sel.end = (m.column, m.row);
                                 }
                             }
-                            // 左键松开:仅保留高亮,不自动复制 —— 复制由
-                            // Cmd-C（CopySelection）显式触发。单击(空选区)
-                            // 清除高亮。
+                            // 左键松开:仅当发生过实际拖拽移动(anchor != end)
+                            // 才保留为有效选区。单击(无移动)不构成选区——
+                            // 否则单点坐标会被当成"选中一个字符"遗留下来
+                            // (右键后 Drag 丢失时正是暴露为此症状:看起来
+                            // 只选中了一个字)。
                             MouseEventKind::Up(MouseButton::Left) => {
-                                if self.state.selection_text().is_empty() {
+                                let stale = self
+                                    .state
+                                    .selection
+                                    .as_ref()
+                                    .map_or(true, |s| s.anchor == s.end);
+                                if stale {
                                     self.state.selection = None;
                                 }
+                            }
+                            // 右键按下:VSCode 右键会重置鼠标上报,这里
+                            // 立即重发完整三件套,让紧随其后的左键拖拽能
+                            // 拿到 Drag;同时清空当前选区(右键交给终端原生
+                            // 菜单 / copyPaste)。
+                            MouseEventKind::Down(MouseButton::Right) => {
+                                let mut stderr = io::stderr();
+                                let _ = io::Write::write_all(
+                                    &mut stderr,
+                                    b"\x1b[?1000h\x1b[?1002h\x1b[?1006h",
+                                );
+                                let _ = io::Write::flush(&mut stderr);
+                                self.state.selection = None;
                             }
                             _ => {}
                         }
