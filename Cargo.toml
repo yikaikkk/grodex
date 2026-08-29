@@ -55,6 +55,8 @@ base64 = "0.22"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "scrolling-regions"] }
 crossterm = "0.29"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # Internal crates
 grodex-core = { path = "crates/grodex-core" }

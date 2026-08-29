@@ -39,6 +39,9 @@ grodex-subagent.workspace = true
 grodex-prompt.workspace = true
 grodex-tui.workspace = true
 grodex-mcp.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
 
 [lints]
 workspace = true

@@ -653,10 +653,13 @@ pub struct TuiAppState {
     /// Messages before this index are NOT rendered in the viewport.
     /// （当前设计:内容全部在应用内渲染,此字段不再前移,保留供回退。）
     pub finalized_count: usize,
-    /// ── 应用内文本选择（grok-build 模式:捕获鼠标后自建选中/复制）──
+    /// ── 应用内文本选择（grok 同款三态状态机）──
     /// 当前拖拽/已完成的选区,(列,行) 为 viewport 坐标,anchor=起点 end=终点。
     /// None 表示没有选区。
     pub selection: Option<ScreenSelection>,
+    /// Down(Left) 锚点:按下时记录,Drag 超过阈值后提升为 selection。
+    /// 对应 grok 的 PendingTextDrag。None 表示没有待提升的按下。
+    pub pending_drag_anchor: Option<(u16, u16)>,
     /// 上一帧 viewport 的纯文本快照（每行一个 String,由渲染闭包在 draw
     /// 末尾写入）。选中释放时用它提取被选中的文本。
     pub screen_text: Vec<String>,
@@ -799,6 +802,7 @@ impl TuiAppState {
             scroll_conversation: 0,
             scroll_follow_bottom: true,
             selection: None,
+            pending_drag_anchor: None,
             screen_text: Vec::new(),
             cancel_sent: false,
             compacting: false,

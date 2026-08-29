@@ -170,8 +170,44 @@ enum PromptCommand {
     },
 }
 
+/// 安装可观测性订阅器:trace 写入文件(`~/.grodex/logs/grodex.log`,
+/// 可用 `GRODEX_LOG_DIR` 覆盖),避免污染 TUI 的 alt-screen 终端输出。
+/// 返回的 guard 必须在整个进程生命周期内存活,以保证 non-blocking
+/// writer 在退出时 flush。级别受 `RUST_LOG` 控制;未设置时 grodex
+/// crate 默认 info(grodex_loop=debug 以便看到 step/turn 细节),第三方
+/// crate(hyper/reqwest/tokio)默认 warn 以降噪。
+fn init_observability() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::EnvFilter;
+
+    let log_dir = std::env::var("GRODEX_LOG_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".grodex").join("logs")))
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "grodex.log");
+    let (nb, guard) = tracing_appender::non_blocking(file_appender);
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "warn,grodex_loop=debug,grodex_cli=info,grodex_sampler=info,\
+             grodex_rollout=info,grodex_memory=info,grodex_subagent=info,\
+             grodex_permission=info,grodex_capability=info",
+        )
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(nb)
+        .with_target(false)
+        .with_ansi(false)
+        .init();
+    tracing::info!(target: "grodex_cli", log_dir = %log_dir.display(), "observability subscriber installed");
+    Some(guard)
+}
+
 #[tokio::main]
 async fn main() {
+    let _log_guard = init_observability();
     let cli = Cli::parse();
 
     match cli.command {

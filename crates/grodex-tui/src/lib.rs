@@ -263,15 +263,7 @@ impl GrodexTui {
         // 关闭鼠标/滚轮上报 + 复位 scroll region（见 TERMINAL_RESET_ESCAPE）。
         let _viewport_guard = InlineViewportGuard;
 
-        // VS Code 集成终端:Cmd+C 被编辑器截留（无原生选中时还会向应用
-        // 发送 Ctrl+C,有误触取消/退出风险）。提示用户复制选区的正确姿势。
-        if std::env::var("TERM_PROGRAM").map(|v| v == "vscode").unwrap_or(false) {
-            self.state.push_log(
-                "VS Code 终端:Cmd+C 不会到达应用。复制选区请按 Ctrl+Y,\
-                或在 VS Code 键位设置中将 Cmd+C(终端聚焦)绑定为发送 Ctrl+Y 字节。\
-                粘贴 Cmd+V 不受影响。".to_string(),
-            );
-        }
+        // 拖拽选中松开即自动复制(OSC 52),无需额外提示。
 
         let mut last_command_id: u64 = 0;
         let mut next_cmd_id = || -> String {
@@ -1010,8 +1002,7 @@ impl GrodexTui {
                                 let text = self.state.selection_text();
                                 if text.is_empty() {
                                     self.state.push_log(
-                                        "当前没有选区:先按住左键拖拽选中文字,再按 Cmd-C / Ctrl-Y 复制。"
-                                            .to_string(),
+                                        "当前没有选区:拖拽选中文字会自动复制到剪贴板。".to_string(),
                                     );
                                     continue;
                                 }
@@ -2311,9 +2302,7 @@ impl GrodexTui {
                                             (None, _) => out.push_str("（无 Assistant 消息可复制）\n"),
                                             _ => {}
                                         }
-                                        out.push_str("\n提示：TUI 无系统剪贴板接入（需 arboard / clipboard 且跨终端不一定可用）。\n\
-                                                      macOS 终端按住 Option 拖动可选中文本，Cmd+C 复制。\n\
-                                                      或取缓冲区：cat ~/.grodex/.copy-buffer | pbcopy  \nargs={args:?}");
+                                        out.push_str("\n已通过 OSC 52 写入系统剪贴板,直接 Cmd+V / Ctrl+V 粘贴。\nargs={args:?}");
                                         self.state.push_log(out);
                                     }
                                     SlashLocalKind::AcpVoice => {
@@ -3139,99 +3128,81 @@ impl GrodexTui {
                         // 任何鼠标活动:刷新空闲计时器,标记本间隙尚未重同步。
                         self.last_mouse_at = std::time::Instant::now();
                         self.mouse_idle_reenabled = false;
-                        // DEBUG: 记录每个鼠标事件 + 当前选区状态,排查右键后拖拽丢失。
-                        {
-                            use std::io::Write as _;
-                            let kind = match m.kind {
-                                crossterm::event::MouseEventKind::Down(b) => format!("Down({b:?})"),
-                                crossterm::event::MouseEventKind::Up(b) => format!("Up({b:?})"),
-                                crossterm::event::MouseEventKind::Drag(b) => format!("Drag({b:?})"),
-                                crossterm::event::MouseEventKind::Moved => "Moved".into(),
-                                crossterm::event::MouseEventKind::ScrollUp => "ScrollUp".into(),
-                                crossterm::event::MouseEventKind::ScrollDown => "ScrollDown".into(),
-                                _ => "Other".into(),
-                            };
-                            let (a, e) = self
-                                .state
-                                .selection
-                                .as_ref()
-                                .map(|s| (format!("{:?}", s.anchor), format!("{:?}", s.end)))
-                                .unwrap_or(("None".into(), "None".into()));
-                            let t = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() % 100000)
-                                .unwrap_or(0);
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open("/tmp/grodex_mouse_debug.log")
-                            {
-                                let _ = writeln!(
-                                    f,
-                                    "[{t}] kind={kind} col={} row={} sel.anchor={a} sel.end={e}",
-                                    m.column, m.row
-                                );
-                            }
-                        }
-                        // ── 鼠标:滚轮滚动 + 拖拽选中（grok-build 模式）──
-                        // 滚轮驱动应用内对话滚动;左键按下/拖拽/松开构成
-                        // 一次选中,松开时用 OSC 52 把选中文本写入系统剪贴板。
-                        // slash 菜单或审批卡打开时不劫持滚轮（与按键突发
-                        // 识别的覆盖层直通策略一致）。
+                        // ── grok 同款三态鼠标状态机 ──
+                        // Idle → (Down) → Pending(锚点) → (Drag 超阈值) →
+                        //   Active(选区) → (Up) → finish_text_drag:OSC 52 复制
+                        // 滚轮驱动应用内对话滚动;slash 菜单或审批卡打开时
+                        // 不劫持滚轮(与覆盖层直通策略一致)。
                         use crossterm::event::{MouseButton, MouseEventKind};
                         let overlay_open = (self.state.slash.open
                             && !self.state.slash.matches.is_empty())
                             || !self.state.pending_approvals.is_empty();
                         match m.kind {
                             MouseEventKind::ScrollUp if !overlay_open => {
-                                // 滚动后选区的屏幕坐标失效,一并清除。
                                 self.state.selection = None;
+                                self.state.pending_drag_anchor = None;
                                 for _ in 0..3 {
                                     self.state.scroll_up();
                                 }
                             }
                             MouseEventKind::ScrollDown if !overlay_open => {
                                 self.state.selection = None;
+                                self.state.pending_drag_anchor = None;
                                 for _ in 0..3 {
                                     self.state.scroll_down(None);
                                 }
                             }
-                            // 左键按下:开始新选区(替换旧选区)。
-                            // 注意:不要在此处重发鼠标上报序列。实测在按钮
-                            // 按下期间重发 1000h 会让 xterm.js 重置"按钮按下"
-                            // 状态,反而破坏进行中的拖拽(连正常左键都选不中)。
-                            // 上报模式恢复只在 Down(Right) 做(那时左键未按下)。
+                            // Down(Left):清除旧选区,记录锚点(grok PendingTextDrag)。
+                            // 不立即创建可见选区——等 Drag 超过阈值后才提升,
+                            // 避免单击产生残留选区。不在按钮按下期间重发
+                            // 1000h(xterm.js 会重置按下状态,破坏进行中拖拽)。
                             MouseEventKind::Down(MouseButton::Left) => {
-                                self.state.selection = Some(ui::state::ScreenSelection {
-                                    anchor: (m.column, m.row),
-                                    end: (m.column, m.row),
-                                });
+                                self.state.selection = None;
+                                self.state.pending_drag_anchor =
+                                    Some((m.column, m.row));
                             }
-                            // 按住左键移动:扩展选区(需 DECSET 1002)。
+                            // Drag(Left):有活跃选区则更新 head;否则若
+                            // pending 锚点存在且移动超阈值(任一坐标变化),
+                            // 提升为活跃选区(grok threshold promotion)。
                             MouseEventKind::Drag(MouseButton::Left) => {
                                 if let Some(sel) = &mut self.state.selection {
                                     sel.end = (m.column, m.row);
+                                } else if let Some(anchor) =
+                                    self.state.pending_drag_anchor
+                                {
+                                    if anchor != (m.column, m.row) {
+                                        self.state.selection =
+                                            Some(ui::state::ScreenSelection {
+                                                anchor,
+                                                end: (m.column, m.row),
+                                            });
+                                    }
                                 }
                             }
-                            // 左键松开:仅当发生过实际拖拽移动(anchor != end)
-                            // 才保留为有效选区。单击(无移动)不构成选区——
-                            // 否则单点坐标会被当成"选中一个字符"遗留下来
-                            // (右键后 Drag 丢失时正是暴露为此症状:看起来
-                            // 只选中了一个字)。
+                            // Up(Left):finish_text_drag(grok 同款 copy-on-release)。
+                            // 有实际拖拽 → 提取文本, OSC 52 写剪贴板,
+                            //   选区保留高亮(persist_drag_selection)。
+                            // 无拖拽(单击) → 清除。
                             MouseEventKind::Up(MouseButton::Left) => {
-                                let stale = self
-                                    .state
-                                    .selection
-                                    .as_ref()
-                                    .map_or(true, |s| s.anchor == s.end);
-                                if stale {
-                                    self.state.selection = None;
+                                self.state.pending_drag_anchor = None;
+                                let sel = self.state.selection;
+                                if let Some(s) = sel {
+                                    if s.anchor != s.end {
+                                        // 松开即复制:OSC 52。
+                                        let text =
+                                            self.state.selection_text();
+                                        if !text.is_empty() {
+                                            let _ = set_clipboard(&text);
+                                        }
+                                        // 选区保留,高亮持续(grok persist)。
+                                    } else {
+                                        self.state.selection = None;
+                                    }
                                 }
                             }
-                            // 右键按下:VSCode 右键会重置鼠标上报,这里
-                            // 立即重发完整三件套,让紧随其后的左键拖拽能
-                            // 拿到 Drag;同时清空当前选区(右键交给终端原生
-                            // 菜单 / copyPaste)。
+                            // Down(Right):重发完整鼠标上报三件套(VSCode
+                            // 右键会重置上报模式),清空选区+pending(右键
+                            // 交给终端原生菜单/copyPaste)。
                             MouseEventKind::Down(MouseButton::Right) => {
                                 let mut stderr = io::stderr();
                                 let _ = io::Write::write_all(
@@ -3240,6 +3211,7 @@ impl GrodexTui {
                                 );
                                 let _ = io::Write::flush(&mut stderr);
                                 self.state.selection = None;
+                                self.state.pending_drag_anchor = None;
                             }
                             _ => {}
                         }

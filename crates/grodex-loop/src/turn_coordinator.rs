@@ -13,6 +13,7 @@ use crate::chat_state::ChatStateHandle;
 use crate::context::state_capsule::StateCapsule;
 use crate::context::CompactionManager;
 use crate::step::{classify_step, StepDisposition, TurnOutcome};
+use tracing::Instrument;
 use crate::turn::{StepResult, TurnContext};
 use grodex_capability::id::{CapabilityId, CapabilityKind};
 use grodex_capability::authority::Authority;
@@ -161,6 +162,19 @@ pub struct TurnCoordinator {
     /// result is returned to the model. Prevents a single long-running
     /// tool (e.g. a hung network call) from blocking the entire turn.
     tool_timeout_secs: u64,
+}
+
+/// 每 Turn 的运行指标(对应设计文档 09 §19.1)。在 `run()` 内累加,
+/// Turn 结束时通过 tracing 落 trace。`cancel` 在 run() 内可观测;
+/// `recovery` 发生在 reducer,后续接入。
+#[derive(Debug, Default, Clone)]
+struct TurnMetrics {
+    steps: u64,
+    model_calls: u64,
+    tool_calls: u64,
+    compactions: u64,
+    retries: u64,
+    cancels: u64,
 }
 
 impl TurnCoordinator {
@@ -424,6 +438,10 @@ impl TurnCoordinator {
         // P0-1：无工具 `Stop` 响应的 repair sampling 剩余预算。
         let mut repair_budget = REPAIR_SAMPLING_BUDGET;
 
+        // 可观测(设计文档 09 §19.1):Turn 计时与指标累加。
+        let turn_started = std::time::Instant::now();
+        let mut metrics = TurnMetrics::default();
+
         // ── Approval notification forwarder ───────────────────────────
         // Drains `approval_rx` (fed by `PermissionManager::check()` when
         // policy says `Ask`) and pushes `StreamFragment::ApprovalRequested`
@@ -477,6 +495,7 @@ impl TurnCoordinator {
 
         for _step_idx in 0..max_steps {
             if cancel_token.is_cancelled() {
+                metrics.cancels += 1;
                 break;
             }
 
@@ -492,12 +511,16 @@ impl TurnCoordinator {
             };
             if should_compact
             {
-                self.try_compact(&turn_ctx, &context, stream_tx.as_ref()).await;
+                metrics.compactions += 1;
+                self.try_compact(&turn_ctx, &context, stream_tx.as_ref())
+                    .instrument(tracing::info_span!("compaction", turn_id = %turn_ctx.turn_id))
+                    .await;
             }
 
             // ── Build request ───────────────────────────────────
             let context = self.chat_state.get_conversation().await;
             let step_id = StepId::new();
+            metrics.steps += 1;
 
             tracing::debug!(
                 step_idx = _step_idx,
@@ -543,10 +566,19 @@ impl TurnCoordinator {
 
             // ── Sample ──────────────────────────────────────────
             // Use streaming if available (clone tx for each step).
-            let outcome = match stream_tx {
-                Some(ref tx) => self.sampler.sample_streaming(&turn_ctx.model_binding, &request, tx.clone()).await,
-                None => self.sampler.sample(&turn_ctx.model_binding, &request).await,
-            };
+            // §19.2 Model span。`.instrument()` 是 Send-safe 的异步 span
+            // 写法(不用 `.entered()` 跨 await,避免破坏 run() future 的
+            // Send 约束)。
+            let model_span = tracing::info_span!("model", step_id = %step_id);
+            let outcome = async {
+                metrics.model_calls += 1;
+                match stream_tx {
+                    Some(ref tx) => self.sampler.sample_streaming(&turn_ctx.model_binding, &request, tx.clone()).await,
+                    None => self.sampler.sample(&turn_ctx.model_binding, &request).await,
+                }
+            }
+            .instrument(model_span)
+            .await;
 
             let elapsed_ms = outcome.elapsed.as_millis() as u64;
 
@@ -601,6 +633,7 @@ impl TurnCoordinator {
                         .collect();
 
                     let has_tools = !tool_calls.is_empty();
+                    metrics.tool_calls += tool_calls.len() as u64;
 
                     // Persist the model's emission for this Step: the assistant
                     // text and the tool calls it requested, tagged with the
@@ -627,6 +660,7 @@ impl TurnCoordinator {
                             })
                             .collect();
                         let reasoning_opt = if reasoning_text.is_empty() { None } else { Some(reasoning_text.as_str()) };
+                        let commit_span = tracing::info_span!("commit", kind = "model_output", step_id = %step_id);
                         if let Err(e) = writer
                             .write_model_output(
                                 turn_ctx.turn_id,
@@ -636,6 +670,7 @@ impl TurnCoordinator {
                                 &tool_calls_json,
                                 reasoning_opt,
                             )
+                            .instrument(commit_span)
                             .await
                         {
                             eprintln!("[warn] rollout write_model_output failed (seq gap risk): {e}");
@@ -673,6 +708,7 @@ impl TurnCoordinator {
                                 break;
                             }
                             StepDisposition::Truncated => {
+                                metrics.retries += 1;
                                 // 输出被截断（max_output_tokens）。
                                 // 注入 continuation prompt 让模型从断点继续。
                                 // NOTE: assistant_text 已在上方 push 到
@@ -692,6 +728,7 @@ impl TurnCoordinator {
                                 continue;
                             }
                             StepDisposition::Repair => {
+                                metrics.retries += 1;
                                 // 无工具自然 Stop + 非空文本 + 预算未耗尽。
                                 // 注入 repair prompt 迫使模型二选一：
                                 //   总结收尾 → turn 结束
@@ -980,6 +1017,10 @@ impl TurnCoordinator {
                             tool_timeout_secs: self.tool_timeout_secs,
                         };
                         let op_id_for_result = op_id_str.clone();
+                        // §19.2 Tool call span(父=Turn span;Step span 待
+                        // 重构循环体提取)。`.instrument()` 覆盖 serial 直接
+                        // await 与 parallel spawned future 两条路径。
+                        let tool_call_span = tracing::info_span!("tool_call", tool = %name, call_id = %call_id);
 
                         if has_serial {
                             // R14-6: Serial mode — execute sequentially,
@@ -991,7 +1032,9 @@ impl TurnCoordinator {
                             let result = execute_single_tool(
                                 &prepared, runtime.clone(), perm.clone(), sb.clone(),
                                 envelope.as_ref(), &exec_ctx,
-                            ).await;
+                            )
+                            .instrument(tool_call_span.clone())
+                            .await;
                             let duration_ms = t0.elapsed().as_millis() as u64;
                             let _ = tx.send(ToolExecResult {
                                 call_id,
@@ -1019,7 +1062,7 @@ impl TurnCoordinator {
                                     operation_id: Some(op_id_for_result),
                                     duration_ms: Some(duration_ms),
                                 });
-                            });
+                            }.instrument(tool_call_span));
                         }
                     }
                     drop(result_tx);
@@ -1221,6 +1264,12 @@ impl TurnCoordinator {
                                 });
                                 approval_cancel.cancel();
                                 approval_handle.abort();
+                                tracing::info!(
+                                    target: "grodex_loop::metrics",
+                                    metrics = ?metrics,
+                                    turn_duration_ms = turn_started.elapsed().as_millis() as u64,
+                                    "turn_metrics (early return: tool commit journal failure)"
+                                );
                                 return TurnOutcome {
                                     steps,
                                     final_text: String::new(),
@@ -1490,6 +1539,13 @@ impl TurnCoordinator {
 
         approval_cancel.cancel();
         approval_handle.abort();
+
+        tracing::info!(
+            target: "grodex_loop::metrics",
+            metrics = ?metrics,
+            turn_duration_ms = turn_started.elapsed().as_millis() as u64,
+            "turn_metrics"
+        );
 
         TurnOutcome {
             steps,
