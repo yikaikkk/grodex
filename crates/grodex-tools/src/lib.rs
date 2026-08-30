@@ -23,6 +23,8 @@ pub mod cancel;
 pub mod common;
 pub mod edit;
 pub mod exec;
+pub mod glob_tool;
+pub mod grep;
 pub mod load_skill;
 pub mod fsutil;
 pub mod patch;
@@ -45,6 +47,8 @@ pub use common::{
 };
 pub use edit::EditTool;
 pub use exec::ExecTool;
+pub use glob_tool::GlobTool;
+pub use grep::GrepTool;
 pub use load_skill::{LoadSkillTool, SharedSkillCatalog};
 pub use fsutil::{assert_within_root, canonicalize, FileVersion};
 pub use patch::ApplyPatchTool;

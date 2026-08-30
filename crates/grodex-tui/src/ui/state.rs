@@ -1231,8 +1231,13 @@ impl TuiAppState {
     }
 
     /// Count of ToolCallStart events that have no matching ToolResult yet —
-    /// rendered on the turn-status line.
+    /// rendered on the turn-status line. Returns 0 once the user has pressed
+    /// Esc (cancel_sent) so "N tool active" clears immediately instead of
+    /// waiting for the backend to emit ToolResult frames.
     pub fn active_tool_count(&self) -> usize {
+        if self.cancel_sent {
+            return 0;
+        }
         let mut pending = 0usize;
         let mut closed = 0usize;
         for ev in &self.events {

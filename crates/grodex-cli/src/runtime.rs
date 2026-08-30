@@ -39,7 +39,7 @@ use grodex_rollout::store::{FileRolloutStore, RolloutStore};
 use grodex_sampler::{ModelRoute, SamplingActor, SamplingClient, SamplingClientConfig};
 use grodex_sandbox::SandboxRuntimeClient;
 use grodex_subagent::supervisor::SubAgentConfig;
-use grodex_tools::{ApplyPatchTool, EditTool, ExecTool, LoadSkillTool, ReadFileTool, WriteFileTool};
+use grodex_tools::{ApplyPatchTool, EditTool, ExecTool, GlobTool, GrepTool, LoadSkillTool, ReadFileTool, WriteFileTool};
 use tokio::sync::mpsc;
 
 /// A fully-wired session runtime ready to serve turns.
@@ -601,6 +601,15 @@ impl SessionRuntimeBuilder {
         coordinator
             .register_tool("apply_patch", Arc::new(ApplyPatchTool::new()), ApplyPatchTool::new().input_schema())
             .await;
+        // grep / glob: read-only codebase search tools. Give the model
+        // grep (content search) and glob (file-pattern search) so it
+        // doesn't need read_file for every search operation.
+        coordinator
+            .register_tool("grep", Arc::new(GrepTool::new()), GrepTool::new().input_schema())
+            .await;
+        coordinator
+            .register_tool("glob", Arc::new(GlobTool::new()), GlobTool::new().input_schema())
+            .await;
         // ── Subagent progress channel ───────────────────────────
         // The DelegateTool sends structured lifecycle events
         // (started/step/finished) via this channel. The forwarder task
@@ -627,14 +636,20 @@ impl SessionRuntimeBuilder {
             .with_sampling(sub_actor, model_config.clone())
             .with_progress_sender(subagent_progress_tx.clone())
             .with_limits(max_subagents.unwrap_or(0), max_subagents_total.unwrap_or(0))
-            // Sub-agents get a read-only file tool so analysis tasks can
+            // Sub-agents get read-only tools so analysis tasks can
             // actually inspect the codebase (bypasses the approval
-            // round-trip — read_file has no side effects).
-            .with_readonly_tools(vec![(
-                "read_file".to_string(),
-                Arc::new(ReadFileTool::new()) as Arc<dyn ToolRuntime>,
-                ReadFileTool::new().input_schema(),
-            )]);
+            // round-trip — these have no side effects).
+            .with_readonly_tools(vec![
+                ("read_file".to_string(),
+                 Arc::new(ReadFileTool::new()) as Arc<dyn ToolRuntime>,
+                 ReadFileTool::new().input_schema()),
+                ("grep".to_string(),
+                 Arc::new(GrepTool::new()) as Arc<dyn ToolRuntime>,
+                 GrepTool::new().input_schema()),
+                ("glob".to_string(),
+                 Arc::new(GlobTool::new()) as Arc<dyn ToolRuntime>,
+                 GlobTool::new().input_schema()),
+            ]);
         if let Some(ref w) = writer {
             delegate = delegate.with_writer(w.clone(), SubAgentConfig::default());
         }

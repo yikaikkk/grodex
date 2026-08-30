@@ -1143,6 +1143,7 @@ dependencies = [
  "grodex-sandbox",
  "grodex-sandbox-types",
  "grodex-skills",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

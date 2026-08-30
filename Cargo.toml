@@ -57,6 +57,7 @@ crossterm = "0.29"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+regex = "1"
 
 # Internal crates
 grodex-core = { path = "crates/grodex-core" }
