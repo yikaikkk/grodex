@@ -13,6 +13,7 @@ grodex-provider.workspace = true
 grodex-sampler.workspace = true
 grodex-config.workspace = true
 grodex-rollout.workspace = true
+grodex-telemetry.workspace = true
 grodex-permission.workspace = true
 grodex-skills.workspace = true
 grodex-memory.workspace = true

@@ -27,6 +27,10 @@ use grodex_core::error::GrodexError;
 use grodex_core::id::{SessionId, StepGeneration, StepId, TurnId};
 use grodex_rollout::event::{RolloutEvent, RolloutEventType, SensitivityLevel};
 use grodex_rollout::store::RolloutStore;
+use grodex_telemetry::{
+    bound_payload, kind as tel_kind, Sensitivity as TelSensitivity, Severity as TelSeverity,
+    TelemetryRecord, TelemetrySink,
+};
 use std::sync::{Arc, RwLock};
 
 /// Inner state shared across all [`RolloutWriter`] clones. When
@@ -49,6 +53,12 @@ use std::sync::{Arc, RwLock};
 struct RolloutWriterInner {
     store: Arc<dyn RolloutStore>,
     session_id: SessionId,
+    /// Runtime-observation sink (SQLite telemetry). Fire-and-forget —
+    /// never gates correctness. `None` disables telemetry entirely.
+    telemetry: Option<Arc<dyn TelemetrySink>>,
+    /// Process-level run id, attached to every telemetry record so
+    /// parallel Grodex processes are distinguishable in telemetry.db.
+    run_id: String,
 }
 
 /// Manages journal writes through the shared store. Cloneable — the
@@ -62,10 +72,177 @@ pub struct RolloutWriter {
 impl RolloutWriter {
     pub fn new(store: Arc<dyn RolloutStore>, session_id: SessionId) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(RolloutWriterInner { store, session_id })),
+            inner: Arc::new(RwLock::new(RolloutWriterInner {
+                store,
+                session_id,
+                telemetry: None,
+                run_id: "unknown".into(),
+            })),
         }
     }
 
+    /// Attach the telemetry sink + process run id. Every successful
+    /// journal append then emits one fire-and-forget telemetry record
+    /// carrying the committed `journal_seq`.
+    pub fn with_telemetry(self, sink: Arc<dyn TelemetrySink>, run_id: String) -> Self {
+        let mut inner = self.inner.write().expect("RolloutWriter inner poisoned");
+        inner.telemetry = Some(sink);
+        inner.run_id = run_id;
+        drop(inner);
+        self
+    }
+
+    /// Telemetry sink access (re-projection callers check for presence).
+    fn telemetry_sink(&self) -> Option<Arc<dyn TelemetrySink>> {
+        self.inner
+            .read()
+            .expect("RolloutWriter inner poisoned")
+            .telemetry
+            .clone()
+    }
+
+    fn run_id(&self) -> String {
+        self.inner
+            .read()
+            .expect("RolloutWriter inner poisoned")
+            .run_id
+            .clone()
+    }
+
+    /// Emit an out-of-band telemetry record (not journaled) for
+    /// peripheral-module timing (memory retrieval, MCP lifecycle, …).
+    /// Fire-and-forget; no-op when telemetry is not attached.
+    pub fn emit_out_of_band_telemetry(
+        &self,
+        kind: &'static str,
+        turn_id: Option<TurnId>,
+        call_id: Option<&str>,
+        payload: &serde_json::Value,
+    ) {
+        let (sink, run_id, session_id) = {
+            let inner = self.inner.read().expect("RolloutWriter inner poisoned");
+            match &inner.telemetry {
+                None => return,
+                Some(sink) => (sink.clone(), inner.run_id.clone(), inner.session_id),
+            }
+        };
+        let mut rec = TelemetryRecord::out_of_band(&run_id, &session_id.to_string(), kind);
+        rec.turn_id = turn_id.map(|t| t.to_string());
+        rec.call_id = call_id.map(str::to_string);
+        rec.payload_json = serde_json::to_string(payload).unwrap_or_else(|_| "{}".into());
+        sink.emit(rec);
+    }
+
+    /// Re-project the journal into the telemetry DB (startup crash-gap
+    /// backfill): reads every journaled event and re-ingests it with a
+    /// deterministic `event_id` (`"{session_id}:{seq}"`), so rows that
+    /// were lost when the process died before a telemetry commit are
+    /// restored, and duplicates are ignored. Idempotent.
+    ///
+    /// Returns `None` when telemetry is not attached.
+    pub async fn reproject_telemetry(&self) -> Option<usize> {
+        let sink = self.telemetry_sink()?;
+        let events = match self.store().replay_from(0).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(target: "grodex_telemetry", error = %e, "telemetry re-projection: journal read failed");
+                return Some(0);
+            }
+        };
+        let run_id = self.run_id();
+        let records: Vec<TelemetryRecord> =
+            events.iter().map(|e| journal_event_record(e, e.seq, &run_id)).collect();
+        // ingest busy-waits while the writer thread drains the queue —
+        // push that onto the blocking pool, never a tokio worker.
+        let accepted = tokio::task::spawn_blocking(move || sink.ingest(records))
+            .await
+            .unwrap_or(0);
+        tracing::info!(
+            target: "grodex_telemetry",
+            journaled = events.len(),
+            accepted,
+            "telemetry re-projection complete"
+        );
+        Some(accepted)
+    }
+}
+
+/// Convert one journaled event into its telemetry record. Journal-derived
+/// records keep the event's own timestamp so the projection survives
+/// re-projection with correct chronology.
+fn journal_event_record(event: &RolloutEvent, committed_seq: u64, run_id: &str) -> TelemetryRecord {
+    let payload = &event.payload;
+    let is_error = payload
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut rec = TelemetryRecord::from_journal(
+        &event.session_id.to_string(),
+        committed_seq,
+        run_id,
+        event.turn_id.as_ref().map(|t| t.to_string()).as_deref(),
+        event.step_id.as_ref().map(|s| s.to_string()).as_deref(),
+        payload.get("call_id").and_then(|v| v.as_str()),
+        telemetry_kind(&event.event_type),
+        event.timestamp,
+    );
+    rec.status = if is_error { Some("error".into()) } else { None };
+    rec.severity = if is_error { TelSeverity::Error } else { TelSeverity::Info };
+    rec.duration_ms = payload.get("duration_ms").and_then(|v| v.as_u64());
+    rec.sensitivity = match event.sensitivity {
+        SensitivityLevel::Normal => TelSensitivity::Normal,
+        SensitivityLevel::Credential => TelSensitivity::Credential,
+        SensitivityLevel::Personal => TelSensitivity::Personal,
+    };
+    // Oversized payloads (e.g. ToolExecutionFinished carrying a full tool
+    // result) are truncated here — full content lives in the journal.
+    rec.payload_json = bound_payload(payload);
+    rec
+}
+
+/// Stable snake_case kind per journal event type — the telemetry
+/// projection matches on these strings.
+fn telemetry_kind(event_type: &RolloutEventType) -> &'static str {
+    match event_type {
+        RolloutEventType::UserInputAccepted => tel_kind::USER_INPUT,
+        RolloutEventType::ModelItemProduced => tel_kind::MODEL_ITEM,
+        RolloutEventType::ToolCallPrepared => tel_kind::TOOL_PREPARED,
+        RolloutEventType::ToolCallApproved => tel_kind::TOOL_APPROVED,
+        RolloutEventType::ToolExecutionStarted => tel_kind::TOOL_STARTED,
+        RolloutEventType::ToolExecutionFinished => tel_kind::TOOL_FINISHED,
+        RolloutEventType::ToolResultCommitted => tel_kind::TOOL_RESULT_COMMITTED,
+        RolloutEventType::ToolOutcomeIndeterminate => tel_kind::TOOL_INDETERMINATE,
+        RolloutEventType::ToolOutcomeResolved => tel_kind::TOOL_RESOLVED,
+        RolloutEventType::ProjectionPruned => tel_kind::PROJECTION_PRUNED,
+        RolloutEventType::RuntimeStateChanged => tel_kind::STATE_CHANGED,
+        RolloutEventType::PromptSnapshotBuilt => tel_kind::PROMPT_SNAPSHOT,
+        RolloutEventType::CompactionStarted => tel_kind::COMPACTION_STARTED,
+        RolloutEventType::CompactionCandidateBuilt => tel_kind::COMPACTION_CANDIDATE,
+        RolloutEventType::CompactionCommitted => tel_kind::COMPACTION_COMMITTED,
+        RolloutEventType::CompactionFailed => tel_kind::COMPACTION_FAILED,
+        RolloutEventType::TurnCompleted => tel_kind::TURN_COMPLETED,
+        RolloutEventType::SubAgentTaskStarted => tel_kind::SUBAGENT_STARTED,
+        RolloutEventType::SubAgentTaskFinished => tel_kind::SUBAGENT_FINISHED,
+        RolloutEventType::ModelRouteEvent => tel_kind::MODEL_ROUTE_EVENT,
+        RolloutEventType::CapabilityPromoted => tel_kind::CAPABILITY_PROMOTED,
+        RolloutEventType::CapabilityCallRejectedStale => tel_kind::CAPABILITY_REJECTED_STALE,
+        RolloutEventType::EffectiveToolCallRevisionCreated => tel_kind::EFFECTIVE_REVISION_CREATED,
+        RolloutEventType::ContextRestored => tel_kind::CONTEXT_RESTORED,
+        RolloutEventType::ApprovalRequested => tel_kind::APPROVAL_REQUESTED,
+        RolloutEventType::ApprovalResolved => tel_kind::APPROVAL_RESOLVED,
+        RolloutEventType::LeaseIssued => tel_kind::LEASE_ISSUED,
+        RolloutEventType::LeaseConsumed => tel_kind::LEASE_CONSUMED,
+        RolloutEventType::LeaseExpired => tel_kind::LEASE_EXPIRED,
+        RolloutEventType::SkillSnapshotRecorded => tel_kind::SKILL_SNAPSHOT,
+        RolloutEventType::AppOnlyToolCall => tel_kind::APP_ONLY_TOOL_CALL,
+        RolloutEventType::SessionStarted => tel_kind::SESSION_STARTED,
+        RolloutEventType::TurnStarted => tel_kind::TURN_STARTED,
+        RolloutEventType::ModelAttemptStarted => tel_kind::MODEL_ATTEMPT_STARTED,
+        RolloutEventType::ModelAttemptFinished => tel_kind::MODEL_ATTEMPT_FINISHED,
+    }
+}
+
+impl RolloutWriter {
     /// Pre-seed the expected seq counter from an existing journal (crash
     /// recovery). After a replay the writer must continue from the next
     /// seq so newly appended events don't collide with replayed ones.
@@ -144,7 +321,9 @@ impl RolloutWriter {
 
     // ── Append helpers (private) ───────────────────────────────────
 
-    /// Build the event + dispatch to the store.
+    /// Build the event + dispatch to the store. On success, fire a
+    /// telemetry record at the (non-blocking) sink — telemetry failure
+    /// never affects the returned seq or the Turn.
     async fn write(
         &self,
         event_type: RolloutEventType,
@@ -153,6 +332,7 @@ impl RolloutWriter {
         generation: Option<StepGeneration>,
         payload: serde_json::Value,
         durable: bool,
+        sensitivity: SensitivityLevel,
     ) -> Result<u64, GrodexError> {
         let store = self.store();
         let session_id = self.session_id();
@@ -166,13 +346,20 @@ impl RolloutWriter {
             timestamp: chrono::Utc::now(),
             event_type,
             payload,
-            sensitivity: SensitivityLevel::Normal,
+            sensitivity,
         };
-        if durable {
-            store.append_event_durable(event).await
+        let seq = if durable {
+            store.append_event_durable(event.clone()).await
         } else {
-            store.append_event(event).await
+            store.append_event(event.clone()).await
+        }?;
+        if let Some(sink) = self.telemetry_sink() {
+            let run_id = self.run_id();
+            // The event clone still carries seq=0 (the actor filled its own
+            // copy) — stamp the committed seq returned by the store.
+            sink.emit(journal_event_record(&event, seq, &run_id));
         }
+        Ok(seq)
     }
 
     // ── Public API ─────────────────────────────────────────────────
@@ -185,6 +372,7 @@ impl RolloutWriter {
             None,
             serde_json::json!({"state": state}),
             false,
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -207,6 +395,7 @@ impl RolloutWriter {
             None,
             payload,
             true, // durable: second crash must not lose the restore
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -219,6 +408,7 @@ impl RolloutWriter {
             None,
             serde_json::json!({"text": text}),
             false,
+            SensitivityLevel::Personal,
         )
         .await
     }
@@ -246,6 +436,7 @@ impl RolloutWriter {
             Some(generation),
             payload,
             false,
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -269,6 +460,7 @@ impl RolloutWriter {
             Some(generation),
             serde_json::json!({"phase": "step_started"}),
             false,
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -336,6 +528,7 @@ impl RolloutWriter {
             Some(generation),
             payload,
             true,
+            SensitivityLevel::Normal,
         ).await
     }
 
@@ -363,6 +556,7 @@ impl RolloutWriter {
             Some(generation),
             payload,
             true,
+            SensitivityLevel::Normal,
         ).await
     }
 
@@ -389,6 +583,7 @@ impl RolloutWriter {
             Some(generation),
             payload,
             true, // durable: pre-side-effect commit point
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -429,6 +624,7 @@ impl RolloutWriter {
             Some(generation),
             payload,
             true,
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -456,6 +652,7 @@ impl RolloutWriter {
             Some(generation),
             payload,
             true,
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -486,6 +683,7 @@ impl RolloutWriter {
             None,
             payload,
             true,
+            SensitivityLevel::Normal,
         ).await
     }
 
@@ -518,6 +716,7 @@ impl RolloutWriter {
             None,
             payload,
             true,
+            SensitivityLevel::Normal,
         ).await
     }
 
@@ -545,7 +744,7 @@ impl RolloutWriter {
         });
         if let Some(c) = call_id { payload["call_id"] = serde_json::json!(c); }
         if let Some(op) = operation_id { payload["operation_id"] = serde_json::json!(op); }
-        self.write(RolloutEventType::ApprovalRequested, None, None, None, payload, true).await
+        self.write(RolloutEventType::ApprovalRequested, None, None, None, payload, true, SensitivityLevel::Normal).await
     }
 
     pub async fn write_approval_resolved(
@@ -563,7 +762,7 @@ impl RolloutWriter {
         if let Some(c) = call_id { payload["call_id"] = serde_json::json!(c); }
         if let Some(r) = resolved_by { payload["resolved_by"] = serde_json::json!(r); }
         if let Some(n) = narrowed_args { payload["narrowed_args"] = n.clone(); }
-        self.write(RolloutEventType::ApprovalResolved, None, None, None, payload, true).await
+        self.write(RolloutEventType::ApprovalResolved, None, None, None, payload, true, SensitivityLevel::Normal).await
     }
 
     pub async fn write_lease_issued(
@@ -580,7 +779,7 @@ impl RolloutWriter {
             "issued_at": chrono::Utc::now().to_rfc3339(),
         });
         if let Some(t) = ttl_secs { payload["ttl_secs"] = serde_json::json!(t); }
-        self.write(RolloutEventType::LeaseIssued, None, None, None, payload, true).await
+        self.write(RolloutEventType::LeaseIssued, None, None, None, payload, true, SensitivityLevel::Normal).await
     }
 
     pub async fn write_lease_consumed(
@@ -593,7 +792,7 @@ impl RolloutWriter {
             "call_id": call_id,
             "consumed_at": chrono::Utc::now().to_rfc3339(),
         });
-        self.write(RolloutEventType::LeaseConsumed, None, None, None, payload, true).await
+        self.write(RolloutEventType::LeaseConsumed, None, None, None, payload, true, SensitivityLevel::Normal).await
     }
 
     pub async fn write_lease_expired(
@@ -602,7 +801,7 @@ impl RolloutWriter {
         reason: &str,
     ) -> Result<u64, GrodexError> {
         let payload = serde_json::json!({"lease_id": lease_id, "reason": reason});
-        self.write(RolloutEventType::LeaseExpired, None, None, None, payload, true).await
+        self.write(RolloutEventType::LeaseExpired, None, None, None, payload, true, SensitivityLevel::Normal).await
     }
 
     /// Record a Turn-level skill snapshot (Design Doc 08 §6).
@@ -627,6 +826,7 @@ impl RolloutWriter {
             None,
             payload,
             true,
+            SensitivityLevel::Normal,
         ).await
     }
 
@@ -654,6 +854,7 @@ impl RolloutWriter {
             None,
             payload,
             true,
+            SensitivityLevel::Normal,
         ).await
     }
 
@@ -682,6 +883,7 @@ impl RolloutWriter {
             generation,
             payload,
             true,
+            SensitivityLevel::Normal,
         ).await
     }
 
@@ -695,6 +897,7 @@ impl RolloutWriter {
             None,
             serde_json::json!({}),
             true,
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -724,6 +927,7 @@ impl RolloutWriter {
                 "interrupted": true
             }),
             true,
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -747,6 +951,7 @@ impl RolloutWriter {
             None,
             serde_json::json!({"items": items_json}),
             true,
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -771,6 +976,7 @@ impl RolloutWriter {
                 "pre_compaction_item_count": pre_compaction_item_count,
             }),
             true,
+            SensitivityLevel::Normal,
         ).await
     }
 
@@ -795,6 +1001,7 @@ impl RolloutWriter {
                 "summary_preview": summary_preview.chars().take(200).collect::<String>(),
             }),
             true,
+            SensitivityLevel::Normal,
         ).await
     }
 
@@ -815,6 +1022,7 @@ impl RolloutWriter {
             None,
             serde_json::json!({"reason": reason}),
             true,
+            SensitivityLevel::Normal,
         ).await
     }
 
@@ -838,6 +1046,7 @@ impl RolloutWriter {
                 "details": details,
             }),
             false,
+            SensitivityLevel::Normal,
         )
         .await
     }
@@ -878,6 +1087,172 @@ impl RolloutWriter {
             None,
             payload,
             true, // durable: only audit trail for app-initiated calls
+            SensitivityLevel::Normal,
+        )
+        .await
+    }
+
+    // ── Session / Turn / Model-attempt lifecycle (telemetry anchors) ──
+    //
+    // These give the telemetry projection stable start/finish anchors:
+    // `SessionStarted` → sessions.started_at, `TurnStarted` →
+    // turns.started_at, ModelAttempt* → per-sampling-round records.
+
+    /// SessionStarted — durable session boundary written once when the
+    /// process attaches to (or creates) the session journal.
+    pub async fn write_session_started(&self, details: &serde_json::Value) -> Result<u64, GrodexError> {
+        self.write(
+            RolloutEventType::SessionStarted,
+            None,
+            None,
+            None,
+            details.clone(),
+            true,
+            SensitivityLevel::Normal,
+        )
+        .await
+    }
+
+    /// TurnStarted — durable turn boundary. Without it a crash between
+    /// input acceptance and turn completion leaves the turn invisible
+    /// to the telemetry projection.
+    pub async fn write_turn_started(
+        &self,
+        turn_id: TurnId,
+        input_chars: usize,
+    ) -> Result<u64, GrodexError> {
+        self.write(
+            RolloutEventType::TurnStarted,
+            Some(turn_id),
+            None,
+            None,
+            serde_json::json!({"input_chars": input_chars}),
+            true,
+            SensitivityLevel::Normal,
+        )
+        .await
+    }
+
+    /// ModelAttemptStarted — observability-only (NOT durable), same tier
+    /// as [`Self::write_route_event`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_model_attempt_started(
+        &self,
+        turn_id: TurnId,
+        step_id: StepId,
+        generation: StepGeneration,
+        request_id: &str,
+        provider: &str,
+        model: &str,
+        wire_protocol: &str,
+    ) -> Result<u64, GrodexError> {
+        self.write(
+            RolloutEventType::ModelAttemptStarted,
+            Some(turn_id),
+            Some(step_id),
+            Some(generation),
+            serde_json::json!({
+                "request_id": request_id,
+                "provider": provider,
+                "model": model,
+                "wire_protocol": wire_protocol,
+            }),
+            false,
+            SensitivityLevel::Normal,
+        )
+        .await
+    }
+
+    /// ModelAttemptFinished — observability-only (NOT durable).
+    /// `usage_json` (when present) carries the settled token counts.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_model_attempt_finished(
+        &self,
+        turn_id: TurnId,
+        step_id: StepId,
+        generation: StepGeneration,
+        request_id: &str,
+        attempts: u32,
+        duration_ms: u64,
+        first_token_ms: Option<u64>,
+        status: &str,
+        error_class: Option<&str>,
+        http_status: Option<u16>,
+        retry_after_secs: Option<u64>,
+        provider_request_id: Option<&str>,
+        usage_json: Option<&serde_json::Value>,
+    ) -> Result<u64, GrodexError> {
+        let mut payload = serde_json::json!({
+            "request_id": request_id,
+            "attempts": attempts,
+            "duration_ms": duration_ms,
+            "status": status,
+        });
+        if let Some(ft) = first_token_ms { payload["first_token_ms"] = serde_json::json!(ft); }
+        if let Some(ec) = error_class { payload["error_class"] = serde_json::json!(ec); }
+        if let Some(hs) = http_status { payload["http_status"] = serde_json::json!(hs); }
+        if let Some(ra) = retry_after_secs { payload["retry_after_secs"] = serde_json::json!(ra); }
+        if let Some(pr) = provider_request_id { payload["provider_request_id"] = serde_json::json!(pr); }
+        if let Some(u) = usage_json { payload["usage"] = u.clone(); }
+        self.write(
+            RolloutEventType::ModelAttemptFinished,
+            Some(turn_id),
+            Some(step_id),
+            Some(generation),
+            payload,
+            false,
+            SensitivityLevel::Normal,
+        )
+        .await
+    }
+
+    /// PromptSnapshotBuilt — observability-only. Records the prompt
+    /// hash + shape of the context at sampling time (never the content).
+    pub async fn write_prompt_snapshot(
+        &self,
+        turn_id: TurnId,
+        step_id: StepId,
+        generation: StepGeneration,
+        prompt_snapshot_hash: &str,
+        context_item_count: usize,
+        estimated_input_tokens: u64,
+    ) -> Result<u64, GrodexError> {
+        self.write(
+            RolloutEventType::PromptSnapshotBuilt,
+            Some(turn_id),
+            Some(step_id),
+            Some(generation),
+            serde_json::json!({
+                "prompt_snapshot_hash": prompt_snapshot_hash,
+                "context_item_count": context_item_count,
+                "estimated_input_tokens": estimated_input_tokens,
+            }),
+            false,
+            SensitivityLevel::Normal,
+        )
+        .await
+    }
+
+    /// TurnCompleted with the structured termination reason + aggregate
+    /// counters. Durable (turn boundary). The plain
+    /// [`Self::write_turn_completed`] variant (empty payload) is kept for
+    /// existing call sites / tests.
+    pub async fn write_turn_completed_with(
+        &self,
+        turn_id: TurnId,
+        termination_reason: &str,
+        metrics_json: &serde_json::Value,
+    ) -> Result<u64, GrodexError> {
+        let mut payload = metrics_json.clone();
+        payload["termination_reason"] = serde_json::json!(termination_reason);
+        self.write(
+            RolloutEventType::TurnCompleted,
+            Some(turn_id),
+            None,
+            None,
+            payload,
+            true,
+            SensitivityLevel::Normal,
         )
         .await
     }

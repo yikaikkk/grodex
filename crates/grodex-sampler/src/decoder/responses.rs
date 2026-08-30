@@ -311,6 +311,7 @@ impl ResponsesDecoder {
             items,
             stop_reason,
             usage,
+            provider_request_id: Some(wire.id.clone()),
         })
     }
 }

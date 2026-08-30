@@ -15,6 +15,16 @@ pub struct PendingApprovalRow {
     pub summary: String,
     pub risk: String,
     pub remaining_s: u32,
+    /// The requested arguments — the Narrow editor pre-fills from these.
+    pub args: Option<serde_json::Value>,
+}
+
+/// State for the Narrow (args-scope) JSON editor popup.
+#[derive(Clone)]
+pub struct NarrowEditState {
+    pub ticket_id: String,
+    pub buffer: String,
+    pub error: Option<String>,
 }
 
 /// A tool call that was in-flight during a crash — its side-effect
@@ -65,6 +75,7 @@ impl IndeterminateOption {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalOption {
     Allow,
+    AlwaysAllow,
     Deny,
     Cancel,
     Narrow,
@@ -72,8 +83,9 @@ pub enum ApprovalOption {
 
 impl ApprovalOption {
     /// All options in display order.
-    pub const ALL: [ApprovalOption; 4] = [
+    pub const ALL: [ApprovalOption; 5] = [
         ApprovalOption::Allow,
+        ApprovalOption::AlwaysAllow,
         ApprovalOption::Deny,
         ApprovalOption::Cancel,
         ApprovalOption::Narrow,
@@ -82,6 +94,7 @@ impl ApprovalOption {
     pub fn label(self) -> &'static str {
         match self {
             ApprovalOption::Allow => "Allow",
+            ApprovalOption::AlwaysAllow => "Always allow",
             ApprovalOption::Deny => "Deny",
             ApprovalOption::Cancel => "Cancel",
             ApprovalOption::Narrow => "Narrow",
@@ -91,9 +104,10 @@ impl ApprovalOption {
     pub fn desc(self) -> &'static str {
         match self {
             ApprovalOption::Allow => "approve and run the tool",
+            ApprovalOption::AlwaysAllow => "approve AND allow this tool for the whole session",
             ApprovalOption::Deny => "reject the tool call",
             ApprovalOption::Cancel => "cancel this turn",
-            ApprovalOption::Narrow => "narrow arguments scope",
+            ApprovalOption::Narrow => "edit a narrowed args JSON scope",
         }
     }
 }
@@ -103,6 +117,8 @@ pub enum InputMode {
     Normal,
     Prompt,
     Command,
+    /// Editing narrowed_args JSON for a pending approval (Narrow flow).
+    NarrowEdit,
 }
 
 /// A chat message in the conversation view.
@@ -664,6 +680,8 @@ pub struct TuiAppState {
     /// 末尾写入）。选中释放时用它提取被选中的文本。
     pub screen_text: Vec<String>,
     pub pending_approvals: Vec<PendingApprovalRow>,
+    /// Active Narrow-args editor (InputMode::NarrowEdit). `None` = closed.
+    pub narrow_edit: Option<NarrowEditState>,
     /// Indeterminate tool calls discovered during crash recovery.
     /// The user must inspect the real-world state and resolve each one
     /// as Succeeded / Failed / Retry.
@@ -786,6 +804,7 @@ impl TuiAppState {
             messages: Vec::new(),
             finalized_count: 0,
             pending_approvals: Vec::new(),
+            narrow_edit: None,
             pending_indeterminates: Vec::new(),
             selected_indeterminate_idx: 0,
             indeterminate_option_idx: 0,
@@ -1331,6 +1350,7 @@ impl TuiAppState {
                 summary: payload.summary.clone(),
                 risk: payload.risk.clone(),
                 remaining_s: (payload.timeout_remaining_ms / 1000) as u32,
+                args: payload.arguments_snapshot.clone(),
             });
         }
 
@@ -1995,6 +2015,7 @@ impl From<RequestPermissionPayload> for PendingApprovalRow {
             summary: p.summary,
             risk: p.risk,
             remaining_s: (p.timeout_remaining_ms / 1000) as u32,
+            args: p.arguments_snapshot,
         }
     }
 }

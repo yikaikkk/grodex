@@ -12,7 +12,7 @@ use crate::capability_manager::{CapabilityManager, TurnCapabilityOverlay};
 use crate::chat_state::ChatStateHandle;
 use crate::context::state_capsule::StateCapsule;
 use crate::context::CompactionManager;
-use crate::step::{classify_step, StepDisposition, TurnOutcome};
+use crate::step::{classify_step, StepDisposition, TurnMetricsSummary, TurnOutcome};
 use tracing::Instrument;
 use crate::turn::{StepResult, TurnContext};
 use grodex_capability::id::{CapabilityId, CapabilityKind};
@@ -151,6 +151,9 @@ pub struct TurnCoordinator {
     /// task never dies silently mid-way. Configurable via
     /// `max_steps_per_turn` (default 40).
     max_steps: usize,
+    /// Context window (tokens) — used by the compaction verifier's budget
+    /// band. 0 = unset (protocol check is window-agnostic).
+    context_window: u64,
     /// Managed blob store backing oversized tool-result offload (Design
     /// Doc 11 §22). When present, offloaded results are stored as owned
     /// blobs (owner = `ToolResult` / session id) whose lifetime is
@@ -198,7 +201,8 @@ impl TurnCoordinator {
     /// for modern models with 1M+ windows — without this override,
     /// compaction fires prematurely or the context grows past the model's
     /// actual limit before compaction can catch up.
-    pub fn with_context_window(self, window: u64) -> Self {
+    pub fn with_context_window(mut self, window: u64) -> Self {
+        self.context_window = window;
         // Use try_lock — the compaction mutex is only held briefly during
         // the compaction check; contention at construction time is impossible
         // because the coordinator hasn't started running yet.
@@ -300,6 +304,7 @@ impl TurnCoordinator {
         Self {
             sampler: Arc::new(sampler),
             chat_state,
+            context_window: 0,
             capability: Arc::new(Mutex::new(CapabilityManager::with_publisher(10, publisher))),
             rollout: None,
             completed_operations: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -320,6 +325,21 @@ impl TurnCoordinator {
     /// loaded from config). Re-wires the approval bus to the injected
     /// manager so `Ask` decisions still reach the frontend — the caller
     /// must NOT have attached its own bus.
+    /// Same as [`Self::with_permission`] but takes an already-shared
+    /// handle so other components (DelegateTool) can reuse the SAME
+    /// PermissionManager instance.
+    pub fn with_permission_arc(
+        self,
+        mgr: Arc<Mutex<PermissionManager>>,
+        approval_rx: mpsc::UnboundedReceiver<ApprovalRequestedEvent>,
+    ) -> Self {
+        Self {
+            permission: mgr,
+            approval_rx: Arc::new(Mutex::new(approval_rx)),
+            ..self
+        }
+    }
+
     pub fn with_permission(self, mgr: PermissionManager) -> Self {
         let (mgr, approval_rx) = Self::wire_approval_bus(mgr);
         Self {
@@ -473,6 +493,7 @@ impl TurnCoordinator {
                         summary: ev.summary,
                         risk: ev.risk,
                         timeout_remaining_ms: ev.timeout_remaining_ms,
+                        args: ev.args,
                     });
                 }
             }
@@ -535,7 +556,7 @@ impl TurnCoordinator {
             // boundaries during recovery.
             if let Some(ref writer) = self.rollout {
                 if let Err(e) = writer
-                    .write_step_started(
+                    .write_step_boundary(
                         turn_ctx.turn_id,
                         step_id,
                         StepGeneration::new(step_gen),
@@ -564,6 +585,33 @@ impl TurnCoordinator {
                 provider_state_in: None,
             };
 
+            // ── Telemetry: prompt snapshot + attempt start (observability-only) ──
+            if let Some(ref writer) = self.rollout {
+                let est_input_tokens: u64 =
+                    context.iter().map(|i| i.estimated_tokens() as u64).sum();
+                let _ = writer
+                    .write_prompt_snapshot(
+                        turn_ctx.turn_id,
+                        step_id,
+                        StepGeneration::new(step_gen),
+                        request.prompt_snapshot_hash.as_deref().unwrap_or(""),
+                        context.len(),
+                        est_input_tokens,
+                    )
+                    .await;
+                let _ = writer
+                    .write_model_attempt_started(
+                        turn_ctx.turn_id,
+                        step_id,
+                        StepGeneration::new(step_gen),
+                        &request.request_id,
+                        &turn_ctx.model_binding.provider_id,
+                        &turn_ctx.model_binding.model_id,
+                        &format!("{:?}", turn_ctx.model_binding.wire_protocol),
+                    )
+                    .await;
+            }
+
             // ── Sample ──────────────────────────────────────────
             // Use streaming if available (clone tx for each step).
             // §19.2 Model span。`.instrument()` 是 Send-safe 的异步 span
@@ -581,6 +629,16 @@ impl TurnCoordinator {
             .await;
 
             let elapsed_ms = outcome.elapsed.as_millis() as u64;
+
+            emit_model_attempt_telemetry(
+                self.rollout.as_ref(),
+                turn_ctx.turn_id,
+                step_id,
+                StepGeneration::new(step_gen),
+                &request.request_id,
+                &outcome,
+            )
+            .await;
 
             tracing::debug!(
                 step_id = %step_id,
@@ -840,7 +898,7 @@ impl TurnCoordinator {
                                 },
                                 index: CommitSequence::new(idx as u64),
                                 operation_id: None,
-                                duration_ms: None,
+                                duration_ms: Some(0),
                             });
                             continue;
                         }
@@ -938,7 +996,7 @@ impl TurnCoordinator {
                                     },
                                     index: CommitSequence::new(idx as u64),
                                     operation_id: Some(op_id_str.clone()),
-                                    duration_ms: None,
+                                    duration_ms: Some(0),
                                 });
                                 continue;
                             }
@@ -989,7 +1047,7 @@ impl TurnCoordinator {
                                 },
                                 index: CommitSequence::new(idx as u64),
                                 operation_id: Some(op_id_str.clone()),
-                                duration_ms: None,
+                                duration_ms: Some(0),
                             });
                             continue;
                         }
@@ -1275,6 +1333,16 @@ impl TurnCoordinator {
                                     final_text: String::new(),
                                     usage: Some(response.usage.clone()),
                                     steps_exhausted: false,
+                                    termination_reason: "journal_failure",
+                                    metrics: TurnMetricsSummary {
+                                        duration_ms: turn_started.elapsed().as_millis() as u64,
+                                        steps: metrics.steps,
+                                        model_calls: metrics.model_calls,
+                                        tool_calls: metrics.tool_calls,
+                                        retries: metrics.retries,
+                                        compactions: metrics.compactions,
+                                        cancels: metrics.cancels,
+                                    },
                                 };
                             }
                         }
@@ -1369,6 +1437,15 @@ impl TurnCoordinator {
                             Some(ref tx) => self.sampler.sample_streaming(&turn_ctx.model_binding, &retry_request, tx.clone()).await,
                             None => self.sampler.sample(&turn_ctx.model_binding, &retry_request).await,
                         };
+                        emit_model_attempt_telemetry(
+                            self.rollout.as_ref(),
+                            turn_ctx.turn_id,
+                            step_id,
+                            StepGeneration::new(step_gen),
+                            &retry_request.request_id,
+                            &retry_outcome,
+                        )
+                        .await;
                         match retry_outcome.response {
                             Some(ref response) => {
                                 // Retry succeeded — process normally.
@@ -1492,6 +1569,15 @@ impl TurnCoordinator {
                 }
                 None => self.sampler.sample(&turn_ctx.model_binding, &wrap_request).await,
             };
+            emit_model_attempt_telemetry(
+                self.rollout.as_ref(),
+                turn_ctx.turn_id,
+                wrap_request.step_id,
+                StepGeneration::new(step_gen),
+                &wrap_request.request_id,
+                &wrap_outcome,
+            )
+            .await;
             if let Some(resp) = wrap_outcome.response {
                 if let Some(t) = resp.assistant_text() {
                     if !t.is_empty() {
@@ -1547,11 +1633,33 @@ impl TurnCoordinator {
             "turn_metrics"
         );
 
+        let termination_reason: &'static str = if steps_exhausted {
+            "step_budget_exhausted"
+        } else if cancel_token.is_cancelled() {
+            "cancelled"
+        } else if steps.last().and_then(|s| s.error.as_ref()).is_some() {
+            // The FINAL step's error is what ended the turn; an earlier
+            // step's recovered error does not make the turn a failure.
+            "sampling_error"
+        } else {
+            "final_answer"
+        };
+
         TurnOutcome {
             steps,
             final_text,
             usage,
             steps_exhausted,
+            termination_reason,
+            metrics: TurnMetricsSummary {
+                steps: metrics.steps,
+                model_calls: metrics.model_calls,
+                tool_calls: metrics.tool_calls,
+                retries: metrics.retries,
+                compactions: metrics.compactions,
+                cancels: metrics.cancels,
+                duration_ms: turn_started.elapsed().as_millis() as u64,
+            },
         }
     }
 
@@ -1640,6 +1748,34 @@ impl TurnCoordinator {
                                 summary,
                             )
                             .await;
+                    }
+
+                    // ── Verification gate (Doc 11 §17.1) ─────────────
+                    // The CompactionVerifier's protocol check rejects a
+                    // candidate that contains orphaned tool results or
+                    // dangling tool calls — committing one would break the
+                    // next sampling step's transcript invariants (#7/#13).
+                    // Failure keeps the old context and journals Failed.
+                    // The verifier takes the context window for its budget
+                    // band; the protocol check itself is window-agnostic.
+                    let protocol_errors =
+                        crate::context::verifier::CompactionVerifier::new(self.context_window.max(1))
+                            .verify_protocol(&rebuilt);
+                    if !protocol_errors.is_empty() {
+                        if let Some(ref writer) = self.rollout {
+                            let _ = writer
+                                .write_compaction_failed(
+                                    Some(turn_ctx.turn_id),
+                                    &format!("verification failed: {}", protocol_errors.join("; ")),
+                                )
+                                .await;
+                        }
+                        eprintln!(
+                            "[warn] compaction rejected by verifier: {}",
+                            protocol_errors.join("; ")
+                        );
+                        emit_status("failed");
+                        return;
                     }
 
                     // Persist CompactionCommitted BEFORE swapping the in-memory
@@ -2144,20 +2280,90 @@ async fn execute_single_tool(
     };
 
     // Sandbox check for file/exec operations.
+    //
+    // Classification is by EXACT tool name — the previous substring match
+    // (`name.contains("write")`) let `apply_patch` bypass write validation
+    // entirely, so a patch could modify files outside the sandbox paths.
+    // MCP tools keep their unknown-side-effect default (no path checks;
+    // the permission policy is their gate).
+    const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "apply_patch"];
+    const READ_TOOLS: &[&str] = &["read_file", "glob", "grep", "read_artifact", "load_skill"];
+
+    let deny = |reason: String| ContextItem::ToolResult {
+        call_id,
+        content: format!("Sandbox: {reason}"),
+        is_error: true,
+    };
+
     if name == "exec" {
         if let Err(e) = sandbox.validate_exec() {
-            return ContextItem::ToolResult { call_id, content: format!("Sandbox: {e}"), is_error: true };
+            return deny(e);
         }
     }
-    if let Some(path) = effective_args.get("path").and_then(|v| v.as_str()) {
-        if name.contains("write") || name.contains("edit") {
-            if let Err(e) = sandbox.validate_write(std::path::Path::new(path)) {
-                return ContextItem::ToolResult { call_id, content: format!("Sandbox: {e}"), is_error: true };
+    // web_fetch: enforce the profile's network rules against the URL's
+    // host. Fail-open when no sandbox profile is configured — the policy
+    // layer remains the gate in unrestricted setups.
+    if name == "web_fetch" {
+        if sandbox.active_profile().is_some() {
+            let host = effective_args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .and_then(host_of_url);
+            match host {
+                Some(host) => {
+                    if let Err(e) = sandbox.validate_network(&host) {
+                        return deny(e);
+                    }
+                }
+                None => return deny("invalid or missing url".into()),
             }
-        } else if name.contains("read") {
-            if let Err(e) = sandbox.validate_read(std::path::Path::new(path)) {
-                return ContextItem::ToolResult { call_id, content: format!("Sandbox: {e}"), is_error: true };
+        }
+    }
+
+    // Validate every path an operation touches. For most tools that is
+    // `args.path`; for apply_patch each operation carries its own target
+    // (create/modify/delete → path, rename → old_path AND new_path).
+    let mut touched_paths: Vec<(std::path::PathBuf, bool)> = Vec::new(); // (path, is_write)
+    if name == "apply_patch" {
+        if let Some(ops) = effective_args.get("operations").and_then(|v| v.as_array()) {
+            for op in ops {
+                let action = op.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let mut push = |key: &str, is_write: bool| {
+                    if let Some(p) = op.get(key).and_then(|v| v.as_str()) {
+                        touched_paths.push((std::path::PathBuf::from(p), is_write));
+                    }
+                };
+                match action {
+                    "create" | "modify" | "delete" => push("path", true),
+                    "rename" => {
+                        push("old_path", true);
+                        push("new_path", true);
+                    }
+                    _ => {}
+                }
             }
+        }
+    } else if let Some(path) = effective_args.get("path").and_then(|v| v.as_str()) {
+        let is_write = WRITE_TOOLS.contains(&name.as_str());
+        touched_paths.push((std::path::PathBuf::from(path), is_write));
+    }
+
+    for (path, is_write) in &touched_paths {
+        // apply_patch operations are inherently writes; other tools use
+        // the exact-name classification.
+        let result = if name == "apply_patch" || WRITE_TOOLS.contains(&name.as_str()) {
+            if *is_write {
+                sandbox.validate_write(path)
+            } else {
+                Ok(())
+            }
+        } else if READ_TOOLS.contains(&name.as_str()) {
+            sandbox.validate_read(path)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = result {
+            return deny(e);
         }
     }
 
@@ -2510,4 +2716,110 @@ mod schema_validation_tests {
         assert!(validate_args_against_schema(&json!({"path": "a.md", "ratio": 0.3}), &schema).is_ok());
         assert!(validate_args_against_schema(&json!({"ratio": 0.3}), &schema).is_err()); // missing required "path"
     }
+}
+
+/// Extract the lowercase host from an http(s) URL (no external parser —
+/// authority is everything between `scheme://` and the first `/`, minus
+/// userinfo and port).
+fn host_of_url(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = authority.split(':').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Drain route events + persist one ModelAttemptFinished record for a
+/// completed sampling round. Observability-only: every journal write
+/// here is fail-open and must never affect the Turn result.
+async fn emit_model_attempt_telemetry(
+    writer: Option<&crate::rollout_writer::RolloutWriter>,
+    turn_id: TurnId,
+    step_id: StepId,
+    generation: StepGeneration,
+    request_id: &str,
+    outcome: &grodex_sampler::SamplingOutcome,
+) {
+    let Some(writer) = writer else { return };
+
+    // Route events (candidate selected / failed / breaker / exhausted),
+    // drained from the ModelRoute by the sampler actor.
+    for ev in &outcome.route_events {
+        let (event_kind, candidate_id, details) = match ev {
+            grodex_sampler::RouteEvent::CandidateSelected { candidate_id, priority } => {
+                ("candidate_selected", candidate_id.as_str(), serde_json::json!({ "priority": priority }))
+            }
+            grodex_sampler::RouteEvent::CandidateSucceeded { candidate_id } => {
+                ("candidate_succeeded", candidate_id.as_str(), serde_json::json!({}))
+            }
+            grodex_sampler::RouteEvent::CandidateFailed { candidate_id, failover } => {
+                ("candidate_failed", candidate_id.as_str(), serde_json::json!({ "failover": failover }))
+            }
+            grodex_sampler::RouteEvent::CandidateRejected { candidate_id, reasons } => {
+                ("candidate_rejected", candidate_id.as_str(), serde_json::json!({ "reasons": reasons }))
+            }
+            grodex_sampler::RouteEvent::RouteExhausted { attempts } => {
+                ("route_exhausted", "", serde_json::json!({ "attempts": attempts }))
+            }
+            grodex_sampler::RouteEvent::BreakerOpened { candidate_id } => {
+                ("breaker_opened", candidate_id.as_str(), serde_json::json!({}))
+            }
+        };
+        let _ = writer
+            .write_route_event(Some(turn_id), event_kind, candidate_id, details)
+            .await;
+    }
+
+    let (status, error_class, http_status, retry_after_secs) = match &outcome.error {
+        None => ("ok", None, None, None),
+        Some(e) => (
+            "error",
+            Some(e.kind_label()),
+            match e {
+                grodex_sampler::SamplingError::Api { status, .. } => Some(*status),
+                grodex_sampler::SamplingError::Auth { status_code, .. } => *status_code,
+                _ => None,
+            },
+            e.retry_after().map(|d| d.as_secs()),
+        ),
+    };
+    let usage_json = outcome.response.as_ref().map(|r| {
+        serde_json::json!({
+            "input_tokens": r.usage.input_tokens,
+            "cached_input_tokens": r.usage.cached_input_tokens,
+            "cache_creation_tokens": r.usage.cache_creation_tokens,
+            "output_tokens": r.usage.output_tokens,
+            "reasoning_tokens": r.usage.reasoning_tokens,
+            "total_tokens": r.usage.total_tokens,
+            "estimated": r.usage.estimated,
+        })
+    });
+    let provider_request_id = outcome
+        .response
+        .as_ref()
+        .and_then(|r| r.provider_request_id.as_deref());
+    let _ = writer
+        .write_model_attempt_finished(
+            turn_id,
+            step_id,
+            generation,
+            request_id,
+            outcome.attempts,
+            outcome.elapsed.as_millis() as u64,
+            outcome.first_token_ms,
+            status,
+            error_class,
+            http_status,
+            retry_after_secs,
+            provider_request_id,
+            usage_json.as_ref(),
+        )
+        .await;
 }

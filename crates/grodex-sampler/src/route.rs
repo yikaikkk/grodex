@@ -94,6 +94,9 @@ pub struct ModelCandidate {
     pub region: Option<String>,
     /// Capability revision tag (for compatibility gating).
     pub revision: Option<String>,
+    /// Per-candidate credential — cross-provider failover MUST
+    /// authenticate with the target provider's key, not the primary's.
+    pub api_key: Option<String>,
     /// Circuit breaker for this candidate.
     pub breaker: Arc<CircuitBreaker>,
 }
@@ -189,6 +192,13 @@ impl ModelRoute {
     /// Build a LossinessGate from this route's declared degradation policy.
     pub fn lossiness_gate(&self) -> LossinessGate {
         LossinessGate::with_declared_degradations(self.declared_degradations.clone())
+    }
+
+    /// Per-candidate credential for the currently selected candidate —
+    /// used by the sampler to switch Authorization headers on failover.
+    /// Falls back to `None` when no route / no key (client default).
+    pub fn current_api_key(&self) -> Option<String> {
+        self.current().and_then(|c| c.api_key.clone())
     }
 
     /// Get the current candidate (the one we're "stuck" to).
@@ -415,6 +425,14 @@ pub struct CandidateToml {
     pub account_id: Option<String>,
     pub region: Option<String>,
     pub revision: Option<String>,
+    /// Per-candidate credential (TOML literal). Prefer `auth_env_var` in
+    /// committed configs to keep secrets out of the file.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Name of an env var holding this candidate's credential. Resolved
+    /// at route construction; `api_key` (literal) wins when both set.
+    #[serde(default)]
+    pub auth_env_var: Option<String>,
 }
 
 /// TOML representation of a model route.
@@ -481,6 +499,14 @@ impl ModelRouteToml {
                 account_id: c.account_id.clone(),
                 region: c.region.clone(),
                 revision: c.revision.clone(),
+                api_key: c
+                    .api_key
+                    .clone()
+                    .or_else(|| {
+                        c.auth_env_var
+                            .as_ref()
+                            .and_then(|v| std::env::var(v).ok())
+                    }),
                 breaker: Arc::new(CircuitBreaker::new(BreakerConfig::default())),
             })
             .collect();
@@ -526,6 +552,7 @@ mod tests {
             account_id: None,
             region: None,
             revision: None,
+            api_key: None,
             breaker: Arc::new(CircuitBreaker::new(BreakerConfig::default())),
         }
     }

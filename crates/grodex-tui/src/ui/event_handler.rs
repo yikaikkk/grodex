@@ -31,6 +31,10 @@ pub enum TuiAction {
     SubmitPrompt { text: String },
     SubmitCommand { cmd: String },
     ResolveApproval { ticket_idx: usize, resolution: ApprovalResolution },
+    /// Open the Narrow-args JSON editor for the selected approval. The
+    /// main loop switches to `InputMode::NarrowEdit` and pre-fills the
+    /// editor buffer from the ticket's original args.
+    EnterNarrowEdit { ticket_idx: usize },
     /// Resolve an Indeterminate tool call (crash recovery) with one of
     /// three options: Succeeded / Failed / Retry.
     ResolveIndeterminate { row_idx: usize, resolution: IndeterminateResolution },
@@ -92,6 +96,7 @@ pub fn handle_key(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
         InputMode::Normal => handle_normal(key, state),
         InputMode::Prompt => handle_prompt(key, state),
         InputMode::Command => handle_command(key, state),
+        InputMode::NarrowEdit => handle_narrow_edit(key, state),
     };
     // 兜底：handle_prompt 内部有多个 return 路径（Alt+Enter、空文本 Enter、
     // \r/\n 过滤、Tab 补全、菜单导航）会跳过末尾的 recompute_slash_menu()，
@@ -272,13 +277,20 @@ fn handle_normal(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
                 None
             }
         }
-        (KeyCode::Char('n'), _) => {
+        (KeyCode::Char('A'), _) => {
             if !state.pending_approvals.is_empty() {
                 Some(TuiAction::ResolveApproval {
                     ticket_idx: state.selected_approval_idx,
-                    resolution: ApprovalResolution::Narrow {
-                        narrowed_args: serde_json::Value::Null,
-                    },
+                    resolution: ApprovalResolution::AlwaysAllow,
+                })
+            } else {
+                None
+            }
+        }
+        (KeyCode::Char('n'), _) => {
+            if !state.pending_approvals.is_empty() {
+                Some(TuiAction::EnterNarrowEdit {
+                    ticket_idx: state.selected_approval_idx,
                 })
             } else {
                 None
@@ -422,18 +434,28 @@ fn handle_prompt(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
             }
             KeyCode::Enter => {
                 let opt = state.current_approval_option();
-                let res = match opt {
-                    ApprovalOption::Allow => ApprovalResolution::Allow,
-                    ApprovalOption::Deny => ApprovalResolution::Deny,
-                    ApprovalOption::Cancel => ApprovalResolution::Cancel,
-                    ApprovalOption::Narrow => ApprovalResolution::Narrow {
-                        narrowed_args: serde_json::Value::Null,
-                    },
-                };
-                return Some(TuiAction::ResolveApproval {
-                    ticket_idx: state.selected_approval_idx,
-                    resolution: res,
-                });
+                match opt {
+                    ApprovalOption::Narrow => {
+                        // Open the args editor — a bare null narrowed_args
+                        // would fail the tool's deserialization downstream.
+                        return Some(TuiAction::EnterNarrowEdit {
+                            ticket_idx: state.selected_approval_idx,
+                        });
+                    }
+                    opt => {
+                        let res = match opt {
+                            ApprovalOption::Allow => ApprovalResolution::Allow,
+                            ApprovalOption::AlwaysAllow => ApprovalResolution::AlwaysAllow,
+                            ApprovalOption::Deny => ApprovalResolution::Deny,
+                            ApprovalOption::Cancel => ApprovalResolution::Cancel,
+                            ApprovalOption::Narrow => unreachable!(),
+                        };
+                        return Some(TuiAction::ResolveApproval {
+                            ticket_idx: state.selected_approval_idx,
+                            resolution: res,
+                        });
+                    }
+                }
             }
             _ => {}
         }
@@ -1330,5 +1352,67 @@ mod tests {
         assert!(matches!(kind, SlashLocalKind::Unsupported));
         // Regular prompt → passthrough (None).
         assert!(try_parse_local_slash("hello world").is_none());
+    }
+}
+
+/// Narrow-args editor (InputMode::NarrowEdit): the user edits a JSON
+/// scope for the selected approval. Enter parses + submits as
+/// `ApprovalResolution::Narrow`, Esc closes without resolving.
+fn handle_narrow_edit(key: KeyEvent, state: &mut TuiAppState) -> Option<TuiAction> {
+    let Some(edit) = state.narrow_edit.as_mut() else {
+        return None;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            state.narrow_edit = None;
+            state.input_mode = InputMode::Prompt;
+            None
+        }
+        KeyCode::Enter => {
+            let text = edit.buffer.trim().to_string();
+            let parsed: Result<serde_json::Value, _> = if text.is_empty() {
+                Ok(serde_json::json!({}))
+            } else {
+                serde_json::from_str(&text)
+            };
+            match parsed {
+                Ok(v) => {
+                    let ticket_id = edit.ticket_id.clone();
+                    state.narrow_edit = None;
+                    state.input_mode = InputMode::Prompt;
+                    // If the ticket vanished while editing (120s expiry is
+                    // routine), DROP the resolution — falling back to
+                    // selected_approval_idx would send these args to a
+                    // DIFFERENT tool's ticket.
+                    match state
+                        .pending_approvals
+                        .iter()
+                        .position(|t| t.ticket_id == ticket_id)
+                    {
+                        Some(idx) => Some(TuiAction::ResolveApproval {
+                            ticket_idx: idx,
+                            resolution: ApprovalResolution::Narrow { narrowed_args: v },
+                        }),
+                        None => {
+                            state.push_log("narrow 目标审批已失效，已丢弃");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    edit.error = Some(format!("JSON 解析失败: {e}"));
+                    None
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            edit.buffer.pop();
+            None
+        }
+        KeyCode::Char(c) => {
+            edit.buffer.push(c);
+            None
+        }
+        _ => None,
     }
 }

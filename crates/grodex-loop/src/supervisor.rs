@@ -346,6 +346,21 @@ impl SessionSupervisor {
             return;
         }
 
+        // ── Telemetry anchor: SessionStarted (durable) ────────────────
+        // Gives the telemetry projection its `sessions.started_at`. On a
+        // fresh session this is the first journal entry; on a resumed
+        // session (writer rebound to the old journal) it re-anchors the
+        // resumed session id. Cwd is stored raw in the journal (the
+        // telemetry projection keeps only its hash).
+        if let Some(ref writer) = self.writer {
+            let details = serde_json::json!({
+                "cwd": self.cwd.to_string_lossy(),
+                "model_provider": self.model_config.provider,
+                "model": self.model_config.model,
+            });
+            let _ = writer.write_session_started(&details).await;
+        }
+
         // ── Crash recovery: replay the journal into the live transcript ──
         // On startup, if a rollout exists for this session we fold it back
         // into the ChatStateActor so a restarted session continues from
@@ -398,12 +413,40 @@ impl SessionSupervisor {
             }
         }
 
+        // Approval-ticket expiry sweeper: the coordinator's 120s wait
+        // timeout Denies the *tool future*, but only this sweep marks the
+        // broker/DB ticket Expired (and journals the resolution) so
+        // recovered/re-injected tickets cannot linger forever.
+        let mut expiry_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        expiry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 biased;
                 // Turn completions (higher priority — process before new commands).
                 Some(completion) = self.completion_rx.recv() => {
                     self.handle_turn_completion(completion).await;
+                }
+                _ = expiry_tick.tick() => {
+                    let expired = self.permission.lock().await.expired_ticket_infos();
+                    if !expired.is_empty() {
+                        for (ticket_id, info) in &expired {
+                            if let Some(ref writer) = self.writer {
+                                let _ = writer
+                                    .write_approval_resolved(ticket_id, info.call_id.as_deref(), "expired", None, None)
+                                    .await;
+                            }
+                            let _ = self.event_tx
+                                .send(SessionEvent::Info {
+                                    message: format!(
+                                        "审批超时：{}（ticket={ticket_id}）",
+                                        info.tool_name.as_deref().unwrap_or("?")
+                                    ),
+                                })
+                                .await;
+                        }
+                        self.permission.lock().await.expire_timed_out();
+                    }
                 }
                 // Commands from the frontend.
                 cmd = self.cmd_rx.recv() => {
@@ -443,11 +486,26 @@ impl SessionSupervisor {
                 self.start_turn(user_input).await;
                 true
             }
+            SessionCommand::AdoptPermissionPolicy { policy } => {
+                // Config hot-reload: adopt the recompiled policy. The
+                // revocation epoch bump fences every in-flight lease —
+                // a mid-Turn tool call revalidates against the NEW
+                // policy before its side effect (invariant #16).
+                self.permission.lock().await.adopt_policy(policy);
+                let epoch = self.permission.lock().await.revocation_epoch();
+                let _ = self
+                    .event_tx
+                    .send(SessionEvent::Info {
+                        message: format!("权限策略已热更新（revocation epoch → {epoch}）"),
+                    })
+                    .await;
+                true
+            }
             SessionCommand::CancelTurn => {
                 self.cancel_turn().await;
                 true
             }
-            SessionCommand::ResolveApproval { ticket_id, decision, narrowed_args } => {
+            SessionCommand::ResolveApproval { ticket_id, decision, narrowed_args, always_allow } => {
                 // Design Doc 16 §10 (second half) + Doc 17 §9 — the
                 // frontend resolved an approval ticket. Forward the
                 // decision to the SAME PermissionManager the
@@ -470,11 +528,12 @@ impl SessionSupervisor {
                 //      so the tool future / coordinator can look up the
                 //      narrowed args when building the actual invocation.
                 let accepted = matches!(decision, PolicyDecision::Allow);
-                let resolution_str = match (&decision, narrowed_args.is_some()) {
-                    (PolicyDecision::Deny, _) => "rejected",
-                    (PolicyDecision::Ask, _)  => "rejected", // Ask should never appear in resolve()
-                    (PolicyDecision::Allow, true) => "narrowed",
-                    (PolicyDecision::Allow, false) => "approved",
+                let resolution_str = match (&decision, narrowed_args.is_some(), always_allow) {
+                    (PolicyDecision::Deny, _, _) => "rejected",
+                    (PolicyDecision::Ask, _, _)  => "rejected", // Ask should never appear in resolve()
+                    (PolicyDecision::Allow, true, _) => "narrowed",
+                    (PolicyDecision::Allow, false, true) => "approved_session",
+                    (PolicyDecision::Allow, false, false) => "approved",
                 };
 
                 // Look up the pending ticket's associated tool_call_id /
@@ -522,6 +581,31 @@ impl SessionSupervisor {
                         .await;
                     if let Err(e) = write_res {
                         eprintln!("[warn] rollout write_effective_tool_call_revision failed: {e}");
+                    }
+                }
+
+                // "Always allow": mint a session-level grant keyed to this
+                // tool so later `PermissionManager::check()` calls hit the
+                // grant fast-path instead of re-prompting. Doc 10 §20.12.
+                if always_allow && accepted {
+                    if let Some(tool_name) = tool_name {
+                        let generation = self.permission.lock().await.revocation_epoch();
+                        let grant = grodex_permission::session_grant::SessionPolicyGrant {
+                            grant_id: format!("grant_{ticket_id}"),
+                            origin_approval_id: ticket_id.clone(),
+                            subject_id: "user".into(),
+                            capability_id: tool_name.to_string(),
+                            normalized_operation_matcher: format!("tool={tool_name}"),
+                            normalized_resource_or_command_matcher: None,
+                            ceiling_hash: format!("policy_gen:{generation}"),
+                            policy_generation_created: generation,
+                            created_at: chrono::Utc::now(),
+                            expires_at: None, // session lifetime
+                            max_uses: None,
+                            revoked_at: None,
+                        };
+                        self.permission.lock().await.add_session_grant(grant);
+                        tracing::info!(ticket_id = %ticket_id, tool = %tool_name, "session grant minted (always allow)");
                     }
                 }
 
@@ -633,6 +717,15 @@ impl SessionSupervisor {
                     // readers (chat state, diagnostics) report the
                     // resumed id rather than the transient new one.
                     self.session.id = new_session_id;
+                    // Telemetry anchor for the resumed session id (the
+                    // boot-time SessionStarted went to the ephemeral
+                    // empty journal, not this rebound one).
+                    let details = serde_json::json!({
+                        "cwd": self.cwd.to_string_lossy(),
+                        "model_provider": self.model_config.provider,
+                        "model": self.model_config.model,
+                    });
+                    let _ = w.write_session_started(&details).await;
                 }
                 // Internal diagnostic — use tracing, NOT SessionEvent::Info
                 // which would leak session_id/next_seq to the user.
@@ -1055,6 +1148,10 @@ impl SessionSupervisor {
                     })
                     .await;
             }
+            // Telemetry anchor: durable TurnStarted (turns.started_at).
+            let _ = writer
+                .write_turn_started(turn_id, user_input_for_memory.chars().count())
+                .await;
         }
 
         // Build system instructions via PromptBuilder + Memory + Discovery.
@@ -1121,7 +1218,28 @@ impl SessionSupervisor {
             // Hybrid RRF retrieval (FTS5 + vector, fail-open to pure FTS).
             // emb=None → vector list empty → RRF degrades to pure FTS5 ranking.
             // emb=Some → embed query, search vectors, fuse with FTS5 results.
-            match db.retrieve_hybrid_memory(&user_input_for_memory, 5, self.embedding.as_ref()).await {
+            let retrieval_started = std::time::Instant::now();
+            let retrieval_result =
+                db.retrieve_hybrid_memory(&user_input_for_memory, 5, self.embedding.as_ref()).await;
+            // P3 telemetry: retrieval latency + yield (out-of-band record).
+            if let Some(ref writer) = self.writer {
+                let selected = match &retrieval_result {
+                    Ok(units) => units.len(),
+                    Err(_) => 0,
+                };
+                writer.emit_out_of_band_telemetry(
+                    grodex_telemetry::kind::MEMORY_RETRIEVAL,
+                    Some(turn_id),
+                    None,
+                    &serde_json::json!({
+                        "query_chars": user_input_for_memory.chars().count(),
+                        "selected_count": selected,
+                        "duration_ms": retrieval_started.elapsed().as_millis() as u64,
+                        "router_kind": "hybrid_rrf",
+                    }),
+                );
+            }
+            match retrieval_result {
                 Ok(units) if !units.is_empty() => {
                     memory_block = Some(grodex_memory::RetrievedUnit::format_for_prompt(&units));
                 }
@@ -1189,13 +1307,14 @@ impl SessionSupervisor {
                             summary,
                             risk,
                             timeout_remaining_ms,
+                            args,
                         } => SessionEvent::ApprovalRequested {
                             ticket_id,
                             tool_name,
                             summary,
                             risk,
                             timeout_remaining_ms,
-                            args: None,
+                            args: args,
                             call_id: None,
                         },
                         StreamFragment::CompactionStatus { phase } => {
@@ -1310,9 +1429,19 @@ impl SessionSupervisor {
             })
             .await;
 
-        // Write TurnCompleted rollout event.
+        // Write TurnCompleted rollout event with the structured
+        // termination reason + aggregate counters (telemetry projection).
         if let Some(ref writer) = self.writer {
-            if let Err(e) = writer.write_turn_completed(completion.turn_id).await {
+            let metrics_json = serde_json::to_value(completion.outcome.metrics)
+                .unwrap_or(serde_json::Value::Null);
+            if let Err(e) = writer
+                .write_turn_completed_with(
+                    completion.turn_id,
+                    completion.outcome.termination_reason,
+                    &metrics_json,
+                )
+                .await
+            {
                 let _ = self.event_tx
                     .send(SessionEvent::Error {
                         message: format!("rollout journal write failed (TurnCompleted): {e}"),
@@ -1447,7 +1576,10 @@ impl SessionSupervisor {
 
         // Seal the cancelled turn so strict replays see a complete turn
         // boundary (the aborted task never reached handle_turn_completion).
-        if let Err(e) = writer.write_turn_completed(turn_id).await {
+        if let Err(e) = writer
+            .write_turn_completed_with(turn_id, "cancelled", &serde_json::json!({}))
+            .await
+        {
             tracing::warn!("heal_interrupted_tool_calls: TurnCompleted write failed: {e}");
         }
     }

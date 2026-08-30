@@ -1,0 +1,23 @@
+[package]
+name = "grodex-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SQLite telemetry sink — queryable runtime-observation projection of the rollout journal"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -890,14 +890,17 @@ dependencies = [
  "grodex-sandbox-types",
  "grodex-skills",
  "grodex-subagent",
+ "grodex-telemetry",
  "grodex-tools",
  "grodex-tui",
+ "rusqlite",
  "serde_json",
  "tokio",
  "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -945,6 +948,7 @@ dependencies = [
  "grodex-sandbox",
  "grodex-skills",
  "grodex-subagent",
+ "grodex-telemetry",
  "grodex-tools",
  "loom",
  "serde",
@@ -1134,6 +1138,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "grodex-telemetry"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "grodex-tools"
 version = "0.1.0"
 dependencies = [
@@ -1144,6 +1162,7 @@ dependencies = [
  "grodex-sandbox-types",
  "grodex-skills",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

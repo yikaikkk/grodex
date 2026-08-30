@@ -12,6 +12,10 @@ name = "grodex"
 path = "src/main.rs"
 
 [dependencies]
+rusqlite.workspace = true
+grodex-telemetry.workspace = true
+uuid.workspace = true
+
 clap.workspace = true
 dirs.workspace = true
 tokio.workspace = true

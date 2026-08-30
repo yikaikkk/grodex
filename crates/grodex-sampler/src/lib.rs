@@ -88,6 +88,9 @@ pub enum StreamFragment {
         summary: String,
         risk: String,
         timeout_remaining_ms: u64,
+        /// The tool call arguments — needed by the frontend to offer a
+        /// Narrow (args-scope) approval.
+        args: Option<serde_json::Value>,
     },
     /// Context compaction lifecycle status. Emitted by the TurnCoordinator
     /// around the summarization round-trip so the frontend can show a

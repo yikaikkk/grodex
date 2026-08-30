@@ -8,6 +8,7 @@
 //! Fail-closed: if the DB is unavailable the broker degrades to pure
 //! in-memory mode transparently.
 
+use crate::manager::PendingTicketInfo;
 use crate::store::{StoreError, TicketStore};
 use crate::ticket::{ApprovalTicket, TicketStatus};
 use crate::resolution::ApprovalResolution;
@@ -272,6 +273,25 @@ impl ApprovalBroker {
 
     pub fn pending_count(&self) -> usize {
         self.tickets.len()
+    }
+
+    /// Tickets past their deadline that the sweeper has not yet removed.
+    /// Used by the supervisor to journal the "expired" resolution before
+    /// `expire_timed_out()` removes them from the broker.
+    pub fn expired_ticket_infos(&self) -> Vec<(String, PendingTicketInfo)> {
+        self.tickets
+            .iter()
+            .filter(|(_, t)| t.is_expired())
+            .map(|(id, t)| {
+                (
+                    id.clone(),
+                    PendingTicketInfo {
+                        call_id: Some(t.tool_call_id.to_string()),
+                        tool_name: Some(t.tool_name.clone()),
+                    },
+                )
+            })
+            .collect()
     }
 
     pub fn pending_tickets(&self) -> Vec<&str> {

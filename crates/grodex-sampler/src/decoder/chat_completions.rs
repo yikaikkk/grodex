@@ -18,6 +18,10 @@ use std::collections::BTreeMap;
 /// A Chat Completions SSE chunk.
 #[derive(Debug, Deserialize)]
 struct ChatChunk {
+    /// Provider-issued completion id (`chatcmpl-…`), present on every
+    /// chunk; captured once for provider_request_id.
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     choices: Vec<ChatChoice>,
     #[serde(default)]
@@ -112,6 +116,7 @@ pub struct ChatCompletionsDecoder {
     finish_reason: Option<String>,
     model: Option<String>,
     usage: Option<ChatUsage>,
+    provider_request_id: Option<String>,
 }
 
 impl ChatCompletionsDecoder {
@@ -128,6 +133,7 @@ impl ChatCompletionsDecoder {
             finish_reason: None,
             model: None,
             usage: None,
+            provider_request_id: None,
         }
     }
 
@@ -143,6 +149,9 @@ impl ChatCompletionsDecoder {
         }
         if let Some(ref u) = chunk.usage {
             self.usage = Some(u.clone());
+        }
+        if self.provider_request_id.is_none() {
+            self.provider_request_id = chunk.id;
         }
 
         for choice in chunk.choices {
@@ -364,6 +373,7 @@ impl StreamingDecoder for ChatCompletionsDecoder {
             items,
             stop_reason,
             usage,
+            provider_request_id: self.provider_request_id.clone(),
         };
 
         events.push(CanonicalModelEvent::ResponseCompleted(response));

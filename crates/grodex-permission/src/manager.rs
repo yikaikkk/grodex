@@ -36,6 +36,10 @@ pub struct ApprovalRequestedEvent {
     /// counts down from here locally; the broker itself expires tickets
     /// at `ticket.timeout` anyway, so this is only for UX.
     pub timeout_remaining_ms: u64,
+    /// The tool call arguments that triggered this request — the frontend
+    /// needs them to offer a Narrow (args-scope) approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
 }
 
 /// Lightweight snapshot of a pending ticket, returned by
@@ -198,6 +202,22 @@ impl PermissionManager {
         self.revocation_epoch
     }
 
+    /// Hot-adopt a recompiled policy (config hot-reload). The revocation
+    /// epoch is bumped so every in-flight lease revalidates against the
+    /// NEW policy before any further side effect — a loosened rule can
+    /// never retroactively authorize an already-dispatched call, and a
+    /// tightened one fences calls that were approved under the old
+    /// generation. Session grants minted by "always allow" survive the
+    /// swap (the user granted them explicitly).
+    pub fn adopt_policy(&mut self, policy: PermissionPolicy) {
+        self.policy = policy;
+        self.revocation_epoch += 1;
+        tracing::info!(
+            epoch = self.revocation_epoch,
+            "permission policy hot-adopted (revocation epoch bumped)"
+        );
+    }
+
     /// Attach a sandbox validator for path-based policy enforcement.
     pub fn with_sandbox(mut self, validator: SandboxValidator) -> Self {
         self.sandbox_validator = Some(validator);
@@ -285,11 +305,25 @@ impl PermissionManager {
         args: &serde_json::Value,
         summary: &str,
     ) -> PermissionResult {
+        // Deny rules ALWAYS win — an explicit policy deny overrides even
+        // a user-minted session grant (a hot-adopted tightened policy must
+        // not be silently bypassed by a grant from before the swap).
+        if matches!(
+            self.policy.evaluate(tool_name, args),
+            PolicyDecision::Deny
+        ) {
+            return PermissionResult::Denied {
+                reason: format!("policy denied {tool_name}"),
+            };
+        }
+
         // ── Session grant fast-path (doc 10 §20.12) ──
+        // Exact matcher equality — a grant for tool "read" must NOT also
+        // allow "read_file" (the old `contains` check did exactly that).
         let now = chrono::Utc::now();
         let matcher_key = format!("tool={tool_name}");
         for grant in self.session_grants.iter_mut() {
-            if grant.is_active(now) && grant.normalized_operation_matcher.contains(&matcher_key) {
+            if grant.is_active(now) && grant.normalized_operation_matcher == matcher_key {
                 // Decrement use counter if bounded.
                 if let Some(ref mut max) = grant.max_uses {
                     if *max == 0 {
@@ -344,6 +378,7 @@ impl PermissionManager {
                         summary: summary_owned,
                         risk: risk_str,
                         timeout_remaining_ms: timeout_ms,
+                        args: Some(args.clone()),
                     });
                 }
                 PermissionResult::ApprovalRequired {
@@ -409,6 +444,14 @@ impl PermissionManager {
     /// Number of pending approval tickets.
     pub fn pending_count(&self) -> usize {
         self.broker.pending_count()
+    }
+
+    /// Tickets whose deadline has passed but the sweeper has not yet
+    /// expired — the supervisor journals these as "expired" BEFORE
+    /// calling `expire_timed_out()` so the broker's removal doesn't
+    /// lose the audit trail.
+    pub fn expired_ticket_infos(&self) -> Vec<(String, PendingTicketInfo)> {
+        self.broker.expired_ticket_infos()
     }
 
     /// Add a session-level grant (doc 10 §20.12). Called when the user

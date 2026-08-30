@@ -31,6 +31,7 @@ pub mod patch;
 pub mod process_io;
 pub mod read;
 pub mod read_artifact;
+pub mod web;
 pub mod registry;
 pub mod write;
 
@@ -57,3 +58,4 @@ pub use read::ReadFileTool;
 pub use read_artifact::ReadArtifactTool;
 pub use registry::ToolRegistry;
 pub use write::WriteFileTool;
+pub use web::{WebFetchArgs, WebFetchOutput, WebFetchTool};

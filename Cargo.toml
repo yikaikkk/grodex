@@ -20,6 +20,7 @@ members = [
     "crates/grodex-auth",
     "crates/grodex-mcp",
     "crates/grodex-memory",
+    "crates/grodex-telemetry",
     "crates/grodex-cli",
     "crates/grodex-tui",
 ]
@@ -79,6 +80,7 @@ grodex-sandbox = { path = "crates/grodex-sandbox" }
 grodex-auth = { path = "crates/grodex-auth" }
 grodex-mcp = { path = "crates/grodex-mcp" }
 grodex-memory = { path = "crates/grodex-memory" }
+grodex-telemetry = { path = "crates/grodex-telemetry" }
 grodex-cli = { path = "crates/grodex-cli" }
 grodex-tui = { path = "crates/grodex-tui" }
 

@@ -37,6 +37,10 @@ enum MessageEvent {
 
 #[derive(Debug, Deserialize)]
 struct MessageData {
+    /// Provider-issued message id (Anthropic `msg_…`) — surfaced as
+    /// `provider_request_id` for support/billing correlation.
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -100,6 +104,8 @@ pub struct MessagesDecoder {
     stop_reason: Option<String>,
     model: Option<String>,
     usage: Option<MsgUsage>,
+    /// Provider-issued message id from `message_start`.
+    provider_request_id: Option<String>,
 }
 
 impl MessagesDecoder {
@@ -115,6 +121,7 @@ impl MessagesDecoder {
             stop_reason: None,
             model: None,
             usage: None,
+            provider_request_id: None,
         }
     }
 
@@ -124,6 +131,7 @@ impl MessagesDecoder {
         match event {
             MessageEvent::MessageStart { message } => {
                 self.state = DecoderState::Started;
+                self.provider_request_id = message.id;
                 self.model = message.model;
                 self.usage = message.usage;
             }
@@ -301,6 +309,7 @@ impl StreamingDecoder for MessagesDecoder {
             items,
             stop_reason,
             usage,
+            provider_request_id: self.provider_request_id.clone(),
         };
 
         events.push(CanonicalModelEvent::ResponseCompleted(response));

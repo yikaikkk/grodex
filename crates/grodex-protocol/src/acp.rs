@@ -74,6 +74,20 @@ pub struct SessionPrompt {
     pub text: String,
 }
 
+/// Steer an in-progress Turn: the user adds/changes the goal while the
+/// agent is still streaming. The agent cancels the current Turn and
+/// starts a new one seeded with the steering text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSteer {
+    pub command_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    pub session_id: SessionId,
+    pub text: String,
+}
+
 /// Cancel the current operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCancel {
@@ -125,6 +139,8 @@ pub struct SnapshotItem {
 #[serde(tag = "type")]
 pub enum Command {
     Prompt(SessionPrompt),
+    /// Modify the in-progress Turn mid-stream (agent cancels + restarts).
+    Steer(SessionSteer),
     Cancel(SessionCancel),
     ResolveApproval(ResolveApprovalCommand),
     ResumeSession(ResumeSessionCommand),
@@ -140,6 +156,10 @@ pub enum Command {
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalResolution {
     Allow,
+    /// Approve this call AND grant it for the rest of the session
+    /// ("always allow"). The agent mints a `SessionPolicyGrant` keyed to
+    /// the tool so later `check()` calls fast-path to Allowed.
+    AlwaysAllow,
     Narrow { narrowed_args: serde_json::Value },
     Deny,
     Cancel,

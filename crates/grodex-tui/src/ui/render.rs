@@ -32,7 +32,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders as B, Paragraph, Wrap, List, ListItem};
+use ratatui::widgets::{Clear, Block, Borders as B, Paragraph, Wrap, List, ListItem};
 use crate::custom_terminal::Frame;
 
 use super::layout::AppLayout;
@@ -620,6 +620,52 @@ pub fn render_full(f: &mut Frame<'_>, state: &mut TuiAppState, layout: &AppLayou
     }
     render_prompt_widget(f, state, layout.prompt);
     render_shortcuts_bar(f, state, layout.shortcuts);
+    if state.narrow_edit.is_some() {
+        render_narrow_edit_popup(f, state, f.area());
+    }
+}
+
+/// Centered modal editor for the Narrow approval flow: the user edits a
+/// JSON args scope; Enter submits (parsed as `ApprovalResolution::Narrow`),
+/// Esc closes without resolving.
+fn render_narrow_edit_popup(f: &mut Frame<'_>, state: &TuiAppState, area: Rect) {
+    let Some(edit) = state.narrow_edit.as_ref() else { return };
+    // 70% width, ~14 rows, centered.
+    let w = (area.width as usize * 7 / 10).max(40).min(area.width as usize) as u16;
+    let h = 14u16.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+
+    // Clear the region behind the popup.
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Narrow arguments (JSON) ",
+            c_accent().add_modifier(Modifier::BOLD),
+        ))
+        .borders(B::ALL)
+        .border_style(c_accent());
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Edit the approved argument scope, then Enter to run / Esc to cancel",
+        c_muted(),
+    )));
+    lines.push(Line::from(Span::raw("")));
+    // Wrap the buffer into the popup width.
+    let text_w = inner.width.max(4) as usize - 2;
+    let max_lines = (inner.height as usize).saturating_sub(5);
+    for l in wrap_str(&edit.buffer, text_w).into_iter().take(max_lines) {
+        lines.push(Line::from(Span::raw(l)));
+    }
+    if let Some(err) = &edit.error {
+        lines.push(Line::from(Span::styled(err.clone(), c_error())));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── 1. Status bar (1 row) ───────────────────────────────────────────────
@@ -1897,11 +1943,13 @@ fn render_prompt_info_line(
     let mode_tag = match state.input_mode {
         InputMode::Prompt  => " PROMPT ",
         InputMode::Command => " CMD ",
+        InputMode::NarrowEdit => " NARROW ",
         InputMode::Normal  => " IDLE ",
     };
     let mode_tag_s = match state.input_mode {
         InputMode::Prompt  => c_user(),
         InputMode::Command => c_warn().add_modifier(Modifier::BOLD),
+        InputMode::NarrowEdit => c_accent().add_modifier(Modifier::BOLD),
         InputMode::Normal  => c_dim(),
     };
     let enter_hint = if matches!(state.input_mode, InputMode::Prompt) {
@@ -2141,6 +2189,7 @@ fn render_shortcuts_bar(f: &mut Frame<'_>, state: &TuiAppState, area: Rect) {
         InputMode::Normal  => &normal_hints,
         InputMode::Prompt  => prompt_hints,
         InputMode::Command => &cmd_hints,
+        InputMode::NarrowEdit => &cmd_hints,
     };
 
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
@@ -2172,11 +2221,13 @@ fn render_shortcuts_bar(f: &mut Frame<'_>, state: &TuiAppState, area: Rect) {
         InputMode::Normal  => "NORMAL",
         InputMode::Prompt  => "PROMPT",
         InputMode::Command => "CMD",
+        InputMode::NarrowEdit => "NARROW",
     };
     let mode_s = match state.input_mode {
         InputMode::Normal  => c_dim().add_modifier(Modifier::BOLD),
         InputMode::Prompt  => c_user().add_modifier(Modifier::BOLD),
         InputMode::Command => c_warn().add_modifier(Modifier::BOLD),
+        InputMode::NarrowEdit => c_accent().add_modifier(Modifier::BOLD),
     };
     let n = state.pending_approvals.len();
     let approval_tag = if n > 0 {

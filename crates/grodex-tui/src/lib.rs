@@ -17,6 +17,7 @@ use grodex_core::id::SessionId;
 use grodex_protocol::acp::{
     Command, EventEnvelope, ReplayCursor, ReplayMode,
     ResolveApprovalCommand, ResolveIndeterminateCommand, ResumeSessionCommand, SessionCancel,
+    SessionSteer,
     SessionPrompt,
 };
 use ratatui::backend::CrosstermBackend;
@@ -878,13 +879,27 @@ impl GrodexTui {
                                     .clone()
                                     .and_then(|s| SessionId::from_string(&s).ok())
                                     .unwrap_or_else(SessionId::new);
-                                let cmd = Command::Prompt(SessionPrompt {
-                                    command_id: next_cmd_id(),
-                                    expected_generation: Some(self.state.capability_generation),
-                                    idempotency_key: None,
-                                    session_id: sid,
-                                    text,
-                                });
+                                // Mid-stream submissions STEER the running
+                                // Turn (agent cancels + restarts with the
+                                // new input) instead of being dropped with
+                                // "one turn at a time".
+                                let cmd = if self.state.is_streaming() {
+                                    Command::Steer(SessionSteer {
+                                        command_id: next_cmd_id(),
+                                        expected_generation: Some(self.state.capability_generation),
+                                        idempotency_key: None,
+                                        session_id: sid,
+                                        text,
+                                    })
+                                } else {
+                                    Command::Prompt(SessionPrompt {
+                                        command_id: next_cmd_id(),
+                                        expected_generation: Some(self.state.capability_generation),
+                                        idempotency_key: None,
+                                        session_id: sid,
+                                        text,
+                                    })
+                                };
                                 if let Err(e) = self.transport.send_command(cmd) {
                                     self.state.push_log(format!("发送 Prompt 失败: {e}"));
                                 }
@@ -896,6 +911,23 @@ impl GrodexTui {
                                     &mut *self.transport,
                                     &mut next_cmd_id,
                                 );
+                            }
+                            TuiAction::EnterNarrowEdit { ticket_idx } => {
+                                if let Some(ticket) =
+                                    self.state.pending_approvals.get(ticket_idx).cloned()
+                                {
+                                    let buffer = ticket
+                                        .args
+                                        .as_ref()
+                                        .and_then(|v| serde_json::to_string_pretty(v).ok())
+                                        .unwrap_or_else(|| "{}".to_string());
+                                    self.state.narrow_edit = Some(ui::state::NarrowEditState {
+                                        ticket_id: ticket.ticket_id.clone(),
+                                        buffer,
+                                        error: None,
+                                    });
+                                    self.state.input_mode = ui::state::InputMode::NarrowEdit;
+                                }
                             }
                             TuiAction::ResolveApproval {
                                 ticket_idx,
@@ -2467,7 +2499,7 @@ impl GrodexTui {
                                         } else {
                                             matches!(arg.as_str(), "on" | "true" | "1" | "enable")
                                         };
-                                        if arg != "status" && (arg.is_empty() || arg != "status") {
+                                        if arg != "status" {
                                             self.state.show_timestamps = new_val;
                                         }
                                         let st = if self.state.show_timestamps { "🟢 on" } else { "⚪ off" };

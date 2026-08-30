@@ -4,6 +4,7 @@
 
 mod idempotency;
 mod runtime;
+mod telemetry_cmd;
 
 use idempotency::IdempotencyCache;
 use runtime::SessionRuntimeBuilder;
@@ -33,6 +34,50 @@ use grodex_rollout::store::{FileRolloutStore, RolloutStore};
 use grodex_sampler::{SamplingActor, SamplingClient, SamplingClientConfig};
 use grodex_tools::{ApplyPatchTool, EditTool, ExecTool, ReadFileTool, WriteFileTool};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+#[derive(clap::Subcommand, Debug)]
+enum TelemetryCommand {
+    /// List recent sessions.
+    Sessions,
+    /// List turns of one session.
+    Session { session_id: String },
+    /// Detail one turn: termination reason, model attempts, tool lifecycle.
+    Turn { turn_id: String },
+    /// Recent error-severity events.
+    Errors {
+        #[arg(default_value_t = 20)]
+        limit: u32,
+    },
+    /// Tools ranked by average latency (with approval-wait breakdown).
+    SlowTools {
+        #[arg(default_value_t = 10)]
+        limit: u32,
+    },
+    /// Models ranked by average latency (with cache-hit rate).
+    SlowModels {
+        #[arg(default_value_t = 10)]
+        limit: u32,
+    },
+    /// Lifecycle anomalies: open turns, stuck tools, uncommitted results.
+    Doctor,
+    /// Prompt-cache hit rates per model (provider-reported tokens).
+    Cache,
+    /// Chronological turn timeline of one session.
+    Timeline { session_id: String },
+    /// Lifecycle anomalies: open turns, stuck tools, uncommitted results.
+    Recovery,
+    /// Checkpoint WAL + VACUUM the telemetry database.
+    Vacuum,
+    /// Export raw telemetry events as JSONL.
+    Export {
+        /// Restrict to one session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Output file (default: stdout).
+        #[arg(long)]
+        output: Option<String>,
+    },
+}
 
 #[derive(Parser)]
 #[command(name = "grodex", about = "AI coding agent", version)]
@@ -92,6 +137,23 @@ enum Command {
     Prompt {
         #[command(subcommand)]
         action: PromptCommand,
+    },
+    /// Run the OAuth authorization flow for an MCP server.
+    McpAuth {
+        /// The MCP server name from [[mcp_server]] config.
+        server: String,
+        /// Working directory used to resolve config (default: current dir).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
+    /// Query the telemetry projection (~/.grodex/telemetry.db).
+    Telemetry {
+        #[command(subcommand)]
+        cmd: TelemetryCommand,
+        /// Explicit telemetry.db path (default: ~/.grodex/telemetry.db,
+        /// overridable via GRODEX_TELEMETRY_DB).
+        #[arg(long)]
+        db: Option<String>,
     },
     /// Show version information.
     Version,
@@ -176,6 +238,36 @@ enum PromptCommand {
 /// writer 在退出时 flush。级别受 `RUST_LOG` 控制;未设置时 grodex
 /// crate 默认 info(grodex_loop=debug 以便看到 step/turn 细节),第三方
 /// crate(hyper/reqwest/tokio)默认 warn 以降噪。
+/// Process-global telemetry sink handle. Initialised once in `main`;
+/// read by `build_session_parts` wherever a session runtime is built.
+static TELEMETRY: std::sync::OnceLock<Option<Arc<dyn grodex_telemetry::TelemetrySink>>> =
+    std::sync::OnceLock::new();
+
+fn telemetry_sink() -> Option<Arc<dyn grodex_telemetry::TelemetrySink>> {
+    TELEMETRY.get().and_then(|slot| slot.as_ref().cloned())
+}
+
+/// Open the SQLite telemetry DB (`~/.grodex/telemetry.db`, 0600). Fail-open:
+/// if the DB cannot be opened, telemetry is disabled for the process and
+/// the Agent Loop is unaffected.
+fn init_telemetry() -> Option<grodex_telemetry::TelemetryGuard> {
+    let path = std::env::var("GRODEX_TELEMETRY_DB")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".grodex").join("telemetry.db")))?;
+    match grodex_telemetry::SqliteTelemetrySink::open(&path) {
+        Ok((sink, guard)) => {
+            let _ = TELEMETRY.set(Some(Arc::new(sink)));
+            Some(guard)
+        }
+        Err(e) => {
+            eprintln!("[warn] telemetry db unavailable ({e}) — telemetry disabled");
+            let _ = TELEMETRY.set(None);
+            None
+        }
+    }
+}
+
 fn init_observability() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::EnvFilter;
 
@@ -208,6 +300,7 @@ fn init_observability() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 #[tokio::main]
 async fn main() {
     let _log_guard = init_observability();
+    let _telemetry_guard = init_telemetry();
     let cli = Cli::parse();
 
     match cli.command {
@@ -260,6 +353,34 @@ async fn main() {
                 !no_redact,
             ),
         },
+        Command::McpAuth { server, cwd } => {
+            if let Err(e) = mcp_auth_command(&server, cwd.as_deref()).await {
+                eprintln!("[mcp-auth] {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Telemetry { cmd, db } => {
+            let result = match &cmd {
+                TelemetryCommand::Sessions => telemetry_cmd::sessions(db.as_ref()),
+                TelemetryCommand::Session { session_id } => telemetry_cmd::session(db.as_ref(), session_id),
+                TelemetryCommand::Turn { turn_id } => telemetry_cmd::turn_detail(db.as_ref(), turn_id),
+                TelemetryCommand::Errors { limit } => telemetry_cmd::errors(db.as_ref(), *limit),
+                TelemetryCommand::SlowTools { limit } => telemetry_cmd::slow_tools(db.as_ref(), *limit),
+                TelemetryCommand::SlowModels { limit } => telemetry_cmd::slow_models(db.as_ref(), *limit),
+                TelemetryCommand::Doctor => telemetry_cmd::doctor(db.as_ref()),
+                TelemetryCommand::Cache => telemetry_cmd::cache(db.as_ref()),
+                TelemetryCommand::Timeline { session_id } => telemetry_cmd::timeline(db.as_ref(), session_id),
+                TelemetryCommand::Recovery => telemetry_cmd::recovery(db.as_ref()),
+                TelemetryCommand::Vacuum => telemetry_cmd::vacuum(db.as_ref()),
+                TelemetryCommand::Export { session, output } => {
+                    telemetry_cmd::export(db.as_ref(), session.as_deref(), output.as_deref())
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         Command::Version => {
             println!("grodex {}", env!("CARGO_PKG_VERSION"));
         }
@@ -298,6 +419,7 @@ async fn build_session_parts(
     tokio::sync::mpsc::Receiver<LoopSessionEvent>,
     SessionId,
     Option<Arc<dyn RolloutStore>>,
+    Option<Arc<tokio::sync::Mutex<grodex_loop::durable_subagent::DurableSubAgentSupervisor>>>,
 )> {
     // Unified composition root: the builder assembles Config, Auth,
     // SamplingActor, PermissionManager (config `[rules]`), SandboxRuntime
@@ -307,12 +429,19 @@ async fn build_session_parts(
     // so a new module only needs to be wired once.
     let runtime = SessionRuntimeBuilder::new(cwd)
         .with_trusted(true) // ACP serve always trusts the workspace
+        .with_telemetry(telemetry_sink())
         .build()
         .await?;
 
     let session_id = SessionId::from_string(&runtime.session_id)
         .map_err(|e| anyhow!("invalid session id from builder: {e}"))?;
-    Ok((runtime.handle, runtime.event_rx, session_id, runtime.rollout_store))
+    Ok((
+        runtime.handle,
+        runtime.event_rx,
+        session_id,
+        runtime.rollout_store,
+        runtime.subagent_recovery,
+    ))
 }
 
 fn now_ms() -> u64 {
@@ -556,11 +685,13 @@ async fn route_command(
     stdout: &mut tokio::io::Stdout,
     idem_cache: &mut IdempotencyCache,
     rollout_store: Option<Arc<dyn RolloutStore>>,
+    subagent_recovery: Option<Arc<tokio::sync::Mutex<grodex_loop::durable_subagent::DurableSubAgentSupervisor>>>,
     session_id: SessionId,
     seq: &mut u64,
 ) -> (Option<AckBucket>, Option<SessionId>) {
     let command_id = match &cmd {
         AcpCommand::Prompt(p) => Some(p.command_id.clone()),
+        AcpCommand::Steer(st) => Some(st.command_id.clone()),
         AcpCommand::Cancel(c) => Some(c.command_id.clone()),
         AcpCommand::ResolveApproval(r) => Some(r.command_id.clone()),
         AcpCommand::ResumeSession(r) => Some(r.command_id.clone()),
@@ -569,6 +700,7 @@ async fn route_command(
 
     if let Some(ref idem_key) = match &cmd {
         AcpCommand::Prompt(p) => p.idempotency_key.as_ref(),
+        AcpCommand::Steer(st) => st.idempotency_key.as_ref(),
         AcpCommand::Cancel(c) => c.idempotency_key.as_ref(),
         AcpCommand::ResolveApproval(r) => r.idempotency_key.as_ref(),
         AcpCommand::ResumeSession(r) => r.idempotency_key.as_ref(),
@@ -597,21 +729,30 @@ async fn route_command(
                 user_input: p.text,
             })
             .await,
+        AcpCommand::Steer(st) => {
+            handle
+                .send(SessionCommand::Steer {
+                    user_input: st.text,
+                })
+                .await
+        }
         AcpCommand::Cancel(_) => handle.send(SessionCommand::CancelTurn).await,
         AcpCommand::ResolveApproval(ra) => {
-            let (decision, narrowed_args) = match ra.resolution {
-                ApprovalResolution::Allow => (PolicyDecision::Allow, None),
+            let (decision, narrowed_args, always_allow) = match ra.resolution {
+                ApprovalResolution::Allow => (PolicyDecision::Allow, None, false),
+                ApprovalResolution::AlwaysAllow => (PolicyDecision::Allow, None, true),
                 ApprovalResolution::Narrow { narrowed_args } => {
-                    (PolicyDecision::Allow, Some(narrowed_args))
+                    (PolicyDecision::Allow, Some(narrowed_args), false)
                 }
-                ApprovalResolution::Deny => (PolicyDecision::Deny, None),
-                ApprovalResolution::Cancel => (PolicyDecision::Deny, None),
+                ApprovalResolution::Deny => (PolicyDecision::Deny, None, false),
+                ApprovalResolution::Cancel => (PolicyDecision::Deny, None, false),
             };
             handle
                 .send(SessionCommand::ResolveApproval {
                     ticket_id: ra.ticket_id,
                     decision,
                     narrowed_args,
+                    always_allow,
                 })
                 .await
         }
@@ -922,6 +1063,23 @@ async fn route_command(
                 return (ack_bucket_out, None);
             }
 
+            // 5.5) Recover sub-agent tasks from the rebound journal:
+            // unfinished SubAgentTaskStarted entries are re-registered
+            // (marked unrestored if in-flight) so delegation state is
+            // consistent after a crash. Fail-open: a recovery error logs
+            // and continues — sub-agent recovery must not block resume.
+            if let Some(sup) = &subagent_recovery {
+                match sup.lock().await.recover_from_journal().await {
+                    Ok(n) if n > 0 => {
+                        eprintln!("[resume] sub-agent recovery: {n} task(s) re-registered");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("[resume] sub-agent recovery failed (ignored): {e}");
+                    }
+                }
+            }
+
             // 6) Tell supervisor to (a) emit its own SnapshotReady event and
             //    (b) rebuild the Session.context from the reduced history.
             //    Order matters: RestoreContext MUST be sent after
@@ -1010,7 +1168,8 @@ async fn route_command(
 
 async fn serve_acp() -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (handle, mut acp_rx, mut session_id, rollout_store) = match build_session_parts(cwd).await {
+    let (handle, mut acp_rx, mut session_id, rollout_store, subagent_recovery) =
+        match build_session_parts(cwd).await {
         Ok(x) => x,
         Err(e) => {
             eprintln!("[serve_acp] init failed: {e}");
@@ -1090,6 +1249,7 @@ async fn serve_acp() -> Result<()> {
                             &mut stdout,
                             &mut idem_cache,
                             rollout_store.clone(),
+                            subagent_recovery.clone(),
                             session_id,
                             &mut seq,
                         ).await;
@@ -1605,11 +1765,56 @@ async fn run_interactive_with(
                 }
                 Some(LoopSessionEvent::TurnStarted { .. }) => {}
                 Some(LoopSessionEvent::SnapshotReady { .. }) | Some(LoopSessionEvent::ApprovalResolved { .. }) => {}
-                // ── Approval requested: the simple REPL has no interactive
-                // approval UI, so just print a one-line notice and keep
-                // streaming. The TUI renders a full pending-approval card.
-                Some(LoopSessionEvent::ApprovalRequested { ticket_id, tool_name, risk, .. }) => {
-                    println!("\n[approval pending] ticket={ticket_id} tool={tool_name} risk={risk}");
+                // ── Approval requested: the REPL resolves it inline —
+                // print the tool + args, read a one-line decision. Empty
+                // input defers (ticket expires after its timeout).
+                Some(LoopSessionEvent::ApprovalRequested { ticket_id, tool_name, risk, args, .. }) => {
+                    println!("\n[approval] ticket={ticket_id} tool={tool_name} risk={risk}");
+                    if let Some(a) = &args {
+                        println!("  args: {a}");
+                    }
+                    print!("  批准？[y=允许 / a=总是允许 / n=拒绝 / 回车=等待超时] > ");
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    let decision = tokio::task::spawn_blocking(|| {
+                        let mut line = String::new();
+                        let _ = std::io::stdin().read_line(&mut line);
+                        line.trim().to_lowercase()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let (allow, always) = match decision.as_str() {
+                        "y" | "yes" => (true, false),
+                        "a" | "always" => (true, true),
+                        "n" | "no" | "c" => (false, false),
+                        _ => {
+                            println!("  （未答复 — 工具将等待审批超时）");
+                            continue;
+                        }
+                    };
+                    let sent = handle
+                        .send(SessionCommand::ResolveApproval {
+                            ticket_id: ticket_id.clone(),
+                            decision: if allow {
+                                grodex_core::policy::PolicyDecision::Allow
+                            } else {
+                                grodex_core::policy::PolicyDecision::Deny
+                            },
+                            narrowed_args: None,
+                            always_allow: always,
+                        })
+                        .await;
+                    // A resolution arriving after the 120s ticket expiry is
+                    // a no-op on the broker side — say so instead of a
+                    // misleading "已回复".
+                    if sent.is_ok() {
+                        println!(
+                            "  已回复：{}",
+                            if always { "总是允许" } else if allow { "允许" } else { "拒绝" }
+                        );
+                    } else {
+                        println!("  回复未送达（会话可能已关闭）");
+                    }
                 }
                 Some(LoopSessionEvent::IndeterminateToolCall { call_id, tool_name, message }) => {
                     println!("\n[indeterminate] call_id={call_id} tool={tool_name}: {message}");
@@ -2035,6 +2240,25 @@ fn summarize_payload(
             let generation = payload.get("bound_generation").and_then(|v| v.as_u64()).unwrap_or(0);
             format!("rejected stale cap={cap} gen={generation}")
         }
+        SessionStarted => {
+            let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("session start cwd={}", truncate(cwd, 40))
+        }
+        TurnStarted => {
+            let chars = payload.get("input_chars").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("turn started ({chars} chars)")
+        }
+        ModelAttemptStarted => {
+            let provider = payload.get("provider").and_then(|v| v.as_str()).unwrap_or("?");
+            let model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("attempt {provider}/{model}")
+        }
+        ModelAttemptFinished => {
+            let status = payload.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            let attempts = payload.get("attempts").and_then(|v| v.as_u64()).unwrap_or(0);
+            let ms = payload.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("attempt {status} x{attempts} {ms}ms")
+        }
         EffectiveToolCallRevisionCreated => {
             let call = payload.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("?");
             let rev = payload.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -2135,4 +2359,119 @@ mod redaction_tests {
         let input = "/usr/bin/bash /etc/hosts /opt/x";
         assert_eq!(redact_absolute_user_paths(input), input);
     }
+}
+
+/// `grodex mcp-auth <server>` — drive the OAuth authorization-code flow
+/// for one MCP server: build the authorization URL, let the user paste
+/// the redirect URL back, exchange the code, and persist the master
+/// token into ~/.grodex/credentials.json (restart survival).
+async fn mcp_auth_command(server_name: &str, cwd: Option<&std::path::Path>) -> Result<()> {
+    let cwd = cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let config = ConfigResolver::load(&cwd).unwrap_or_else(|_| LoadedConfig::empty());
+
+    let servers = config
+        .effective
+        .values
+        .get("mcp_server")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let server_cfg = servers
+        .iter()
+        .filter_map(|v| {
+            let json = serde_json::to_value(v).ok()?;
+            serde_json::from_value::<grodex_mcp::McpServerConfig>(json).ok()
+        })
+        .find(|c| c.name == server_name)
+        .ok_or_else(|| anyhow!("config 中未找到 MCP server '{server_name}'"))?;
+    if !server_cfg.requires_oauth() {
+        return Err(anyhow!("server '{server_name}' 没有配置 oauth 块，无需授权"));
+    }
+
+    let mut coord = match std::env::var("HOME") {
+        Ok(home) => grodex_mcp::McpOAuthCoordinator::with_secret_store(std::sync::Arc::new(
+            grodex_auth::FileSecretStore::new(
+                std::path::PathBuf::from(home)
+                    .join(".grodex")
+                    .join("credentials.json"),
+            ),
+        )),
+        Err(_) => {
+            eprintln!("[auth] HOME 不可用，凭证仅保存在内存");
+            grodex_mcp::McpOAuthCoordinator::new()
+        }
+    };
+    if !coord.register_server(&server_cfg)? {
+        return Err(anyhow!("server '{server_name}' 注册失败（缺少 oauth 块）"));
+    }
+
+    let url = coord.begin_authorization(server_name, &[])?;
+    println!("═ Grodex MCP OAuth ══");
+    println!("Server : {server_name}");
+    println!("请用浏览器打开以下 URL 并完成授权：\n\n  {url}\n");
+    println!("授权完成后，把浏览器重定向的完整 URL 粘贴到这里：");
+    print!("> ");
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+
+    let line = tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        line.trim().to_string()
+    })
+    .await
+    .unwrap_or_default();
+
+    // Extract code/state from the pasted redirect URL's query string.
+    let query = line.split_once('?').map(|(_, q)| q).unwrap_or(&line);
+    let mut code = None;
+    let mut state = None;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "code" => code = Some(urldecode(v)),
+            "state" => state = Some(urldecode(v)),
+            _ => {}
+        }
+    }
+    let code = code.ok_or_else(|| anyhow!("重定向 URL 中未找到 code 参数"))?;
+    let state = state.ok_or_else(|| anyhow!("重定向 URL 中未找到 state 参数"))?;
+
+    let authorized = coord.complete_authorization(code, state).await?;
+    println!("✓ 授权完成：server '{authorized}' 的凭证已保存（会话重启后仍有效）。");
+    Ok(())
+}
+
+/// Minimal percent-decoding for query parameter values.
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (
+                    bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                    bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+                ) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
 }

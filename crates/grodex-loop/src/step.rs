@@ -38,6 +38,28 @@ pub struct TurnOutcome {
     /// exhausted (a wrap-up summary was forced) instead of a natural
     /// model stop. Lets the supervisor surface a visible notice.
     pub steps_exhausted: bool,
+    /// Structured reason the turn reached its terminal state:
+    /// `final_answer` | `repair_exhausted` | `step_budget_exhausted` |
+    /// `cancelled` | `sampling_error` | `tool_error` | `journal_failure`
+    /// | `indeterminate_wait`. Journaled in TurnCompleted so the
+    /// telemetry projection can answer "why did this turn end?".
+    pub termination_reason: &'static str,
+    /// Aggregate counters collected across the turn (journaled in
+    /// TurnCompleted).
+    pub metrics: TurnMetricsSummary,
+}
+
+/// Turn-level aggregate counters — the journaled form of the
+/// coordinator's in-loop `TurnMetrics`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct TurnMetricsSummary {
+    pub steps: u64,
+    pub model_calls: u64,
+    pub tool_calls: u64,
+    pub retries: u64,
+    pub compactions: u64,
+    pub cancels: u64,
+    pub duration_ms: u64,
 }
 
 // ── Step disposition — 结构化终止判断 ─────────────────────────────
@@ -247,6 +269,8 @@ impl StepRunner {
             usage: steps.last().and_then(|s| s.usage.clone()),
             steps,
             steps_exhausted: !finished,
+            termination_reason: if finished { "final_answer" } else { "step_budget_exhausted" },
+            metrics: TurnMetricsSummary::default(),
         }
     }
 
@@ -425,6 +449,7 @@ mod tests {
             items,
             stop_reason,
             usage: dummy_usage(),
+            provider_request_id: None,
         }
     }
 

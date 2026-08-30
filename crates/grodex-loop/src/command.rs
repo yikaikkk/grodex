@@ -1,6 +1,7 @@
 //! Session commands and events — the message protocol between the CLI
 //! (or any frontend) and the SessionSupervisor.
 
+use grodex_permission::PermissionPolicy;
 use grodex_core::context::ContextItem;
 use grodex_core::id::{SessionId, TurnId};
 use grodex_core::policy::PolicyDecision;
@@ -27,6 +28,9 @@ pub enum SessionCommand {
     StartTurn { user_input: String },
     /// Steer an in-progress Turn — modify the goal mid-execution.
     Steer { user_input: String },
+    /// Hot-adopt a recompiled permission policy (config hot-reload).
+    /// Fences in-flight leases by bumping the revocation epoch.
+    AdoptPermissionPolicy { policy: grodex_permission::PermissionPolicy },
     /// Cancel the currently running Turn.
     CancelTurn,
     /// Shut down the session gracefully.
@@ -37,6 +41,9 @@ pub enum SessionCommand {
         ticket_id: String,
         decision: PolicyDecision,
         narrowed_args: Option<serde_json::Value>,
+        /// True when the user chose "always allow" — the supervisor mints
+        /// a session grant for this tool after resolving the ticket.
+        always_allow: bool,
     },
     /// Resolve an Indeterminate tool call discovered during crash recovery.
     ///
@@ -118,13 +125,16 @@ impl std::fmt::Debug for SessionCommand {
                 .debug_struct("StartTurn")
                 .field("user_input_len", &user_input.len())
                 .finish(),
+            SessionCommand::AdoptPermissionPolicy { .. } => f
+                .debug_struct("AdoptPermissionPolicy")
+                .finish(),
             SessionCommand::Steer { user_input } => f
                 .debug_struct("Steer")
                 .field("user_input_len", &user_input.len())
                 .finish(),
             SessionCommand::CancelTurn => write!(f, "CancelTurn"),
             SessionCommand::Shutdown => write!(f, "Shutdown"),
-            SessionCommand::ResolveApproval { ticket_id, decision, narrowed_args: _ } => f
+            SessionCommand::ResolveApproval { ticket_id, decision, narrowed_args: _, always_allow } => f
                 .debug_struct("ResolveApproval")
                 .field("ticket_id", ticket_id)
                 .field("decision", decision)

@@ -117,6 +117,11 @@ pub struct CanonicalModelResponse {
     pub items: Vec<CanonicalResponseItem>,
     pub stop_reason: Option<StopReason>,
     pub usage: SettledUsage,
+    /// Provider-issued response id (e.g. OpenAI `resp_…`, Anthropic
+    /// `msg_…`, chat-completions `chatcmpl-…`). `None` when the provider
+    /// didn't return one — this is the cross-restart correlation key for
+    /// support/billing lookups.
+    pub provider_request_id: Option<String>,
 }
 
 /// One item produced in a model response.

@@ -73,6 +73,18 @@ impl SamplingClient {
         binding: &ModelBinding,
         request: &CanonicalModelRequest,
     ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>, ProviderError> {
+        self.stream_raw_with_credential(binding, request, None).await
+    }
+
+    /// Like [`Self::stream_raw`] but with an optional per-request
+    /// credential override — used on route failover so a cross-provider
+    /// candidate authenticates with ITS key, not the primary's.
+    pub async fn stream_raw_with_credential(
+        &self,
+        binding: &ModelBinding,
+        request: &CanonicalModelRequest,
+        credential: Option<&str>,
+    ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>, ProviderError> {
         let base = self.config.endpoint.as_deref().unwrap_or("https://api.openai.com/v1");
         let (url, body) = match binding.wire_protocol {
             WireProtocol::Responses => (format!("{base}/responses"), self.build_responses_body(binding, request)),
@@ -82,8 +94,10 @@ impl SamplingClient {
 
         let mut req = self.inner.post(&url).header("Content-Type", "application/json");
 
-        // Add auth header if configured.
-        if let Some(ref key) = self.config.api_key {
+        // Add auth header: request-scoped credential (route failover)
+        // wins over the client-level configured key.
+        let key = credential.or(self.config.api_key.as_deref());
+        if let Some(key) = key {
             req = req.header("Authorization", format!("Bearer {key}"));
         }
 

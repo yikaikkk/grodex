@@ -39,7 +39,7 @@ use grodex_rollout::store::{FileRolloutStore, RolloutStore};
 use grodex_sampler::{ModelRoute, SamplingActor, SamplingClient, SamplingClientConfig};
 use grodex_sandbox::SandboxRuntimeClient;
 use grodex_subagent::supervisor::SubAgentConfig;
-use grodex_tools::{ApplyPatchTool, EditTool, ExecTool, GlobTool, GrepTool, LoadSkillTool, ReadFileTool, WriteFileTool};
+use grodex_tools::{ApplyPatchTool, EditTool, ExecTool, GlobTool, GrepTool, LoadSkillTool, ReadFileTool, WebFetchTool, WriteFileTool};
 use tokio::sync::mpsc;
 
 /// A fully-wired session runtime ready to serve turns.
@@ -65,6 +65,10 @@ pub struct SessionRuntime {
     /// sending `Shutdown` to drain the session. Dropping it detaches
     /// (does NOT abort) the supervisor.
     pub supervisor_task: tokio::task::JoinHandle<()>,
+    /// Durable sub-agent supervisor handle (when writer-backed). The
+    /// resume path runs `recover_from_journal` on it after the rollout
+    /// writer is rebound so unfinished sub-agent tasks are re-registered.
+    pub subagent_recovery: Option<Arc<tokio::sync::Mutex<grodex_loop::durable_subagent::DurableSubAgentSupervisor>>>,
     /// Config hot-reload fs backend (Doc 18 §11): kept alive for the
     /// session so `notify` keeps feeding the ConfigWatcher pipeline.
     pub config_fs_backend: Option<grodex_config::FsConfigBackend>,
@@ -86,6 +90,11 @@ pub struct SessionRuntimeBuilder {
     /// When `Some`, the SamplingActor is wired with this route so that
     /// `RetryDecision::FailoverToNextCandidate` can switch candidates.
     model_route: Option<ModelRoute>,
+    /// SQLite telemetry sink. When `Some`, the RolloutWriter emits a
+    /// fire-and-forget telemetry record per journal append.
+    telemetry: Option<Arc<dyn grodex_telemetry::TelemetrySink>>,
+    /// Process-level run id attached to every telemetry record.
+    run_id: String,
 }
 
 impl SessionRuntimeBuilder {
@@ -96,8 +105,19 @@ impl SessionRuntimeBuilder {
             recovered_context: None,
             model_config_override: None,
             model_route: None,
+            telemetry: None,
+            run_id: uuid::Uuid::new_v4().to_string(),
         }
     }
+
+    /// Attach the telemetry sink (SQLite, `~/.grodex/telemetry.db`).
+    /// `None` (or a sink that later fails) simply disables telemetry —
+    /// it never blocks the Agent Loop.
+    pub fn with_telemetry(mut self, sink: Option<Arc<dyn grodex_telemetry::TelemetrySink>>) -> Self {
+        self.telemetry = sink;
+        self
+    }
+
 
     /// Force the workspace trust flag (equivalent to `--trusted`). When
     /// set, any untrusted Workspace layer is forced trusted and re-merged
@@ -179,6 +199,12 @@ impl SessionRuntimeBuilder {
         // Decisions are surfaced on stderr; hot-ADOPT of the new
         // generation by live subsystems is out of scope here. Fail-open:
         // watcher failure only disables hot-reload, never the session.
+        // Hot-adopt channel: the drain thread (std) hands recompiled
+        // permission policies to an async forwarder task (declared here so
+        // the receiver outlives the watcher block).
+        let (policy_tx, mut policy_rx) =
+            tokio::sync::mpsc::unbounded_channel::<grodex_permission::PermissionPolicy>();
+
         let config_fs_backend = {
             let sources: Vec<grodex_config::FsWatchSource> = config
                 .paths
@@ -202,6 +228,14 @@ impl SessionRuntimeBuilder {
                     config.effective.generation + 1,
                 ));
                 let counter2 = counter.clone();
+                // Hot-ADOPT (P3 fix): on Published the drain thread
+                // re-resolves the FULL merged config from disk (the watched
+                // file may be any layer — compiling a policy from the single
+                // changed file would silently drop rules from other layers)
+                // and forwards the new PermissionPolicy to the supervisor,
+                // which swaps it in with a revocation-epoch bump. The
+                // channel is tokio-unbounded so a std thread can send.
+                let adopt_cwd = self.cwd.clone();
                 let validator: grodex_config::ConfigValidator = Arc::new(move |bytes| {
                     let s = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
                     toml::from_str::<toml::Value>(s).map_err(|e| e.to_string())?;
@@ -221,10 +255,28 @@ impl SessionRuntimeBuilder {
                                 use grodex_config::WatchOutcome;
                                 while let Ok(p) = pub_rx.recv() {
                                     match &p.outcome {
-                                        WatchOutcome::Published { generation } => eprintln!(
-                                            "[config] {} hot-reload: published generation {generation}",
-                                            p.source_id
-                                        ),
+                                        WatchOutcome::Published { generation } => {
+                                            eprintln!(
+                                                "[config] {} hot-reload: published generation {generation}",
+                                                p.source_id
+                                            );
+                                            // Adopt: recompile the permission
+                                            // policy from the stashed valid
+                                            // config and hand it to the
+                                            // supervisor (fail-open).
+                                            match ConfigResolver::load(&adopt_cwd) {
+                                                Ok(config) => {
+                                                    let policy =
+                                                        build_permission_policy(&config.effective.values);
+                                                    if policy_tx.send(policy).is_err() {
+                                                        // session shutting down — nothing to adopt into
+                                                    }
+                                                }
+                                                Err(e) => eprintln!(
+                                                    "[config] hot-adopt skipped (re-resolve failed, last-known-good policy retained): {e}"
+                                                ),
+                                            }
+                                        }
                                         WatchOutcome::Unchanged => {}
                                         WatchOutcome::Rejected { diagnostic } => eprintln!(
                                             "[config] {} hot-reload rejected (last-known-good retained): {diagnostic}",
@@ -469,9 +521,22 @@ impl SessionRuntimeBuilder {
             .await
             .ok()
             .map(|s| Arc::new(s) as Arc<dyn RolloutStore>);
-        let writer = rollout
-            .as_ref()
-            .map(|s| RolloutWriter::new(s.clone(), session.id));
+        let writer = rollout.as_ref().map(|s| {
+            let mut w = RolloutWriter::new(s.clone(), session.id);
+            if let Some(sink) = self.telemetry.clone() {
+                w = w.with_telemetry(sink, self.run_id.clone());
+            }
+            w
+        });
+        // Re-project the journal into telemetry.db so events lost when a
+        // previous process died before a telemetry commit are restored
+        // (idempotent: journal-derived event_ids are deterministic).
+        if writer.is_some() && self.telemetry.is_some() {
+            let w = writer.clone().unwrap();
+            tokio::spawn(async move {
+                w.reproject_telemetry().await;
+            });
+        }
 
         // ── 6.5. PermissionManager (SQLite-backed if session dir exists) ──
         // Place the approval ticket DB alongside the rollout journal so
@@ -481,6 +546,12 @@ impl SessionRuntimeBuilder {
             .join(&session_id_str)
             .join("approvals.db");
         let permission_mgr = PermissionManager::new_with_db(policy, &approval_db_path);
+        // Attach the approval bus BEFORE Arc-wrapping, so the coordinator
+        // AND the DelegateTool share the same PermissionManager instance
+        // (deny rules + session grants apply to sub-agent calls too).
+        let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel();
+        let permission_mgr = permission_mgr.with_approval_bus(approval_tx);
+        let permission_mgr = Arc::new(tokio::sync::Mutex::new(permission_mgr));
 
         // Compaction trigger threshold (% of context_window) and the
         // per-tool-result size cap — both optional config overrides that
@@ -543,7 +614,7 @@ impl SessionRuntimeBuilder {
             std::time::Duration::from_secs(30),
         ));
         let mut coordinator = TurnCoordinator::new(actor, chat_state.clone())
-            .with_permission(permission_mgr)
+            .with_permission_arc(permission_mgr.clone(), approval_rx)
             .with_sandbox(sandbox)
             .with_context_window(model_config.context_window)
             .with_blob_store(blob_store);
@@ -601,6 +672,9 @@ impl SessionRuntimeBuilder {
         coordinator
             .register_tool("apply_patch", Arc::new(ApplyPatchTool::new()), ApplyPatchTool::new().input_schema())
             .await;
+        coordinator
+            .register_tool("web_fetch", Arc::new(WebFetchTool::new()), WebFetchTool::new().input_schema())
+            .await;
         // grep / glob: read-only codebase search tools. Give the model
         // grep (content search) and glob (file-pattern search) so it
         // doesn't need read_file for every search operation.
@@ -653,9 +727,13 @@ impl SessionRuntimeBuilder {
         if let Some(ref w) = writer {
             delegate = delegate.with_writer(w.clone(), SubAgentConfig::default());
         }
+        // P3 fix: sub-agent tool calls go through the shared permission
+        // gate (deny rules apply; Ask fails closed inside a sub-agent).
+        let delegate = delegate.with_permission(permission_mgr.clone());
         // Shared Arc: the collaboration-protocol followup executor reuses
         // the same DelegateTool child loop.
         let delegate = Arc::new(delegate);
+        let subagent_recovery = delegate.durable_supervisor();
         let delegate_schema = delegate.input_schema();
         coordinator
             .register_tool("delegate_task", delegate.clone(), delegate_schema)
@@ -697,7 +775,24 @@ impl SessionRuntimeBuilder {
                 }
                 // 注册 OAuth 客户端配置（无 oauth 块时为 no-op）。
                 if mcp_config.requires_oauth() {
-                    let coord = mcp_oauth.get_or_insert_with(grodex_mcp::McpOAuthCoordinator::new);
+                    // Persist OAuth master tokens so a separate
+                    // `grodex mcp-auth <server>` run (or a session
+                    // restart) can rehydrate credentials.
+                    let coord = mcp_oauth.get_or_insert_with(|| {
+                        match std::env::var("HOME") {
+                            Ok(home) => {
+                                let store = std::sync::Arc::new(
+                                    grodex_auth::FileSecretStore::new(
+                                        std::path::PathBuf::from(home)
+                                            .join(".grodex")
+                                            .join("credentials.json"),
+                                    ),
+                                );
+                                grodex_mcp::McpOAuthCoordinator::with_secret_store(store)
+                            }
+                            Err(_) => grodex_mcp::McpOAuthCoordinator::new(),
+                        }
+                    });
                     match coord.register_server(&mcp_config) {
                         Ok(_) => eprintln!(
                             "[mcp] server '{}' 需要 OAuth 授权（已注册，等待 begin_authorization）",
@@ -708,10 +803,39 @@ impl SessionRuntimeBuilder {
                         }
                     }
                 }
+                // P3 telemetry: MCP spawn/list_tools timing (out-of-band,
+                // fail-open — telemetry failures never affect the session).
+                let emit_mcp = |phase: &'static str, status: &'static str, dur: u64, tool_count: usize, error: Option<&str>| {
+                    if let Some(sink) = &self.telemetry {
+                        let mut rec = grodex_telemetry::TelemetryRecord::out_of_band(
+                            &self.run_id, &session_id_str, grodex_telemetry::kind::MCP_LIFECYCLE,
+                        );
+                        rec.payload_json = serde_json::json!({
+                            "server_name": mcp_config.name,
+                            "phase": phase,
+                            "transport": "stdio",
+                            "tool_count": tool_count,
+                            "status": status,
+                            "error_class": error,
+                            "duration_ms": dur,
+                        }).to_string();
+                        rec.severity = if status == "failed" {
+                            grodex_telemetry::Severity::Warn
+                        } else {
+                            grodex_telemetry::Severity::Info
+                        };
+                        sink.emit(rec);
+                    }
+                };
+
+                let spawn_started = std::time::Instant::now();
                 match grodex_mcp::McpProcess::spawn(mcp_config.clone()).await {
                     Ok(mut process) => {
+                        emit_mcp("spawn", "ok", spawn_started.elapsed().as_millis() as u64, 0, None);
+                        let list_started = std::time::Instant::now();
                         match process.list_tools().await {
                             Ok(tools) => {
+                                emit_mcp("list_tools", "ok", list_started.elapsed().as_millis() as u64, tools.len(), None);
                                 for tool in tools {
                                     let adapter = grodex_mcp::McpToolAdapter::new(
                                         mcp_config.clone(),
@@ -728,11 +852,13 @@ impl SessionRuntimeBuilder {
                                 }
                             }
                             Err(e) => {
+                                emit_mcp("list_tools", "failed", list_started.elapsed().as_millis() as u64, 0, Some(&e.to_string()));
                                 eprintln!("[warn] MCP server '{}' list_tools failed: {e}", mcp_config.name);
                             }
                         }
                     }
                     Err(e) => {
+                        emit_mcp("spawn", "failed", spawn_started.elapsed().as_millis() as u64, 0, Some(&e.to_string()));
                         eprintln!("[warn] MCP server '{}' spawn failed: {e}", mcp_config.name);
                     }
                 }
@@ -774,29 +900,31 @@ impl SessionRuntimeBuilder {
         // files are registered in indexed_files (content parsing into MemoryUnit
         // is deferred to a later phase when a Markdown parser is available).
         // Fail-open: scan errors must not block session startup.
+        //
+        // P3 fix: the scan previously ran ONCE at startup, so memory never
+        // saw any file changed after boot. A periodic rescan task re-runs
+        // the same reconcile (default every 10 min,
+        // `GRODEX_MEMORY_RESCAN_SECS` overrides; 0 disables).
         if let Some(ref db) = memory {
-            let scanned = grodex_memory::scan_directory(&self.cwd);
-            let diff = grodex_memory::reconcile(db, &scanned);
-            if !diff.is_empty() {
-                // Apply deletions (orphan units, bump generation).
-                let _ = grodex_memory::apply_deletions(db, &diff);
-                // Register new/changed files in indexed_files so the
-                // index table reflects the current filesystem state.
-                let current_gen = db.read_generation().unwrap_or(1);
-                for file in diff.new_files.iter().chain(diff.changed_files.iter()) {
-                    let indexed = grodex_memory::IndexedFile {
-                        path: file.key.clone(),
-                        source_kind: grodex_memory::types::SourceKind::Memory,
-                        mtime: file.mtime,
-                        size: file.size as i64,
-                        content_hash: file.content_hash.clone(),
-                        index_generation: current_gen,
-                        last_indexed_at: chrono::Utc::now(),
-                    };
-                    let _ = db.upsert_indexed_file(&indexed);
-                }
-                // Bump generation after inserts so the snapshot invalidates.
-                let _ = db.bump_generation();
+            reindex_memory(db, &self.cwd);
+            let rescan_secs: u64 = std::env::var("GRODEX_MEMORY_RESCAN_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600);
+            if rescan_secs > 0 {
+                let db = db.clone();
+                let cwd = self.cwd.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(rescan_secs));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    tick.tick().await; // first tick fires immediately — skip
+                    loop {
+                        tick.tick().await;
+                        let db = db.clone();
+                        let cwd = cwd.clone();
+                        let _ = tokio::task::spawn_blocking(move || reindex_memory(&db, &cwd)).await;
+                    }
+                });
             }
         }
 
@@ -888,6 +1016,22 @@ impl SessionRuntimeBuilder {
         // conversation (instead of a silent block while the sub-agent
         // runs).
         let SessionHandle { cmd_tx, mut event_rx } = handle;
+        // Forward hot-adopted permission policies from the config drain
+        // thread (std) into the supervisor's command loop (async).
+        {
+            let cmd_tx = cmd_tx.clone();
+            tokio::spawn(async move {
+                while let Some(policy) = policy_rx.recv().await {
+                    if cmd_tx
+                        .send(grodex_loop::command::SessionCommand::AdoptPermissionPolicy { policy })
+                        .await
+                        .is_err()
+                    {
+                        break; // session gone
+                    }
+                }
+            });
+        }
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -937,6 +1081,7 @@ impl SessionRuntimeBuilder {
             model_config,
             supervisor_task,
             config_fs_backend,
+            subagent_recovery,
         })
     }
 }
@@ -1132,4 +1277,40 @@ fn build_sandbox(cfg: &toml::Value) -> grodex_sandbox::SandboxManager {
         .and_then(|v| v.as_str())
         .unwrap_or("workspace");
     grodex_sandbox::SandboxManager::new(profile)
+}
+
+/// One memory index pass: scan the workspace for .md files, diff against
+/// `indexed_files`, apply deletions and register new/changed files.
+/// Blocking (fs walk) — call from `spawn_blocking`. Fail-open by caller.
+fn reindex_memory(db: &Arc<grodex_memory::MemoryDatabase>, cwd: &std::path::Path) {
+    let scanned = grodex_memory::scan_directory(cwd);
+    let diff = grodex_memory::reconcile(db, &scanned);
+    if diff.is_empty() {
+        return;
+    }
+    // Apply deletions (orphan units, bump generation).
+    let _ = grodex_memory::apply_deletions(db, &diff);
+    // Register new/changed files in indexed_files so the index table
+    // reflects the current filesystem state.
+    let current_gen = db.read_generation().unwrap_or(1);
+    for file in diff.new_files.iter().chain(diff.changed_files.iter()) {
+        let indexed = grodex_memory::IndexedFile {
+            path: file.key.clone(),
+            source_kind: grodex_memory::types::SourceKind::Memory,
+            mtime: file.mtime,
+            size: file.size as i64,
+            content_hash: file.content_hash.clone(),
+            index_generation: current_gen,
+            last_indexed_at: chrono::Utc::now(),
+        };
+        let _ = db.upsert_indexed_file(&indexed);
+    }
+    // Bump generation after inserts so the snapshot invalidates.
+    let _ = db.bump_generation();
+    eprintln!(
+        "[memory] reindex: +{} new, ~{} changed, -{} removed",
+        diff.new_files.len(),
+        diff.changed_files.len(),
+        diff.deleted_files.len()
+    );
 }

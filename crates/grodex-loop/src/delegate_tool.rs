@@ -98,6 +98,12 @@ pub struct DelegateTool {
     /// Max sub-agents allowed per session (guards against runaway
     /// re-spawn loops). Defaults to 4x the concurrent cap.
     max_total: usize,
+    /// Shared permission gate. Sub-agent tool calls previously bypassed
+    /// the permission pipeline entirely — deny rules had no effect on
+    /// delegated work. When set, each sub-agent tool call is checked:
+    /// Denied → refused, Ask → refused (a sub-agent cannot prompt for
+    /// approval — fail-closed), Allowed → execute.
+    permission: Option<Arc<Mutex<grodex_permission::PermissionManager>>>,
 }
 
 /// Long sub-agent reports are written to a temp file and only a
@@ -119,7 +125,28 @@ impl DelegateTool {
             spawned_total: Arc::new(AtomicUsize::new(0)),
             max_concurrent: 4,
             max_total: 16,
+            permission: None,
         }
+    }
+
+    /// Handle to the durable sub-agent supervisor (when writer-backed),
+    /// so the resume path can run `recover_from_journal`.
+    pub fn durable_supervisor(&self) -> Option<Arc<Mutex<DurableSubAgentSupervisor>>> {
+        match &self.runtime {
+            SubAgentRuntime::Durable(sup) => Some(sup.clone()),
+            SubAgentRuntime::InMemory(_) => None,
+        }
+    }
+
+    /// Attach the shared PermissionManager so sub-agent tool calls are
+    /// policy-checked (deny rules apply; Ask fails closed — sub-agents
+    /// cannot drive the approval round-trip).
+    pub fn with_permission(
+        mut self,
+        permission: Arc<Mutex<grodex_permission::PermissionManager>>,
+    ) -> Self {
+        self.permission = Some(permission);
+        self
     }
 
     /// Inject a SamplingActor + ModelConfig so the tool can actually
@@ -286,7 +313,7 @@ impl ToolRuntime for DelegateTool {
                 task_preview: truncate_task(&args.task, 80).to_string(),
             });
             let response =
-                run_subagent_turn(actor, cfg, &args.task, &self.readonly_tools, |detail| {
+                run_subagent_turn(actor, cfg, &args.task, &self.readonly_tools, self.permission.clone(), |detail| {
                     self.notify_progress(SubagentProgress::Step {
                         id: task_id_str.clone(),
                         detail,
@@ -368,6 +395,7 @@ async fn run_subagent_turn(
     cfg: &ModelConfig,
     task: &str,
     readonly_tools: &[(String, Arc<dyn ToolRuntime>, serde_json::Value)],
+    permission: Option<Arc<Mutex<grodex_permission::PermissionManager>>>,
     mut on_step: impl FnMut(String),
 ) -> Result<String, String> {
     use grodex_core::context::ContextItem;
@@ -483,7 +511,40 @@ async fn run_subagent_turn(
                     arguments: arguments.clone(),
                 });
                 let runtime = readonly_tools.iter().find(|(n, _, _)| *n == name);
-                let (content, is_error) = match runtime {
+                // ── Permission gate (fail-closed) ──────────────────
+                // Deny rules from the live policy now apply to delegated
+                // work too. Ask cannot be satisfied inside a sub-agent
+                // (no approval round-trip) → refuse with a clear message
+                // so the model stops asking the tool.
+                let blocked: Option<String> = if let Some(ref perm) = permission {
+                    let mut pm = perm.lock().await;
+                    match pm.check(
+                        call_id,
+                        &name,
+                        &arguments,
+                        &format!("{name} {arguments}"),
+                    ) {
+                        grodex_permission::PermissionResult::Allowed => None,
+                        grodex_permission::PermissionResult::Denied { reason } => {
+                            Some(format!("permission denied: {reason}"))
+                        }
+                        grodex_permission::PermissionResult::ApprovalRequired { ticket_id, .. } => {
+                            // check() already emitted an ApprovalRequested
+                            // event + broker ticket for this call — the
+                            // sub-agent cannot drive the approval round-trip,
+                            // so resolve the ticket DENIED immediately to
+                            // clean up the stray prompt the frontend saw.
+                            pm.resolve(&ticket_id, grodex_core::policy::PolicyDecision::Deny, None);
+                            Some("this tool requires interactive approval, which a sub-agent cannot perform — the call was refused; finish the task without it".into())
+                        }
+                    }
+                } else {
+                    None
+                };
+                let (content, is_error) = if let Some(reason) = blocked {
+                    (format!("[权限拒绝] {reason}"), true)
+                } else {
+                match runtime {
                     Some((_, rt, _)) => match rt.execute(arguments, OperationId::new()).await {
                         Ok(v) => {
                             let text = match v {
@@ -495,6 +556,7 @@ async fn run_subagent_turn(
                         Err(e) => (format!("工具执行失败: {e}"), true),
                     },
                     None => (format!("未注册的工具: {name}"), true),
+                }
                 };
                 context.push(ContextItem::ToolResult {
                     call_id,

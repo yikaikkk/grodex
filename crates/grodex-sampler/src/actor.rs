@@ -29,6 +29,13 @@ pub struct SamplingOutcome {
     pub error: Option<SamplingError>,
     pub attempts: u32,
     pub elapsed: std::time::Duration,
+    /// Routing decisions drained from the [`ModelRoute`] after the call
+    /// (candidate selected / failed / breaker opened / route exhausted).
+    /// Empty when no route is wired.
+    pub route_events: Vec<crate::route::RouteEvent>,
+    /// Time from round start to the first content event of the successful
+    /// attempt — TTFT. `None` when no content was produced.
+    pub first_token_ms: Option<u64>,
 }
 
 pub struct SamplingActor {
@@ -56,6 +63,24 @@ impl SamplingActor {
         request: &CanonicalModelRequest,
         stream_tx: mpsc::UnboundedSender<StreamFragment>,
     ) -> SamplingOutcome {
+        let mut outcome = self.sample_streaming_inner(binding, request, stream_tx).await;
+        outcome.route_events = self.drain_route_events();
+        outcome
+    }
+
+    fn drain_route_events(&self) -> Vec<crate::route::RouteEvent> {
+        match &self.route {
+            None => Vec::new(),
+            Some(route) => route.lock().map(|mut r| r.drain_events()).unwrap_or_default(),
+        }
+    }
+
+    async fn sample_streaming_inner(
+        &self,
+        binding: &ModelBinding,
+        request: &CanonicalModelRequest,
+        stream_tx: mpsc::UnboundedSender<StreamFragment>,
+    ) -> SamplingOutcome {
         let start = Instant::now();
         let mut events = Vec::new();
         let mut attempt = 0u32;
@@ -64,16 +89,22 @@ impl SamplingActor {
 
         loop {
             if cancel_token.is_cancelled() {
-                return SamplingOutcome { events, response: None, error: Some(SamplingError::internal("cancelled")), attempts: attempt, elapsed: start.elapsed() };
+                return SamplingOutcome { first_token_ms: None, route_events: Vec::new(), events, response: None, error: Some(SamplingError::internal("cancelled")), attempts: attempt, elapsed: start.elapsed() };
             }
             if let Err(bo) = self.breaker.check() {
-                return SamplingOutcome { events, response: None, error: Some(SamplingError::internal(format!("breaker open: {:.1}s", bo.retry_after.as_secs_f64()))), attempts: attempt, elapsed: start.elapsed() };
+                return SamplingOutcome { first_token_ms: None, route_events: Vec::new(), events, response: None, error: Some(SamplingError::internal(format!("breaker open: {:.1}s", bo.retry_after.as_secs_f64()))), attempts: attempt, elapsed: start.elapsed() };
             }
-            let outcome = self.run_attempt(binding, request, &progress, &mut events, &stream_tx).await;
+            // First attempt always targets the PRIMARY binding, so it uses
+            // the client's own credential (no override). `current_api_key()`
+            // would be wrong here: the route's sticky index may still point
+            // at a failover candidate from a PREVIOUS call.
+            let outcome = self
+                .run_attempt(binding, request, &progress, &mut events, &stream_tx, None)
+                .await;
             match outcome {
-                AttemptResult::Completed { response } => {
+                AttemptResult::Completed { response, first_token_ms } => {
                     self.breaker.record(Outcome::Success);
-                    return SamplingOutcome { events, response: Some(response), error: None, attempts: attempt + 1, elapsed: start.elapsed() };
+                    return SamplingOutcome { first_token_ms, route_events: Vec::new(), events, response: Some(response), error: None, attempts: attempt + 1, elapsed: start.elapsed() };
                 }
                 AttemptResult::Failed { error } => {
                     self.breaker.record(Outcome::Failure);
@@ -82,18 +113,24 @@ impl SamplingActor {
                     match classify_error(&error, attempt, &self.budget, sp) {
                         RetryDecision::Retry { backoff } | RetryDecision::RetryWithClientRebuild { backoff } => {
                             if !sleep_or_cancel(backoff, &cancel_token).await {
-                                return SamplingOutcome { events, response: None, error: Some(SamplingError::internal("cancelled")), attempts: attempt, elapsed: start.elapsed() };
+                                return SamplingOutcome { first_token_ms: None, route_events: Vec::new(), events, response: None, error: Some(SamplingError::internal("cancelled")), attempts: attempt, elapsed: start.elapsed() };
                             }
                         }
                         RetryDecision::FailoverToNextCandidate => {
-                            let next_binding = if let Some(ref route) = self.route {
+                            let (next_binding, failover_credential) = if let Some(ref route) = self.route {
                                 let mut route = route.lock().unwrap();
                                 route.record_failure(true);
-                                route.try_next().map(|(_, b)| b)
-                            } else { None };
+                                let next = route.try_next().map(|(_, b)| b);
+                                // try_next advanced the sticky index — the
+                                // current candidate is now the failover one.
+                                let credential = route.current_api_key();
+                                (next, credential)
+                            } else { (None, None) };
                             if let Some(new_binding) = next_binding {
                                 attempt = 0;
-                                let outcome = self.run_attempt(&new_binding, request, &progress, &mut events, &stream_tx).await;
+                                let outcome = self
+                                    .run_attempt(&new_binding, request, &progress, &mut events, &stream_tx, failover_credential.as_deref())
+                                    .await;
                                 if let Some(ref route) = self.route {
                                     let mut route = route.lock().unwrap();
                                     match outcome {
@@ -102,8 +139,8 @@ impl SamplingActor {
                                     }
                                 }
                                 match outcome {
-                                    AttemptResult::Completed { response: resp } => {
-                                        return SamplingOutcome { events, response: Some(resp), error: None, attempts: attempt + 1, elapsed: start.elapsed() };
+                                    AttemptResult::Completed { response: resp, first_token_ms } => {
+                                        return SamplingOutcome { first_token_ms, route_events: Vec::new(), events, response: Some(resp), error: None, attempts: attempt + 1, elapsed: start.elapsed() };
                                     }
                                     AttemptResult::Failed { .. } => {
                                         attempt += 1;
@@ -111,9 +148,9 @@ impl SamplingActor {
                                     }
                                 }
                             }
-                            return SamplingOutcome { events, response: None, error: Some(error), attempts: attempt, elapsed: start.elapsed() };
+                            return SamplingOutcome { first_token_ms: None, route_events: Vec::new(), events, response: None, error: Some(error), attempts: attempt, elapsed: start.elapsed() };
                         }
-                        _ => return SamplingOutcome { events, response: None, error: Some(error), attempts: attempt, elapsed: start.elapsed() },
+                        _ => return SamplingOutcome { first_token_ms: None, route_events: Vec::new(), events, response: None, error: Some(error), attempts: attempt, elapsed: start.elapsed() },
                     }
                 }
             }
@@ -134,8 +171,14 @@ impl SamplingActor {
         progress: &AtomicBool,
         events: &mut Vec<CanonicalModelEvent>,
         stream_tx: &mpsc::UnboundedSender<StreamFragment>,
+        credential: Option<&str>,
     ) -> AttemptResult {
-        let byte_stream = match self.client.stream_raw(binding, request).await {
+        let attempt_start = Instant::now();
+        let byte_stream = match self
+            .client
+            .stream_raw_with_credential(binding, request, credential)
+            .await
+        {
             Ok(s) => s,
             Err(e) => return AttemptResult::Failed { error: map_err(e) },
         };
@@ -147,11 +190,25 @@ impl SamplingActor {
             WireProtocol::Messages => Box::new(MessagesDecoder::new(request.request_id.clone())),
         };
 
+        let mut first_token_ms: Option<u64> = None;
         while let Some(chunk) = byte_stream.next().await {
             match chunk {
                 Ok(bytes) => match decoder.process_chunk(&bytes) {
                     Ok(chunk_events) => {
                         for ev in &chunk_events {
+                            if first_token_ms.is_none() {
+                                use CanonicalModelEvent as CME;
+                                match ev {
+                                    CME::TextDelta { .. }
+                                    | CME::ReasoningDelta { .. }
+                                    | CME::ToolCallStarted { .. }
+                                    | CME::ToolCallArgumentsDelta { .. } => {
+                                        first_token_ms =
+                                            Some(attempt_start.elapsed().as_millis() as u64);
+                                    }
+                                    _ => {}
+                                }
+                            }
                             match ev {
                                 CanonicalModelEvent::TextDelta { text, .. } => {
                                     progress.store(true, Ordering::Release);
@@ -231,7 +288,7 @@ impl SamplingActor {
         match decoder.finalize() {
             Ok(final_events) => {
                 for ev in &final_events {
-                    if let CanonicalModelEvent::ResponseCompleted(resp) = ev { return AttemptResult::Completed { response: resp.clone() }; }
+                    if let CanonicalModelEvent::ResponseCompleted(resp) = ev { return AttemptResult::Completed { response: resp.clone(), first_token_ms }; }
                 }
                 events.extend(final_events);
                 AttemptResult::Failed { error: SamplingError::transport("no terminal event", None) }
@@ -242,7 +299,12 @@ impl SamplingActor {
 }
 
 enum AttemptResult {
-    Completed { response: CanonicalModelResponse },
+    Completed {
+        response: CanonicalModelResponse,
+        /// Time from attempt start (request sent) to the first content
+        /// event — TTFT. `None` when the attempt never produced content.
+        first_token_ms: Option<u64>,
+    },
     Failed { error: SamplingError },
 }
 

@@ -154,6 +154,41 @@ pub enum RolloutEventType {
     ///   - operation_id: str?
     ///   - call_id: str
     AppOnlyToolCall,
+
+    /// The process opened the session (durable session boundary — gives
+    /// the telemetry projection a `sessions.started_at` anchor).
+    /// Schema:
+    ///   - cwd: str            (raw path; the telemetry projection stores
+    ///                          only its SHA-256)
+    ///   - model_provider: str
+    ///   - model: str
+    SessionStarted,
+    /// A user Turn was admitted and started. **Durable** — this is the
+    /// `turns.started_at` anchor; without it a crash between input
+    /// acceptance and turn completion leaves the turn invisible to the
+    /// projection. Schema: input_chars: usize
+    TurnStarted,
+    /// One model sampling round started (observability-only, NOT
+    /// durable). One round may internally perform several provider
+    /// attempts (retry/failover) — those surface via ModelRouteEvent.
+    /// Schema:
+    ///   - request_id: str
+    ///   - provider: str, model: str, wire_protocol: str
+    ModelAttemptStarted,
+    /// One model sampling round finished (observability-only, NOT
+    /// durable). Schema:
+    ///   - request_id: str
+    ///   - attempts: u32            (provider attempts consumed)
+    ///   - duration_ms: u64         (whole round incl. retries)
+    ///   - status: "ok" | "error"
+    ///   - error_class?: str        (SamplingError::kind_label)
+    ///   - http_status?: u16
+    ///   - retry_after_secs?: u64
+    ///   - provider_request_id?: str
+    ///   - usage?: { input_tokens, cached_input_tokens,
+    ///               cache_creation_tokens, output_tokens,
+    ///               reasoning_tokens, total_tokens, estimated }
+    ModelAttemptFinished,
 }
 
 /// Sensitivity classification for an event.
