@@ -468,16 +468,16 @@ async fn write_protocol_error(
     let _ = stdout.flush().await;
 }
 
-async fn write_frame(stdout: &mut tokio::io::Stdout, frame: &ServerFrame) {
+async fn write_frame(stdout: &mut tokio::io::Stdout, frame: &ServerFrame) -> std::io::Result<()> {
     let line = serde_json::to_string(frame).unwrap_or_else(|e| {
         format!(
             "{{\"frame_type\":\"protocol_error\",\"code\":\"SERIALIZE\",\"message\":\"{}\"}}",
             e.to_string().replace('"', "\\\"")
         )
     });
-    let _ = stdout.write_all(line.as_bytes()).await;
-    let _ = stdout.write_all(b"\n").await;
-    let _ = stdout.flush().await;
+    stdout.write_all(line.as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await
 }
 
 fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u64) -> Option<ServerFrame> {
@@ -954,7 +954,10 @@ async fn route_command(
                     current_turn_id: None,
                     items: snapshot_items.clone(),
                 });
-                write_frame(stdout, &snapshot).await;
+                if write_frame(stdout, &snapshot).await.is_err() {
+                    // A dead ACP client must be distinguishable from success.
+                    eprintln!("[acp] frame write failed (client disconnected?)");
+                }
             }
 
             // 3) CatchUp mode: emit real UpdateContent events for clients
@@ -996,7 +999,10 @@ async fn route_command(
                     if let Some(c) = content {
                         let env =
                             EventEnvelope::wrap(replay_seq, resume_sid.clone(), c);
-                        write_frame(stdout, &ServerFrame::Event(env)).await;
+                        if write_frame(stdout, &ServerFrame::Event(env)).await.is_err() {
+                            // A dead ACP client must be distinguishable from success.
+                            eprintln!("[acp] frame write failed (client disconnected?)");
+                        }
                     }
                 }
                 *seq = (*seq).max(replay_seq);
@@ -1007,7 +1013,10 @@ async fn route_command(
                 inflight_events: 0,
                 requested_pause_ms: None,
             };
-            write_frame(stdout, &flow_ctrl).await;
+            if write_frame(stdout, &flow_ctrl).await.is_err() {
+                // A dead ACP client must be distinguishable from success.
+                eprintln!("[acp] frame write failed (client disconnected?)");
+            }
 
             // 5) CRITICAL — rebind the shared RolloutWriter BEFORE sending
             //    ResumeSession / RestoreContext so every journal write
@@ -1212,13 +1221,19 @@ async fn serve_acp() -> Result<()> {
                         inflight_events: inflight.min(u32::MAX as u64) as u32,
                         requested_pause_ms: Some(10u32),
                     };
-                    write_frame(&mut stdout, &pause_frame).await;
+                    if write_frame(&mut stdout, &pause_frame).await.is_err() {
+                        // A dead ACP client must be distinguishable from success.
+                        eprintln!("[acp] frame write failed (client disconnected?)");
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     waited_ms += 10;
                 }
                 seq = next_seq;
                 if let Some(frame) = map_loop_event_to_update(ev, session_id, seq) {
-                    write_frame(&mut stdout, &frame).await;
+                    if write_frame(&mut stdout, &frame).await.is_err() {
+                        // A dead ACP client must be distinguishable from success.
+                        eprintln!("[acp] frame write failed (client disconnected?)");
+                    }
                 }
             }
             line_res = stdin.next_line() => {
@@ -1276,13 +1291,19 @@ async fn serve_acp() -> Result<()> {
                             ping_sent_at_ms: sent_at_ms,
                             pong_at_ms: now_ms(),
                         };
-                        write_frame(&mut stdout, &pong).await;
+                        if write_frame(&mut stdout, &pong).await.is_err() {
+                            // A dead ACP client must be distinguishable from success.
+                            eprintln!("[acp] frame write failed (client disconnected?)");
+                        }
                     }
                 }
             }
             _ = keepalive.tick() => {
                 let ping = ServerFrame::Ping { sent_at_ms: now_ms() };
-                write_frame(&mut stdout, &ping).await;
+                if write_frame(&mut stdout, &ping).await.is_err() {
+                    // A dead ACP client must be distinguishable from success.
+                    eprintln!("[acp] frame write failed (client disconnected?)");
+                }
             }
         }
     }
@@ -1669,6 +1690,7 @@ async fn run_interactive_with(
         .with_trusted(workspace_trusted)
         .with_recovered_context(recovered.unwrap_or_default())
         .with_model_route(model_route)
+        .with_telemetry(telemetry_sink())
         .build()
         .await
         .expect("failed to build session runtime");
@@ -2247,6 +2269,14 @@ fn summarize_payload(
         TurnStarted => {
             let chars = payload.get("input_chars").and_then(|v| v.as_u64()).unwrap_or(0);
             format!("turn started ({chars} chars)")
+        }
+        PromptInjected => {
+            let kind = payload.get("note_kind").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("injected {kind} note")
+        }
+        SessionGrantCreated => {
+            let tool = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("always-allow grant: {tool}")
         }
         ModelAttemptStarted => {
             let provider = payload.get("provider").and_then(|v| v.as_str()).unwrap_or("?");

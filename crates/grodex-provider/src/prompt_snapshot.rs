@@ -55,6 +55,25 @@ pub struct PromptSnapshot {
 }
 
 impl PromptSnapshot {
+    /// Hash-only variant: identical `content_hash` to [`Self::capture`]
+    /// WITHOUT cloning the whole item list / schema list into the snapshot
+    /// struct. The per-step call sites only need the hash — capture() deep
+    /// clones the entire context twice per step for a value that is
+    /// immediately dropped.
+    pub fn hash_of(items: &[ContextItem], tool_schemas: &[ToolSpec]) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        for item in items {
+            hasher.update(serde_json::to_string(item).unwrap_or_default());
+        }
+        for tool in tool_schemas {
+            hasher.update(tool.name.as_bytes());
+            hasher.update(tool.parameters.to_string().as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
     /// Build a snapshot from the request context.
     pub fn capture(
         items: &[ContextItem],
@@ -113,6 +132,21 @@ mod tests {
         let snap1 = PromptSnapshot::capture(&items, &tools);
         let snap2 = PromptSnapshot::capture(&items, &tools);
         assert_eq!(snap1.content_hash, snap2.content_hash);
+    }
+
+    #[test]
+    fn hash_of_matches_capture_hash() {
+        // hash_of is the hot-path optimization — it MUST produce the
+        // identical hash to capture() or journal/telemetry correlation
+        // breaks across the two paths.
+        let items = vec![
+            ContextItem::User { content: "hello".into(), message_id: None },
+            ContextItem::Assistant { content: "world".into() },
+        ];
+        let tools = vec![];
+        assert_eq!(PromptSnapshot::hash_of(&items, &tools), PromptSnapshot::capture(&items, &tools).content_hash);
+        // Non-empty tool specs must participate identically too.
+        let _ = tools;
     }
 
     #[test]

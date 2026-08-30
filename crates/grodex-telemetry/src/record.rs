@@ -59,6 +59,8 @@ pub mod kind {
     pub const MODEL_ATTEMPT_FINISHED: &str = "model_attempt_finished";
     pub const MODEL_ROUTE_EVENT: &str = "model_route_event";
     pub const PROMPT_SNAPSHOT: &str = "prompt_snapshot";
+    pub const PROMPT_INJECTED: &str = "prompt_injected";
+    pub const SESSION_GRANT_CREATED: &str = "session_grant_created";
     pub const TOOL_PREPARED: &str = "tool_prepared";
     pub const TOOL_APPROVED: &str = "tool_approved";
     pub const TOOL_STARTED: &str = "tool_started";

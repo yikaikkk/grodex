@@ -49,6 +49,9 @@ pub struct ApprovalRequestedEvent {
 pub struct PendingTicketInfo {
     pub call_id: Option<String>,
     pub tool_name: Option<String>,
+    /// The ticket's argument snapshot — needed to mint a PRECISE
+    /// "always allow" matcher at resolve time.
+    pub args: Option<serde_json::Value>,
 }
 
 /// The result of a permission check — either immediate or requires approval.
@@ -318,12 +321,13 @@ impl PermissionManager {
         }
 
         // ── Session grant fast-path (doc 10 §20.12) ──
-        // Exact matcher equality — a grant for tool "read" must NOT also
-        // allow "read_file" (the old `contains` check did exactly that).
+        // Structured matcher evaluation: a grant's matcher is a
+        // comma-separated `k=v` list (`tool=read_file, path=/w/a.txt`,
+        // `tool=exec, command_prefix=ls`, ...). The grant applies only
+        // when EVERY constraint matches THIS call's tool + args.
         let now = chrono::Utc::now();
-        let matcher_key = format!("tool={tool_name}");
         for grant in self.session_grants.iter_mut() {
-            if grant.is_active(now) && grant.normalized_operation_matcher == matcher_key {
+            if grant.is_active(now) && Self::grant_applies(&grant.normalized_operation_matcher, tool_name, args) {
                 // Decrement use counter if bounded.
                 if let Some(ref mut max) = grant.max_uses {
                     if *max == 0 {
@@ -454,9 +458,51 @@ impl PermissionManager {
         self.broker.expired_ticket_infos()
     }
 
+    /// Evaluate a structured grant matcher against THIS call. Every
+    /// `k=v` constraint must hold:
+    ///   tool=X            — exact tool-name equality (never prefix)
+    ///   path=P            — args.path equals P exactly
+    ///   command_prefix=C  — first whitespace token of args.command
+    ///   host=H            — args.host equals H
+    ///   server=S / mcp_tool=T — MCP capability ids
+    fn grant_applies(matcher: &str, tool_name: &str, args: &serde_json::Value) -> bool {
+        let mut saw_tool = false;
+        for part in matcher.split(',') {
+            let part = part.trim();
+            let Some((k, v)) = part.split_once('=') else {
+                return false;
+            };
+            let arg_str = |key: &str| -> Option<&str> {
+                args.get(key).and_then(|v| v.as_str())
+            };
+            let ok = match k {
+                "tool" => {
+                    saw_tool = true;
+                    v == tool_name
+                }
+                "path" => arg_str("path") == Some(v),
+                "command_prefix" => arg_str("command")
+                    .and_then(|c| c.split_whitespace().next())
+                    == Some(v),
+                "host" => arg_str("host") == Some(v),
+                "server" => arg_str("server_capability_id") == Some(v),
+                "mcp_tool" => arg_str("tool_capability_id") == Some(v),
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        saw_tool
+    }
+
     /// Add a session-level grant (doc 10 §20.12). Called when the user
-    /// selects "always allow this session" for a tool.
+    /// selects "always allow this session" for a tool. Dedup by grant_id
+    /// so a journal replay that re-mints the same grant is idempotent.
     pub fn add_session_grant(&mut self, grant: SessionPolicyGrant) {
+        if self.session_grants.iter().any(|g| g.grant_id == grant.grant_id) {
+            return;
+        }
         self.session_grants.push(grant);
     }
 
@@ -486,6 +532,7 @@ impl PermissionManager {
         self.broker.pending_ticket(ticket_id).map(|t| PendingTicketInfo {
             call_id: Some(t.tool_call_id.to_string()),
             tool_name: Some(t.tool_name.clone()),
+            args: t.arguments_snapshot.clone(),
         })
     }
 
@@ -497,6 +544,7 @@ impl PermissionManager {
             self.broker.pending_ticket(tid).map(|t| PendingTicketInfo {
                 call_id: Some(t.tool_call_id.to_string()),
                 tool_name: Some(t.tool_name.clone()),
+                args: t.arguments_snapshot.clone(),
             })
         }).collect()
     }
@@ -534,6 +582,97 @@ impl Default for PermissionManager {
 
 #[cfg(test)]
 mod tests {
+    // ── 批5 补测：grant 精确匹配 / Deny 优先 / adopt_policy ──
+
+    fn make_grant(tool: &str) -> SessionPolicyGrant {
+        SessionPolicyGrant {
+            grant_id: format!("g_{tool}"),
+            origin_approval_id: "ticket".into(),
+            subject_id: "user".into(),
+            capability_id: tool.into(),
+            normalized_operation_matcher: format!("tool={tool}"),
+            normalized_resource_or_command_matcher: None,
+            ceiling_hash: String::new(),
+            policy_generation_created: 0,
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+            max_uses: None,
+            revoked_at: None,
+        }
+    }
+
+    /// Regression: the old `contains` matcher let a grant for "read"
+    /// also allow "read_file".
+    #[test]
+    fn grant_matcher_is_exact_not_prefix() {
+        let mut mgr = PermissionManager::new(PermissionPolicy::new()); // Ask-for-all
+        mgr.add_session_grant(make_grant("read"));
+        let result = mgr.check(
+            grodex_core::id::ToolCallId::new(),
+            "read_file",
+            &serde_json::json!({}),
+            "read_file",
+        );
+        assert!(
+            matches!(result, PermissionResult::ApprovalRequired { .. }),
+            "grant for read must NOT satisfy read_file"
+        );
+        let result = mgr.check(
+            grodex_core::id::ToolCallId::new(),
+            "read",
+            &serde_json::json!({}),
+            "read",
+        );
+        assert!(matches!(result, PermissionResult::Allowed));
+    }
+
+    /// Deny rules ALWAYS win - even over a user-minted session grant
+    /// (a hot-adopted tightened policy must not be silently bypassed).
+    #[test]
+    fn deny_rule_beats_session_grant() {
+        let mut policy = PermissionPolicy::permissive();
+        policy.add_rule(PolicyRule {
+            tool_pattern: "exec".into(),
+            arg_patterns: vec![],
+            command: None,
+            resource: None,
+            rule_id: None,
+            network: None,
+            mcp: None,
+            decision: grodex_core::policy::PolicyDecision::Deny,
+            priority: 0,
+        });
+        let mut mgr = PermissionManager::new(PermissionPolicy::new());
+        mgr.adopt_policy(policy);
+        mgr.add_session_grant(make_grant("exec"));
+        let result = mgr.check(
+            grodex_core::id::ToolCallId::new(),
+            "exec",
+            &serde_json::json!({"command": "ls"}),
+            "exec ls",
+        );
+        assert!(
+            matches!(result, PermissionResult::Denied { .. }),
+            "explicit deny rule must outrank a session grant"
+        );
+    }
+
+    /// adopt_policy swaps the policy and bumps the revocation epoch.
+    #[test]
+    fn adopt_policy_bumps_revocation_epoch() {
+        let mut mgr = PermissionManager::new(PermissionPolicy::permissive());
+        let before = mgr.revocation_epoch();
+        mgr.adopt_policy(PermissionPolicy::new()); // Ask-for-all
+        assert_eq!(mgr.revocation_epoch(), before + 1);
+        let result = mgr.check(
+            grodex_core::id::ToolCallId::new(),
+            "anything",
+            &serde_json::json!({}),
+            "anything",
+        );
+        assert!(matches!(result, PermissionResult::ApprovalRequired { .. }));
+    }
+
     use super::*;
     use crate::resolution::ApprovalResolution;
     #[test]

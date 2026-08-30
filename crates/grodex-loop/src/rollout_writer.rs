@@ -31,7 +31,18 @@ use grodex_telemetry::{
     bound_payload, kind as tel_kind, Sensitivity as TelSensitivity, Severity as TelSeverity,
     TelemetryRecord, TelemetrySink,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+
+/// Process-wide count of failed journal appends — every `let _ =`
+/// discarder is counted here. Surfacable by diagnostics; a rising count
+/// means the session is running without its replay/resume guarantees.
+static JOURNAL_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Read the journal write-failure counter (diagnostics surface).
+pub fn journal_write_failures() -> u64 {
+    JOURNAL_WRITE_FAILURES.load(Ordering::Relaxed)
+}
 
 /// Inner state shared across all [`RolloutWriter`] clones. When
 /// `/resume <old_session_id>` rebinds the writer, every outstanding
@@ -216,6 +227,8 @@ fn telemetry_kind(event_type: &RolloutEventType) -> &'static str {
         RolloutEventType::ProjectionPruned => tel_kind::PROJECTION_PRUNED,
         RolloutEventType::RuntimeStateChanged => tel_kind::STATE_CHANGED,
         RolloutEventType::PromptSnapshotBuilt => tel_kind::PROMPT_SNAPSHOT,
+        RolloutEventType::PromptInjected => tel_kind::PROMPT_INJECTED,
+        RolloutEventType::SessionGrantCreated => tel_kind::SESSION_GRANT_CREATED,
         RolloutEventType::CompactionStarted => tel_kind::COMPACTION_STARTED,
         RolloutEventType::CompactionCandidateBuilt => tel_kind::COMPACTION_CANDIDATE,
         RolloutEventType::CompactionCommitted => tel_kind::COMPACTION_COMMITTED,
@@ -336,6 +349,7 @@ impl RolloutWriter {
     ) -> Result<u64, GrodexError> {
         let store = self.store();
         let session_id = self.session_id();
+        let kind_discriminant = std::mem::discriminant(&event_type);
         let event = RolloutEvent {
             schema_version: 2,
             seq: 0, // filled in by the journal actor — sovereignty principle
@@ -348,11 +362,29 @@ impl RolloutWriter {
             payload,
             sensitivity,
         };
-        let seq = if durable {
+        let seq = match if durable {
             store.append_event_durable(event.clone()).await
         } else {
             store.append_event(event.clone()).await
-        }?;
+        } {
+            Ok(seq) => seq,
+            Err(e) => {
+                // Uniform failure visibility: ~90 call sites discard the
+                // Result (`let _ = writer.write_*()`), which silently
+                // degraded replay/resume guarantees on a persistently
+                // failing journal. Count + log here, once, for ALL paths.
+                JOURNAL_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    target: "grodex_journal",
+                    event_type = ?kind_discriminant,
+                    durable,
+                    error = %e,
+                    total_failures = JOURNAL_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+                    "journal append failed"
+                );
+                return Err(e);
+            }
+        };
         if let Some(sink) = self.telemetry_sink() {
             let run_id = self.run_id();
             // The event clone still carries seq=0 (the actor filled its own
@@ -436,7 +468,9 @@ impl RolloutWriter {
             Some(generation),
             payload,
             false,
-            SensitivityLevel::Normal,
+            // Assistant text + tool args routinely echo file contents and
+            // secret-adjacent material — classified Personal like user input.
+            SensitivityLevel::Personal,
         )
         .await
     }
@@ -1128,6 +1162,60 @@ impl RolloutWriter {
             None,
             serde_json::json!({"input_chars": input_chars}),
             true,
+            SensitivityLevel::Normal,
+        )
+        .await
+    }
+
+    /// SessionGrantCreated — durable record of a user-minted "always
+    /// allow" grant. Replay restores it (doc 16 §15 persistence).
+    pub async fn write_session_grant_created(
+        &self,
+        grant_id: &str,
+        tool_name: &str,
+        matcher: &str,
+        policy_generation: u64,
+    ) -> Result<u64, GrodexError> {
+        self.write(
+            RolloutEventType::SessionGrantCreated,
+            None,
+            None,
+            None,
+            serde_json::json!({
+                "grant_id": grant_id,
+                "tool_name": tool_name,
+                "matcher": matcher,
+                "policy_generation": policy_generation,
+            }),
+            true,
+            SensitivityLevel::Normal,
+        )
+        .await
+    }
+
+    /// PromptInjected — an ephemeral steering note (repair prompt /
+    /// length continuation) was added to the live transcript. Non-durable;
+    /// journaled ONLY so a replayed context matches the live one. The
+    /// reducer restores these as user-role context items.
+    pub async fn write_prompt_injected(
+        &self,
+        turn_id: TurnId,
+        step_id: StepId,
+        generation: StepGeneration,
+        note_kind: &str,
+        content: &str,
+    ) -> Result<u64, GrodexError> {
+        self.write(
+            RolloutEventType::PromptInjected,
+            Some(turn_id),
+            Some(step_id),
+            Some(generation),
+            serde_json::json!({
+                "note_kind": note_kind,
+                "role": "user",
+                "content": content,
+            }),
+            false,
             SensitivityLevel::Normal,
         )
         .await

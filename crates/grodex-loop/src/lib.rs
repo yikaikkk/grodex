@@ -31,7 +31,6 @@ pub use command::{SessionCommand, SessionEvent};
 pub use context::CompactionManager;
 pub use memory_snapshot::{MemoryContextSnapshot, MemorySnapshotHandle};
 pub use session::Session;
-pub use step::StepRunner;
 pub use step_context::StepContext;
 pub use supervisor::{BackgroundTaskBarrier, SessionHandle, SessionSupervisor};
 pub use step::TurnOutcome;

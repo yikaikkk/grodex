@@ -84,11 +84,13 @@ pub struct DelegateTool {
     /// Started/Step/Finished events so the TUI can render each
     /// sub-agent as a collapsible card instead of a silent block.
     progress_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<SubagentProgress>>>,
-    /// Read-only tools available to sub-agents (name, runtime, schema).
+    /// Read-only tools available to sub-agents (name, runtime, schema,
+    /// description) — the description is passed through to the sub-agent's
+    /// ToolSpec (previously the model saw `description = name` only).
     /// Injected via `with_readonly_tools` — lets a sub-agent actually
     /// inspect files instead of answering blind (which was the main
     /// cause of "empty response" failures on analysis tasks).
-    readonly_tools: Vec<(String, Arc<dyn ToolRuntime>, serde_json::Value)>,
+    readonly_tools: Vec<(String, Arc<dyn ToolRuntime>, serde_json::Value, String)>,
     /// Number of sub-agents currently executing.
     running_count: Arc<AtomicUsize>,
     /// Total sub-agents spawned in this session (for the session cap).
@@ -98,6 +100,11 @@ pub struct DelegateTool {
     /// Max sub-agents allowed per session (guards against runaway
     /// re-spawn loops). Defaults to 4x the concurrent cap.
     max_total: usize,
+    /// Protocol tree host — when set, delegate children are registered
+    /// into the SAME tree the six collaboration tools operate on, with a
+    /// cancellation token (interrupt_agent) and a mailbox drain (send_message
+    /// delivery between steps). Fixes the "two disconnected agent trees" gap.
+    protocol_host: Option<Arc<crate::protocol_tools::ProtocolToolHost>>,
     /// Shared permission gate. Sub-agent tool calls previously bypassed
     /// the permission pipeline entirely — deny rules had no effect on
     /// delegated work. When set, each sub-agent tool call is checked:
@@ -126,7 +133,14 @@ impl DelegateTool {
             max_concurrent: 4,
             max_total: 16,
             permission: None,
+            protocol_host: None,
         }
+    }
+
+    /// Attach the protocol tree host for tree unification.
+    pub fn with_protocol_host(mut self, host: Arc<crate::protocol_tools::ProtocolToolHost>) -> Self {
+        self.protocol_host = Some(host);
+        self
     }
 
     /// Handle to the durable sub-agent supervisor (when writer-backed),
@@ -194,7 +208,7 @@ impl DelegateTool {
     /// should be passed here — they bypass the main permission pipeline.
     pub fn with_readonly_tools(
         mut self,
-        tools: Vec<(String, Arc<dyn ToolRuntime>, serde_json::Value)>,
+        tools: Vec<(String, Arc<dyn ToolRuntime>, serde_json::Value, String)>,
     ) -> Self {
         self.readonly_tools = tools;
         self
@@ -267,7 +281,7 @@ impl ToolRuntime for DelegateTool {
                 agent_id: String::new(),
                 task_id: String::new(),
                 message: format!(
-                    "[Subagent 限额] 当前已有 {running_now} 个 subagent 在运行（上限 {}），本次未被调度。请等待已有 subagent 完成后再派发，或自己直接完成该子任务。",
+                    "[Subagent quota] {running_now} sub-agents are already running (cap {}). This one was NOT scheduled. Wait for a running sub-agent to finish, or do the subtask yourself.",
                     self.max_concurrent
                 ),
             }));
@@ -278,7 +292,7 @@ impl ToolRuntime for DelegateTool {
                 agent_id: String::new(),
                 task_id: String::new(),
                 message: format!(
-                    "[Subagent 限额] 本会话已累计派发 {spawned_so_far} 个 subagent（上限 {}），不再接受新的派发。请自己直接完成剩余工作。",
+                    "[Subagent quota] This session already spawned {spawned_so_far} sub-agents (cap {}); no more will be scheduled. Complete the remaining work yourself.",
                     self.max_total
                 ),
             }));
@@ -312,8 +326,23 @@ impl ToolRuntime for DelegateTool {
                 label: label.clone(),
                 task_preview: truncate_task(&args.task, 80).to_string(),
             });
+            // Unified tree: register the child in the protocol tree so
+            // list/send/wait/interrupt operate on it, and give the child
+            // loop its cancellation token + mailbox drain.
+            let child_link = self
+                .protocol_host
+                .as_ref()
+                .and_then(|h| h.attach_delegate_child(&label, &task_id_str).ok());
+            let mut controls = child_link.as_ref().map(|link| {
+                let host = self.protocol_host.clone().unwrap();
+                let agent_id = link.agent_id;
+                ChildControls {
+                    cancel: link.cancel.clone(),
+                    drain_messages: Box::new(move || host.drain_delegate_messages(&agent_id)),
+                }
+            });
             let response =
-                run_subagent_turn(actor, cfg, &args.task, &self.readonly_tools, self.permission.clone(), |detail| {
+                run_subagent_turn(actor, cfg, &args.task, &self.readonly_tools, self.permission.clone(), controls.as_mut(), |detail| {
                     self.notify_progress(SubagentProgress::Step {
                         id: task_id_str.clone(),
                         detail,
@@ -321,6 +350,12 @@ impl ToolRuntime for DelegateTool {
                 })
                 .await;
             self.running_count.fetch_sub(1, Ordering::Relaxed);
+            if let Some(link) = &child_link {
+                let ok = response.is_ok();
+                self.protocol_host
+                    .as_ref()
+                    .map(|h| h.finish_delegate_child(&link.agent_id, ok));
+            }
             let response_text = match response {
                 Ok(text) => {
                     self.notify_progress(SubagentProgress::Finished {
@@ -390,12 +425,20 @@ impl ToolRuntime for DelegateTool {
 /// with `max_output_tokens: 4096` and no tools, long answers got
 /// truncated and reasoning-only models returned zero visible text
 /// ("empty response").
+/// Step-boundary controls handed to the sub-agent loop by DelegateTool:
+/// cancellation (interrupt_agent) and parent mailbox delivery (send_message).
+pub struct ChildControls {
+    pub cancel: tokio_util::sync::CancellationToken,
+    pub drain_messages: Box<dyn FnMut() -> Vec<String> + Send>,
+}
+
 async fn run_subagent_turn(
     actor: &grodex_sampler::SamplingActor,
     cfg: &ModelConfig,
     task: &str,
-    readonly_tools: &[(String, Arc<dyn ToolRuntime>, serde_json::Value)],
+    readonly_tools: &[(String, Arc<dyn ToolRuntime>, serde_json::Value, String)],
     permission: Option<Arc<Mutex<grodex_permission::PermissionManager>>>,
+    mut controls: Option<&mut ChildControls>,
     mut on_step: impl FnMut(String),
 ) -> Result<String, String> {
     use grodex_core::context::ContextItem;
@@ -422,9 +465,9 @@ async fn run_subagent_turn(
 
     let mut tool_specs: Vec<ToolSpec> = readonly_tools
         .iter()
-        .map(|(name, _, schema)| ToolSpec {
+        .map(|(name, _, schema, description)| ToolSpec {
             name: name.clone(),
-            description: name.clone(),
+            description: description.clone(),
             parameters: schema.clone(),
             required: vec![],
         })
@@ -442,6 +485,22 @@ async fn run_subagent_turn(
     let mut last_error: Option<String> = None;
 
     for step in 0..MAX_SUBAGENT_STEPS {
+        // ── Step-boundary controls (unified tree) ───────────────────
+        if let Some(c) = controls.as_deref_mut() {
+            if c.cancel.is_cancelled() {
+                return Err("interrupted by user (interrupt_agent)".into());
+            }
+            // Deliver parent messages queued via send_message: injected as
+            // user-role items so the model sees them before the next sample.
+            for msg in (c.drain_messages)() {
+                if !msg.is_empty() {
+                    context.push(ContextItem::User {
+                        content: format!("[user message]: {msg}"),
+                        message_id: None,
+                    });
+                }
+            }
+        }
         on_step(format!("采样步骤 {}", step + 1));
         let request = CanonicalModelRequest {
             request_id: format!("subagent-{}", StepId::new()),
@@ -480,7 +539,7 @@ async fn run_subagent_turn(
                 // Transient provider errors: nudge the loop to retry once
                 // via a synthetic user item, then give up on the next round.
                 context.push(ContextItem::User {
-                    content: format!("[sub-agent 运行时错误，请重试] {err}"),
+                    content: format!("[sub-agent runtime error, retry] {err}"),
                     message_id: None,
                 });
                 continue;
@@ -510,7 +569,7 @@ async fn run_subagent_turn(
                     name: name.clone(),
                     arguments: arguments.clone(),
                 });
-                let runtime = readonly_tools.iter().find(|(n, _, _)| *n == name);
+                let runtime = readonly_tools.iter().find(|(n, ..)| *n == name);
                 // ── Permission gate (fail-closed) ──────────────────
                 // Deny rules from the live policy now apply to delegated
                 // work too. Ask cannot be satisfied inside a sub-agent
@@ -542,10 +601,10 @@ async fn run_subagent_turn(
                     None
                 };
                 let (content, is_error) = if let Some(reason) = blocked {
-                    (format!("[权限拒绝] {reason}"), true)
+                    (format!("[permission denied] {reason}"), true)
                 } else {
                 match runtime {
-                    Some((_, rt, _)) => match rt.execute(arguments, OperationId::new()).await {
+                    Some((_, rt, ..)) => match rt.execute(arguments, OperationId::new()).await {
                         Ok(v) => {
                             let text = match v {
                                 serde_json::Value::String(s) => s,
@@ -553,9 +612,9 @@ async fn run_subagent_turn(
                             };
                             (text, false)
                         }
-                        Err(e) => (format!("工具执行失败: {e}"), true),
+                        Err(e) => (format!("tool execution failed: {e}"), true),
                     },
-                    None => (format!("未注册的工具: {name}"), true),
+                    None => (format!("unregistered tool: {name}"), true),
                 }
                 };
                 context.push(ContextItem::ToolResult {
@@ -585,18 +644,18 @@ async fn run_subagent_turn(
             .collect::<Vec<_>>()
             .join("\n");
         if !reasoning.is_empty() {
-            return Ok(format!("[sub-agent 思考过程输出（无正文）]\n{reasoning}"));
+            return Ok(format!("[sub-agent reasoning-only output]\n{reasoning}"));
         }
 
         // Truly empty — nudge once and retry.
         context.push(ContextItem::User {
-            content: "你刚才没有输出任何内容。请直接给出最终结果文本。".into(),
+            content: "[System: You produced no visible output. Respond with your final result text now.]".into(),
             message_id: None,
         });
     }
 
     Err(last_error.unwrap_or_else(|| {
-        format!("sub-agent 达到最大步数 ({MAX_SUBAGENT_STEPS}) 仍未产出最终结果")
+        format!("sub-agent hit the max step cap ({MAX_SUBAGENT_STEPS}) without producing a final result")
     }))
 }
 
@@ -623,9 +682,10 @@ async fn offload_if_large(text: String, label: &str, task_id: &str) -> String {
     let orig_len = text.len();
     let preview = truncate_task(&text, 2048);
     format!(
-        "结果过长（{orig_len} 字节），完整报告已保存到：{}\n\
-         以下为前 2048 字符预览：\n{preview}\n\n\
-         [预览截断] 如需完整内容，请用 read_file 读取上述文件。",
+        "Sub-agent report too large ({orig_len} bytes). Full report saved to: {}\n\
+         First 2048 chars preview:\n{preview}\n\n\
+         [preview truncated] To read the full report, call the read_file tool with path=\"{}\".",
+        path.display(),
         path.display()
     )
 }

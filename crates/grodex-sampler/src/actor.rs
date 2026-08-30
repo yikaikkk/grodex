@@ -99,7 +99,7 @@ impl SamplingActor {
             // would be wrong here: the route's sticky index may still point
             // at a failover candidate from a PREVIOUS call.
             let outcome = self
-                .run_attempt(binding, request, &progress, &mut events, &stream_tx, None)
+                .run_attempt(binding, request, &progress, &mut events, &stream_tx, None, None)
                 .await;
             match outcome {
                 AttemptResult::Completed { response, first_token_ms } => {
@@ -117,19 +117,23 @@ impl SamplingActor {
                             }
                         }
                         RetryDecision::FailoverToNextCandidate => {
-                            let (next_binding, failover_credential) = if let Some(ref route) = self.route {
+                            let (next_binding, failover_credential, failover_endpoint) = if let Some(ref route) = self.route {
                                 let mut route = route.lock().unwrap();
                                 route.record_failure(true);
                                 let next = route.try_next().map(|(_, b)| b);
                                 // try_next advanced the sticky index — the
                                 // current candidate is now the failover one.
+                                // Switch BOTH credential and endpoint: the
+                                // fallback candidate usually lives on a
+                                // different base URL / provider.
                                 let credential = route.current_api_key();
-                                (next, credential)
-                            } else { (None, None) };
+                                let endpoint = route.current_endpoint();
+                                (next, credential, endpoint)
+                            } else { (None, None, None) };
                             if let Some(new_binding) = next_binding {
                                 attempt = 0;
                                 let outcome = self
-                                    .run_attempt(&new_binding, request, &progress, &mut events, &stream_tx, failover_credential.as_deref())
+                                    .run_attempt(&new_binding, request, &progress, &mut events, &stream_tx, failover_credential.as_deref(), failover_endpoint.as_deref())
                                     .await;
                                 if let Some(ref route) = self.route {
                                     let mut route = route.lock().unwrap();
@@ -172,11 +176,12 @@ impl SamplingActor {
         events: &mut Vec<CanonicalModelEvent>,
         stream_tx: &mpsc::UnboundedSender<StreamFragment>,
         credential: Option<&str>,
+        endpoint: Option<&str>,
     ) -> AttemptResult {
         let attempt_start = Instant::now();
         let byte_stream = match self
             .client
-            .stream_raw_with_credential(binding, request, credential)
+            .stream_raw_for_candidate(binding, request, endpoint, credential)
             .await
         {
             Ok(s) => s,

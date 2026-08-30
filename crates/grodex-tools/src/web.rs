@@ -71,7 +71,10 @@ impl WebFetchTool {
                 reqwest::redirect::Policy::custom(fence)
             })
             .build()
-            .unwrap_or_default();
+            // NO unwrap_or_default fallback: a default client has no
+            // redirect fence and no timeout — the exact protections this
+            // tool exists to enforce. Builder failure is unrecoverable.
+            .expect("web_fetch: reqwest client builder failed");
         Self { client }
     }
 }
@@ -129,7 +132,7 @@ impl Tool for WebFetchTool {
             "required": ["url"],
             "properties": {
                 "url": {"type": "string", "description": "Absolute http(s) URL to fetch"},
-                "max_bytes": {"type": "integer", "description": "Max bytes of extracted text (default 262144, hard cap 2097152)"}
+                "max_bytes": {"type": "integer", "description": "Max bytes of extracted text (default 262144, hard cap 2097152). If the raw response body is larger than 6x this cap (max 2MB), the fetch FAILS instead of truncating."}
             }
         })
     }
@@ -232,7 +235,7 @@ impl ToolRuntime for WebFetchTool {
                 cut -= 1;
             }
             content.truncate(cut);
-            content.push_str("\n\n[... 内容因超出大小上限被截断 ...]");
+            content.push_str("\n\n[... truncated: content exceeded the size cap ...]");
         }
 
         let out = WebFetchOutput {

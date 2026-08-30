@@ -178,6 +178,8 @@ struct TurnMetrics {
     compactions: u64,
     retries: u64,
     cancels: u64,
+    /// Repair 提示注入次数——与 retries 分列，遥测可区分「模型犹豫」与真失败重试。
+    repair_injections: u64,
 }
 
 impl TurnCoordinator {
@@ -457,6 +459,9 @@ impl TurnCoordinator {
         let mut finished = false;
         // P0-1：无工具 `Stop` 响应的 repair sampling 剩余预算。
         let mut repair_budget = REPAIR_SAMPLING_BUDGET;
+        // R 修复：repair 从 retries 分列（遥测可区分「模型犹豫」与真失败重试）；
+        // repair_exhausted 终止原因据此判定。
+        let mut repair_injected = false;
 
         // 可观测(设计文档 09 §19.1):Turn 计时与指标累加。
         let turn_started = std::time::Instant::now();
@@ -524,22 +529,27 @@ impl TurnCoordinator {
             let tool_specs = TurnCapabilityOverlay::effective_specs(&base, &overlay);
 
             // ── Compaction check ────────────────────────────────
+            // One transcript fetch per step: the previous code fetched it
+            // here AND again ~15 lines later for the request build — two
+            // full deep clones of the transcript per step. We re-fetch
+            // only after a compaction actually rewrote the context.
             let context = self.chat_state.get_conversation().await;
             let current_tokens = context.iter().map(|i| i.estimated_tokens() as u64).sum();
             let should_compact = {
                 let c = self.compaction.lock().await;
                 c.should_compact(current_tokens) || c.is_overflow(current_tokens)
             };
-            if should_compact
-            {
+            let context = if should_compact {
                 metrics.compactions += 1;
                 self.try_compact(&turn_ctx, &context, stream_tx.as_ref())
                     .instrument(tracing::info_span!("compaction", turn_id = %turn_ctx.turn_id))
                     .await;
-            }
+                self.chat_state.get_conversation().await
+            } else {
+                context
+            };
 
             // ── Build request ───────────────────────────────────
-            let context = self.chat_state.get_conversation().await;
             let step_id = StepId::new();
             metrics.steps += 1;
 
@@ -567,23 +577,18 @@ impl TurnCoordinator {
                 }
             }
 
-            let request = CanonicalModelRequest {
-                request_id: format!("req_{}", step_id),
-                session_id: turn_ctx.session_id,
-                turn_id: turn_ctx.turn_id,
+            let request = build_model_request(
+                &turn_ctx,
                 step_id,
-                model_binding_id: turn_ctx.model_binding.binding_id,
-                prompt_snapshot_hash: Some(PromptSnapshot::capture(&context, &tool_specs).content_hash),
-                instructions: turn_ctx.instructions.clone(),
-                context_items: context.clone(),
-                tool_specs: tool_specs.clone(), // clone: may need for 413 retry
-                tool_choice: ToolChoice::Auto,
-                parallel_tool_calls: true,
-                reasoning_request: None,
-                response_format: None,
-                max_output_tokens: Some(16384),
-                provider_state_in: None,
-            };
+                format!("req_{}", step_id),
+                context.clone(), // cloned: `context` feeds the 413-retry rebuild
+                tool_specs.clone(), // cloned: may need for 413 retry
+                turn_ctx.instructions.clone(),
+                PromptSnapshot::hash_of(&context, &tool_specs),
+                16384,
+                ToolChoice::Auto,
+                true,
+            );
 
             // ── Telemetry: prompt snapshot + attempt start (observability-only) ──
             if let Some(ref writer) = self.rollout {
@@ -739,7 +744,8 @@ impl TurnCoordinator {
                         // ── 结构化终止判断（StepDisposition）──
                         // 把散落的 if/else 收拢成 classify_step 分类函数，
                         // 终止协议可读、可单测。
-                        let disposition = classify_step(&response, repair_budget);
+                        let disposition =
+                            classify_step(&response, repair_budget, metrics.tool_calls > 0);
 
                         // 非工具分支统一 push step result（工具分支在下方
                         // dispatch 段自行 push）。
@@ -775,19 +781,34 @@ impl TurnCoordinator {
                                     step_id = %step_id,
                                     "output truncated (StopReason::Length) — injecting continuation prompt"
                                 );
+                                const CONTINUATION_NOTE: &str = "[System: Your previous response was truncated because it exceeded the output length limit. \
+                                         Continue exactly from where you left off. If you were in the middle of a tool call, \
+                                         re-issue the complete tool call now.]";
                                 self.chat_state.push_user_message(
                                     ContextItem::User {
-                                        content: "[System: Your previous response was truncated because it exceeded the output length limit. \
-                                         Continue exactly from where you left off. If you were in the middle of a tool call, \
-                                         re-issue the complete tool call now.]".into(),
+                                        content: CONTINUATION_NOTE.into(),
                                         message_id: None,
                                     }
                                 ).await;
+                                // Journal the synthetic note (non-durable) so a
+                                // replayed context matches the live one exactly.
+                                if let Some(ref writer) = self.rollout {
+                                    let _ = writer
+                                        .write_prompt_injected(
+                                            turn_ctx.turn_id,
+                                            step_id,
+                                            StepGeneration::new(step_gen),
+                                            "continuation",
+                                            CONTINUATION_NOTE,
+                                        )
+                                        .await;
+                                }
                                 continue;
                             }
                             StepDisposition::Repair => {
-                                metrics.retries += 1;
-                                // 无工具自然 Stop + 非空文本 + 预算未耗尽。
+                                repair_injected = true;
+                                metrics.repair_injections += 1;
+                                // 无工具自然 Stop + 非空文本 + 预算未耗尽 + 本轮已有工具调用。
                                 // 注入 repair prompt 迫使模型二选一：
                                 //   总结收尾 → turn 结束
                                 //   调用工具 → turn 继续
@@ -797,9 +818,7 @@ impl TurnCoordinator {
                                     repair_budget,
                                     "no-tool natural stop — injecting repair prompt"
                                 );
-                                self.chat_state.push_user_message(
-                                    ContextItem::User {
-                                        content: "[System: You stopped without calling a tool. \
+                                const REPAIR_NOTE: &str = "[System: You stopped without calling a tool. \
                                          If the user's request is fully resolved, give a concise final summary. \
                                          If you were already in the middle of multi-step tool work that you \
                                          started earlier in this turn, continue with the next tool call now. \
@@ -808,10 +827,26 @@ impl TurnCoordinator {
                                          \"shall I…\" / \"do you want me to…\"), you MUST NOT auto-execute \
                                          that proposed action. Wait for the user's response instead. \
                                          Do not merely describe what you would do next — either summarize \
-                                         your findings or continue already-started work.]".into(),
+                                         your findings or continue already-started work.]";
+                                self.chat_state.push_user_message(
+                                    ContextItem::User {
+                                        content: REPAIR_NOTE.into(),
                                         message_id: None,
                                     }
                                 ).await;
+                                // Journal the synthetic note (non-durable) so a
+                                // replayed context matches the live one exactly.
+                                if let Some(ref writer) = self.rollout {
+                                    let _ = writer
+                                        .write_prompt_injected(
+                                            turn_ctx.turn_id,
+                                            step_id,
+                                            StepGeneration::new(step_gen),
+                                            "repair",
+                                            REPAIR_NOTE,
+                                        )
+                                        .await;
+                                }
                                 continue;
                             }
                             StepDisposition::FinalAnswer => {
@@ -1193,9 +1228,10 @@ impl TurnCoordinator {
                                         let orig_len = content.len();
                                         let preview = truncate_utf8(content, 2048);
                                         *content = format!(
-                                            "工具结果过大（{orig_len} 字节），完整内容已保存到临时文件：{}\n\
-                                             以下为前 2048 字节预览：\n{preview}\n\n\
-                                             [预览截断] 如需完整内容，请用 read_artifact 工具读取：path=\"{}\"",
+                                            "Tool result too large ({orig_len} bytes). Full content saved to: {}\n\
+                                             First 2048 bytes preview:\n{preview}\n\n\
+                                             [preview truncated] To read the full content, call the read_artifact tool with path=\"{}\" \
+                                             (note: read_artifact returns a head+tail view with the middle elided).",
                                             path.display(),
                                             path.display()
                                         );
@@ -1342,6 +1378,7 @@ impl TurnCoordinator {
                                         retries: metrics.retries,
                                         compactions: metrics.compactions,
                                         cancels: metrics.cancels,
+                                        repair_injections: metrics.repair_injections,
                                     },
                                 };
                             }
@@ -1416,23 +1453,18 @@ impl TurnCoordinator {
                         self.try_compact(&turn_ctx, &context, stream_tx.as_ref()).await;
                         // Re-fetch compacted context and retry.
                         let context = self.chat_state.get_conversation().await;
-                        let retry_request = CanonicalModelRequest {
-                            request_id: format!("req_retry_{}", step_id),
-                            session_id: turn_ctx.session_id,
-                            turn_id: turn_ctx.turn_id,
+                        let retry_request = build_model_request(
+                            &turn_ctx,
                             step_id,
-                            model_binding_id: turn_ctx.model_binding.binding_id,
-                            prompt_snapshot_hash: Some(PromptSnapshot::capture(&context, &tool_specs).content_hash),
-                            instructions: turn_ctx.instructions.clone(),
-                            context_items: context.clone(),
-                            tool_specs: tool_specs.clone(),
-                            tool_choice: ToolChoice::Auto,
-                            parallel_tool_calls: true,
-                            reasoning_request: None,
-                            response_format: None,
-                            max_output_tokens: Some(16384),
-                            provider_state_in: None,
-                        };
+                            format!("req_retry_{}", step_id),
+                            context.clone(),
+                            tool_specs.clone(),
+                            turn_ctx.instructions.clone(),
+                            PromptSnapshot::hash_of(&context, &tool_specs),
+                            16384,
+                            ToolChoice::Auto,
+                            true,
+                        );
                         let retry_outcome = match stream_tx {
                             Some(ref tx) => self.sampler.sample_streaming(&turn_ctx.model_binding, &retry_request, tx.clone()).await,
                             None => self.sampler.sample(&turn_ctx.model_binding, &retry_request).await,
@@ -1541,26 +1573,24 @@ impl TurnCoordinator {
             );
             let mut wrap_context = self.chat_state.get_conversation().await;
             wrap_context.push(ContextItem::User {
-                content: "你已用完本轮最大执行步数，不能再调用任何工具。请简明总结：已完成的工作、当前进展、剩余未完成的部分及建议的下一步。".into(),
+                content: "[System: Step budget exhausted. You may no longer call any tools. \
+                 Write a concise wrap-up (at most ~200 words): what was completed, current progress, \
+                 what remains unfinished, and the suggested next step.]".into(),
                 message_id: None,
             });
-            let wrap_request = CanonicalModelRequest {
-                request_id: format!("req_wrapup_{}", StepId::new()),
-                session_id: turn_ctx.session_id,
-                turn_id: turn_ctx.turn_id,
-                step_id: StepId::new(),
-                model_binding_id: turn_ctx.model_binding.binding_id,
-                prompt_snapshot_hash: Some(PromptSnapshot::capture(&wrap_context, &[]).content_hash),
-                instructions: turn_ctx.instructions.clone(),
-                context_items: wrap_context,
-                tool_specs: vec![],
-                tool_choice: ToolChoice::None,
-                parallel_tool_calls: false,
-                reasoning_request: None,
-                response_format: None,
-                max_output_tokens: Some(2048),
-                provider_state_in: None,
-            };
+            let wrap_prompt_hash = PromptSnapshot::hash_of(&wrap_context, &[]);
+            let wrap_request = build_model_request(
+                &turn_ctx,
+                StepId::new(),
+                format!("req_wrapup_{}", StepId::new()),
+                wrap_context,
+                vec![],
+                turn_ctx.instructions.clone(),
+                wrap_prompt_hash,
+                2048,
+                ToolChoice::None,
+                false,
+            );
             let wrap_outcome = match stream_tx {
                 Some(ref tx) => {
                     self.sampler
@@ -1641,6 +1671,11 @@ impl TurnCoordinator {
             // The FINAL step's error is what ended the turn; an earlier
             // step's recovered error does not make the turn a failure.
             "sampling_error"
+        } else if repair_injected {
+            // Repair was injected and the post-repair response ended the
+            // turn without tools — the conclusion was budget-driven, not
+            // a spontaneous natural stop.
+            "repair_exhausted"
         } else {
             "final_answer"
         };
@@ -1658,6 +1693,7 @@ impl TurnCoordinator {
                 retries: metrics.retries,
                 compactions: metrics.compactions,
                 cancels: metrics.cancels,
+                repair_injections: metrics.repair_injections,
                 duration_ms: turn_started.elapsed().as_millis() as u64,
             },
         }
@@ -1702,27 +1738,25 @@ impl TurnCoordinator {
             emit_status("started");
 
             let (sys, user) = CompactionManager::build_compaction_prompt(&plan);
-            let compact_req = CanonicalModelRequest {
-                request_id: format!("compact_{}", StepId::new()),
-                session_id: turn_ctx.session_id,
-                turn_id: turn_ctx.turn_id,
-                step_id: StepId::new(),
-                model_binding_id: turn_ctx.model_binding.binding_id,
-                prompt_snapshot_hash: Some(PromptSnapshot::capture(&[ContextItem::User { content: user.clone(), message_id: None }], &[]).content_hash),
-                instructions: vec![grodex_provider::canonical_request::InstructionBlock {
+            let compact_req = build_model_request(
+                &turn_ctx,
+                StepId::new(),
+                format!("compact_{}", StepId::new()),
+                vec![ContextItem::User { content: user.clone(), message_id: None }],
+                Vec::new(),
+                vec![grodex_provider::canonical_request::InstructionBlock {
                     role: grodex_provider::canonical_request::InstructionRole::System,
                     content: sys,
                     priority: 0,
                 }],
-                context_items: vec![ContextItem::User { content: user, message_id: None }],
-                tool_specs: Vec::new(),
-                tool_choice: ToolChoice::None,
-                parallel_tool_calls: false,
-                reasoning_request: None,
-                response_format: None,
-                max_output_tokens: Some(4096),
-                provider_state_in: None,
-            };
+                PromptSnapshot::hash_of(
+                    &[ContextItem::User { content: user, message_id: None }],
+                    &[],
+                ),
+                4096,
+                ToolChoice::None,
+                false,
+            );
             let outcome = self.sampler.sample(&turn_ctx.model_binding, &compact_req).await;
             if let Some(ref resp) = outcome.response {
                 let summary = resp.assistant_text().unwrap_or("");
@@ -2634,9 +2668,10 @@ async fn early_offload_tool_result(
         Some(path) => {
             let preview = truncate_utf8(&content, 2048);
             format!(
-                "工具结果过大（{orig_len} 字节），完整内容已保存到临时文件：{}\n\
-                 以下为前 2048 字节预览：\n{preview}\n\n\
-                 [预览截断] 如需完整内容，请用 read_artifact 工具读取：path=\"{}\"",
+                "Tool result too large ({orig_len} bytes). Full content saved to: {}\n\
+                 First 2048 bytes preview:\n{preview}\n\n\
+                 [preview truncated] To read the full content, call the read_artifact tool with path=\"{}\" \
+                 (note: read_artifact returns a head+tail view with the middle elided).",
                 path.display(),
                 path.display()
             )
@@ -2733,6 +2768,42 @@ fn host_of_url(url: &str) -> Option<String> {
         None
     } else {
         Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Single constructor for the four `CanonicalModelRequest` literals that
+/// were previously copy-pasted across the sampling/413-retry/wrap-up/
+/// compaction paths — adding one request field used to require four
+/// synchronized edits (and `parallel_tool_calls` had already drifted).
+#[allow(clippy::too_many_arguments)]
+fn build_model_request(
+    turn_ctx: &TurnContext,
+    step_id: StepId,
+    request_id: String,
+    context_items: Vec<ContextItem>,
+    tool_specs: Vec<grodex_provider::canonical_request::ToolSpec>,
+    instructions: Vec<grodex_provider::canonical_request::InstructionBlock>,
+    prompt_snapshot_hash: String,
+    max_output_tokens: u64,
+    tool_choice: ToolChoice,
+    parallel_tool_calls: bool,
+) -> CanonicalModelRequest {
+    CanonicalModelRequest {
+        request_id,
+        session_id: turn_ctx.session_id,
+        turn_id: turn_ctx.turn_id,
+        step_id,
+        model_binding_id: turn_ctx.model_binding.binding_id,
+        prompt_snapshot_hash: Some(prompt_snapshot_hash),
+        instructions,
+        context_items,
+        tool_specs,
+        tool_choice,
+        parallel_tool_calls,
+        reasoning_request: None,
+        response_format: None,
+        max_output_tokens: Some(max_output_tokens),
+        provider_state_in: None,
     }
 }
 

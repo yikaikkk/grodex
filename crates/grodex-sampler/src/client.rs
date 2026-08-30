@@ -73,7 +73,7 @@ impl SamplingClient {
         binding: &ModelBinding,
         request: &CanonicalModelRequest,
     ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>, ProviderError> {
-        self.stream_raw_with_credential(binding, request, None).await
+        self.stream_raw_for_candidate(binding, request, None, None).await
     }
 
     /// Like [`Self::stream_raw`] but with an optional per-request
@@ -85,7 +85,27 @@ impl SamplingClient {
         request: &CanonicalModelRequest,
         credential: Option<&str>,
     ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>, ProviderError> {
-        let base = self.config.endpoint.as_deref().unwrap_or("https://api.openai.com/v1");
+        self.stream_raw_for_candidate(binding, request, None, credential)
+            .await
+    }
+
+    /// Full per-request override form for route failover: BOTH the
+    /// endpoint and the credential switch to the failover candidate's.
+    /// (Previously only the credential was overridden while the URL stayed
+    /// pinned to the primary endpoint — a cross-provider failover would
+    /// send the fallback key to the PRIMARY URL.)
+    pub async fn stream_raw_for_candidate(
+        &self,
+        binding: &ModelBinding,
+        request: &CanonicalModelRequest,
+        endpoint_override: Option<&str>,
+        credential: Option<&str>,
+    ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>, ProviderError> {
+        let base = endpoint_override
+            .map(String::from)
+            .or_else(|| self.config.endpoint.clone())
+            .unwrap_or_else(|| "https://api.openai.com/v1".into());
+        let base = base.as_str();
         let (url, body) = match binding.wire_protocol {
             WireProtocol::Responses => (format!("{base}/responses"), self.build_responses_body(binding, request)),
             WireProtocol::ChatCompletions => (format!("{base}/chat/completions"), self.build_chat_body(binding, request)),

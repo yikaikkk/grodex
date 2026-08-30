@@ -288,6 +288,7 @@ impl ApprovalBroker {
                     PendingTicketInfo {
                         call_id: Some(t.tool_call_id.to_string()),
                         tool_name: Some(t.tool_name.clone()),
+                        args: t.arguments_snapshot.clone(),
                     },
                 )
             })

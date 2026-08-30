@@ -201,6 +201,13 @@ impl ModelRoute {
         self.current().and_then(|c| c.api_key.clone())
     }
 
+    /// Endpoint of the currently selected candidate — failover must ALSO
+    /// switch the request URL, not only the credential (a fallback
+    /// candidate often lives on a different base URL / provider).
+    pub fn current_endpoint(&self) -> Option<String> {
+        self.current().map(|c| c.endpoint.clone())
+    }
+
     /// Get the current candidate (the one we're "stuck" to).
     pub fn current(&self) -> Option<&ModelCandidate> {
         if self.current_index >= 0 {
@@ -412,7 +419,7 @@ impl ModelRoute {
 /// region = "us-east-1"
 /// revision = "2024-08"
 /// ```
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct CandidateToml {
     pub candidate_id: String,
     pub provider_id: String,
@@ -433,6 +440,25 @@ pub struct CandidateToml {
     /// at route construction; `api_key` (literal) wins when both set.
     #[serde(default)]
     pub auth_env_var: Option<String>,
+}
+
+impl std::fmt::Debug for CandidateToml {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redacted: api_key is a literal credential from route config.
+        f.debug_struct("CandidateToml")
+            .field("candidate_id", &self.candidate_id)
+            .field("provider_id", &self.provider_id)
+            .field("model_id", &self.model_id)
+            .field("wire_protocol", &self.wire_protocol)
+            .field("endpoint", &self.endpoint)
+            .field("priority", &self.priority)
+            .field("account_id", &self.account_id)
+            .field("region", &self.region)
+            .field("revision", &self.revision)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("auth_env_var", &self.auth_env_var)
+            .finish()
+    }
 }
 
 /// TOML representation of a model route.

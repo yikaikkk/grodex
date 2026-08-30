@@ -365,30 +365,7 @@ impl<'a> PolicyExplainer<'a> {
 
     /// Generate the precise matcher that a "always allow" grant would create.
     pub fn propose_always_allow_matcher(&self, tool_name: &str, args: &serde_json::Value) -> String {
-        let mut parts = vec![format!("tool={}", tool_name)];
-
-        if let Some(path) = args.pointer("/path").and_then(|v| v.as_str()) {
-            parts.push(format!("path={}", path));
-        }
-        if let Some(cmd) = args.pointer("/command").and_then(|v| v.as_str()) {
-            if let Some(first) = cmd.split_whitespace().next() {
-                parts.push(format!("command_prefix={}", first));
-            }
-        }
-        if let Some(host) = args.pointer("/host").and_then(|v| v.as_str()) {
-            parts.push(format!("host={}", host));
-        }
-        if let Some(srv) = args
-            .pointer("/server_capability_id")
-            .and_then(|v| v.as_str())
-        {
-            parts.push(format!("server={}", srv));
-        }
-        if let Some(tool) = args.pointer("/tool_capability_id").and_then(|v| v.as_str()) {
-            parts.push(format!("mcp_tool={}", tool));
-        }
-
-        parts.join(", ")
+        always_allow_matcher_for(tool_name, args)
     }
 }
 
@@ -764,4 +741,31 @@ mod tests {
         assert_eq!(result.policy.generation, 1);
         assert_eq!(result.policy.rules().len(), 0);
     }
+}
+
+/// Build the precise "always allow" operation matcher for one call:
+/// `tool=<name>` plus arg-derived constraints (path / command_prefix /
+/// host / server / mcp_tool). A grant keyed to this matcher only applies
+/// to calls whose args still match — approving one narrow command no
+/// longer grants the whole tool.
+pub fn always_allow_matcher_for(tool_name: &str, args: &serde_json::Value) -> String {
+    let mut parts = vec![format!("tool={}", tool_name)];
+    if let Some(path) = args.pointer("/path").and_then(|v| v.as_str()) {
+        parts.push(format!("path={}", path));
+    }
+    if let Some(cmd) = args.pointer("/command").and_then(|v| v.as_str()) {
+        if let Some(first) = cmd.split_whitespace().next() {
+            parts.push(format!("command_prefix={}", first));
+        }
+    }
+    if let Some(host) = args.pointer("/host").and_then(|v| v.as_str()) {
+        parts.push(format!("host={}", host));
+    }
+    if let Some(srv) = args.pointer("/server_capability_id").and_then(|v| v.as_str()) {
+        parts.push(format!("server={}", srv));
+    }
+    if let Some(tool) = args.pointer("/tool_capability_id").and_then(|v| v.as_str()) {
+        parts.push(format!("mcp_tool={}", tool));
+    }
+    parts.join(", ")
 }

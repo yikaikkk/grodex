@@ -51,6 +51,10 @@ pub struct ContextProjection {
     /// Stable checkpoint id — the projection can be rebuilt from rollout
     /// starting at this checkpoint + incremental events after.
     checkpoint_id: Option<String>,
+    /// Incremental token total maintained by `append` — avoids O(n)
+    /// re-summation of `estimated_tokens()` per pushed item (O(n²)/turn).
+    /// Recomputed wholesale by `replace`.
+    total_est_tokens: u64,
     /// Accounting: actual_tokens, budget_tokens_remaining, soft_limit_exceeded.
     /// None when no model has been sampled against this projection yet.
     token_accounting: Option<TokenAccounting>,
@@ -105,6 +109,7 @@ impl ContextProjection {
             history_version: 0,
             source_seq_end: 0,
             checkpoint_id: None,
+            total_est_tokens: 0,
             token_accounting: None,
             maintenance_policy_version: 1,
             reference_context: None,
@@ -221,7 +226,8 @@ impl ContextProjection {
             }
         }
 
-        let mut p = Self { items, history_version: 1, source_seq_end: max_seq,
+        let total_est_tokens = items.iter().map(|i| i.estimated_tokens() as u64).sum();
+        let mut p = Self { items, total_est_tokens, history_version: 1, source_seq_end: max_seq,
             checkpoint_id: None, token_accounting: None,
             maintenance_policy_version: 1, reference_context: None,
             world_state_baseline: None, state_capsule_id: None,
@@ -240,6 +246,8 @@ impl ContextProjection {
 
     /// Atomically replace the projection (compaction).
     pub fn replace(&mut self, new_items: Vec<ContextItem>) {
+        self.total_est_tokens =
+            new_items.iter().map(|i| i.estimated_tokens() as u64).sum();
         self.items = new_items;
         self.history_version += 1;
         // Recompute token accounting after compaction (best-effort).
@@ -255,12 +263,17 @@ impl ContextProjection {
 
     /// Append an item from the live transcript (during a Turn).
     pub fn append(&mut self, item: ContextItem, seq: u64) {
+        // Incremental token accounting: the previous implementation
+        // re-summed estimated_tokens() over the WHOLE projection on every
+        // push — O(n) per item, O(n²) per turn, with a JSON re-serialize
+        // per ToolCall item each time. Track the delta instead.
+        let item_est = item.estimated_tokens() as u64;
         self.items.push(item);
         self.source_seq_end = seq;
         self.history_version += 1;
-        // Refresh token accounting incrementally.
-        let est = self.estimated_tokens();
+        self.total_est_tokens = self.total_est_tokens.saturating_add(item_est);
         if let Some(ref mut a) = self.token_accounting {
+            let est = self.total_est_tokens;
             a.actual_tokens = est;
             a.budget_tokens_remaining = a.budget_total_tokens.saturating_sub(est);
             a.soft_limit_exceeded = est > a.budget_total_tokens * 80 / 100;
@@ -345,9 +358,9 @@ impl ContextProjection {
         self.source_seq_end
     }
 
-    /// Estimate total tokens.
+    /// Estimate total tokens (incremental — maintained by `append`/`replace`).
     pub fn estimated_tokens(&self) -> u64 {
-        self.items.iter().map(|i| i.estimated_tokens() as u64).sum()
+        self.total_est_tokens
     }
 }
 

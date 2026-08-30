@@ -164,7 +164,7 @@ impl Tool for ExecTool {
         ToolMetadata {
             name: "exec".into(),
             display_name: "Execute Command".into(),
-            description: "Run a shell command and return stdout, stderr, and exit code.".into(),
+            description: "Run a shell command and return stdout, stderr, and exit code. Default timeout 120s; output is capped (head+tail kept) at 100KB. Credential-looking environment variables are stripped from the inherited env — pass env_delta to re-add them.".into(),
             concurrency_class: ConcurrencyClass::Serial,
             side_effect_class: SideEffectClass::NonIdempotent,
             default_policy: grodex_core::policy::PolicyDecision::Ask,
@@ -180,7 +180,9 @@ impl Tool for ExecTool {
                 "timeout_secs": {"type": "integer", "description": "Timeout in seconds"},
                 "description": {"type": "string", "description": "Human-readable description of what this command does"},
                 "background": {"type": "boolean", "description": "Run in background; returns process_id immediately (default: false)"},
-                "yield_time_ms": {"type": "integer", "description": "Wait this many ms then return partial output + handle for long-running commands"}
+                "yield_time_ms": {"type": "integer", "description": "Wait this many ms then return partial output + handle for long-running commands"},
+                "shell_mode": {"type": "string", "enum": ["auto", "bash", "sh", "zsh"], "description": "Shell used to run the command (default: auto = sh on unix, cmd on windows). Output shell_mode_used reports the shell actually used."},
+                "env_delta": {"type": "array", "items": {"type": "string"}, "description": "Environment overrides as KEY=VALUE entries, merged on top of the (sanitized) parent env. NOTE: credential-looking vars (API_KEY/TOKEN/SECRET/...) are stripped from the inherited env; re-add any the command genuinely needs here."}
             },
             "required": ["command"]
         })
@@ -210,6 +212,9 @@ impl ToolRuntime for ExecTool {
     ) -> Result<serde_json::Value, GrodexError> {
         let args: ExecArgs =
             serde_json::from_value(args).map_err(|e| GrodexError::ToolExecution(format!("invalid args: {e}")))?;
+        // Fail fast on shell_mode the runtime cannot honor truthfully.
+        let actual_shell = Self::resolve_shell(&args.shell_mode)?;
+
 
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(120));
@@ -282,8 +287,8 @@ impl ToolRuntime for ExecTool {
                         still_running: false,
                         retained_head: None,
                         retained_tail: None,
-                        shell_mode_used: args.shell_mode.clone(),
-                        env_delta_applied: args.env_delta.clone(),
+                        shell_mode_used: actual_shell.to_string(),
+                        env_delta_applied: Vec::new(), // sandbox runtime does not apply env_delta — report honestly
                     };
                     serde_json::to_value(result)
                         .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
@@ -310,8 +315,8 @@ impl ToolRuntime for ExecTool {
                         still_running: false,
                         retained_head: None,
                         retained_tail: None,
-                        shell_mode_used: args.shell_mode.clone(),
-                        env_delta_applied: args.env_delta.clone(),
+                        shell_mode_used: actual_shell.to_string(),
+                        env_delta_applied: Vec::new(), // sandbox runtime does not apply env_delta — report honestly
                     };
                     serde_json::to_value(result)
                         .map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
@@ -321,15 +326,17 @@ impl ToolRuntime for ExecTool {
 
         // ── Direct-spawn path (no sandbox configured) ───────────────
 
-        let mut cmd = if cfg!(target_os = "windows") {
+        let mut cmd = if actual_shell == "cmd" {
             let mut c = Command::new("cmd");
             c.args(["/C", &args.command]);
             c
         } else {
-            let mut c = Command::new("sh");
+            let mut c = Command::new(actual_shell);
             c.args(["-c", &args.command]);
             c
         };
+        // Env hygiene: credential-looking vars stripped, env_delta re-added.
+        Self::apply_env_hygiene(&mut cmd, &args.env_delta);
 
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -362,7 +369,7 @@ impl ToolRuntime for ExecTool {
                 still_running: true,
                 retained_head: None,
                 retained_tail: None,
-                shell_mode_used: args.shell_mode.clone(),
+                shell_mode_used: actual_shell.to_string(),
                 env_delta_applied: args.env_delta.clone(),
             };
             // Detach the child process (don't kill on drop).
@@ -381,21 +388,25 @@ impl ToolRuntime for ExecTool {
             let mut child = child;
             let stdout_child = child.stdout.take();
             let stderr_child = child.stderr.take();
+            let cap = self
+                .max_output_bytes
+                .saturating_mul(2)
+                .saturating_add(64 * 1024);
             let stdout_handle = tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                if let Some(mut r) = stdout_child {
-                    let _ = r.read_to_end(&mut buf).await;
+                if let Some(r) = stdout_child {
+                    Self::read_capped(r, cap).await.0
+                } else {
+                    Vec::new()
                 }
-                buf
             });
             let stderr_handle = tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                if let Some(mut r) = stderr_child {
-                    let _ = r.read_to_end(&mut buf).await;
+                if let Some(r) = stderr_child {
+                    Self::read_capped(r, cap).await.0
+                } else {
+                    Vec::new()
                 }
-                buf
             });
 
             let yield_dur = Duration::from_millis(yield_ms);
@@ -422,7 +433,7 @@ impl ToolRuntime for ExecTool {
                         still_running: false,
                         retained_head: None,
                         retained_tail: None,
-                        shell_mode_used: args.shell_mode.clone(),
+                        shell_mode_used: actual_shell.to_string(),
                         env_delta_applied: args.env_delta.clone(),
                     };
                     return serde_json::to_value(result)
@@ -453,7 +464,7 @@ impl ToolRuntime for ExecTool {
                         still_running: true,
                         retained_head: None,
                         retained_tail: None,
-                        shell_mode_used: args.shell_mode.clone(),
+                        shell_mode_used: actual_shell.to_string(),
                         env_delta_applied: args.env_delta.clone(),
                     };
                     return serde_json::to_value(result)
@@ -469,21 +480,25 @@ impl ToolRuntime for ExecTool {
             // and wait on child separately so we can kill it on cancel.
             let stdout_child = child.stdout.take();
             let stderr_child = child.stderr.take();
+            let cap = self
+                .max_output_bytes
+                .saturating_mul(2)
+                .saturating_add(64 * 1024);
             let stdout_handle = tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                if let Some(mut r) = stdout_child {
-                    let _ = r.read_to_end(&mut buf).await;
+                if let Some(r) = stdout_child {
+                    Self::read_capped(r, cap).await.0
+                } else {
+                    Vec::new()
                 }
-                buf
             });
             let stderr_handle = tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                if let Some(mut r) = stderr_child {
-                    let _ = r.read_to_end(&mut buf).await;
+                if let Some(r) = stderr_child {
+                    Self::read_capped(r, cap).await.0
+                } else {
+                    Vec::new()
                 }
-                buf
             });
 
             let token_clone = token.clone();
@@ -530,7 +545,7 @@ impl ToolRuntime for ExecTool {
                         still_running: false,
                         retained_head: None,
                         retained_tail: None,
-                        shell_mode_used: args.shell_mode.clone(),
+                        shell_mode_used: actual_shell.to_string(),
                         env_delta_applied: args.env_delta.clone(),
                     };
                     return serde_json::to_value(result)
@@ -556,7 +571,7 @@ impl ToolRuntime for ExecTool {
                         still_running: false,
                         retained_head: None,
                         retained_tail: None,
-                        shell_mode_used: args.shell_mode.clone(),
+                        shell_mode_used: actual_shell.to_string(),
                         env_delta_applied: args.env_delta.clone(),
                     };
                     return serde_json::to_value(result)
@@ -580,7 +595,7 @@ impl ToolRuntime for ExecTool {
                         still_running: false,
                         retained_head: None,
                         retained_tail: None,
-                        shell_mode_used: args.shell_mode.clone(),
+                        shell_mode_used: actual_shell.to_string(),
                         env_delta_applied: args.env_delta.clone(),
                     };
                     return serde_json::to_value(result)
@@ -595,11 +610,36 @@ impl ToolRuntime for ExecTool {
                 _ => unreachable!(),
             }
         } else {
-            // No cancel token — use the simple wait_with_output path.
-            match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                Ok(Ok(proc_output)) => {
-                    let stdout = String::from_utf8_lossy(&proc_output.stdout);
-                    let stderr = String::from_utf8_lossy(&proc_output.stderr);
+            // No cancel token — manual wait + capped collectors (the old
+            // wait_with_output read the child output unbounded into RAM).
+            let stdout_child = child.stdout.take();
+            let stderr_child = child.stderr.take();
+            let cap = self
+                .max_output_bytes
+                .saturating_mul(2)
+                .saturating_add(64 * 1024);
+            let out_h = tokio::spawn(async move {
+                if let Some(r) = stdout_child {
+                    Self::read_capped(r, cap).await.0
+                } else {
+                    Vec::new()
+                }
+            });
+            let err_h = tokio::spawn(async move {
+                if let Some(r) = stderr_child {
+                    Self::read_capped(r, cap).await.0
+                } else {
+                    Vec::new()
+                }
+            });
+            match tokio::time::timeout(timeout, child.wait()).await {
+                Ok(Ok(status)) => {
+                    let proc_output = (
+                        out_h.await.unwrap_or_default(),
+                        err_h.await.unwrap_or_default(),
+                    );
+                    let stdout = String::from_utf8_lossy(&proc_output.0);
+                    let stderr = String::from_utf8_lossy(&proc_output.1);
                     let (stdout_str, stdout_truncated) = Self::truncate(&stdout, self.max_output_bytes);
                     let (stderr_str, stderr_truncated) = Self::truncate(&stderr, self.max_output_bytes);
                     let duration_ms = start.elapsed().as_millis() as u64;
@@ -608,7 +648,7 @@ impl ToolRuntime for ExecTool {
                         process_id: child_pid,
                         stdout: stdout_str,
                         stderr: stderr_str,
-                        exit_code: proc_output.status.code(),
+                        exit_code: status.code(),
                         timed_out: false,
                         duration_ms,
                         stdout_truncated,
@@ -616,7 +656,7 @@ impl ToolRuntime for ExecTool {
                         still_running: false,
                         retained_head: None,
                         retained_tail: None,
-                        shell_mode_used: args.shell_mode.clone(),
+                        shell_mode_used: actual_shell.to_string(),
                         env_delta_applied: args.env_delta.clone(),
                     };
                     return serde_json::to_value(result)
@@ -646,7 +686,7 @@ impl ToolRuntime for ExecTool {
                         still_running: false,
                         retained_head: None,
                         retained_tail: None,
-                        shell_mode_used: args.shell_mode.clone(),
+                        shell_mode_used: actual_shell.to_string(),
                         env_delta_applied: args.env_delta.clone(),
                     };
                     return serde_json::to_value(result)
@@ -664,6 +704,112 @@ impl ExecTool {
     /// joined by an elision marker, so the user sees both the start and the
     /// final exit/error lines instead of only a head (the old behaviour).
     /// Cuts are char-aligned to avoid splitting UTF-8.
+    /// Resolve the requested `shell_mode` into the ACTUAL shell binary
+    /// used. `none` is rejected outright — commands are strings that need
+    /// a shell to parse, and a silent whitespace-split would mangle quoted
+    /// arguments; the model should use dedicated tools for file ops.
+    fn resolve_shell(requested: &str) -> Result<&'static str, GrodexError> {
+        match requested {
+            "auto" => Ok(if cfg!(target_os = "windows") { "cmd" } else { "sh" }),
+            "sh" => Ok("sh"),
+            "bash" => Ok("bash"),
+            "zsh" => Ok("zsh"),
+            "none" => Err(GrodexError::ToolExecution(
+                "shell_mode='none' is not supported — commands run through a shell;                  use read_file/write_file/edit_file instead of shell builtins"
+                    .into(),
+            )),
+            other => Err(GrodexError::ToolExecution(format!(
+                "unknown shell_mode '{other}' (expected auto|bash|sh|zsh)"
+            ))),
+        }
+    }
+
+    /// Drain a child stream with a HARD memory cap. The old collectors
+    /// used `read_to_end` — a command emitting gigabytes was fully read
+    /// into RAM before the string-level truncation ran. Now: keep the
+    /// first `cap` bytes plus a rolling window of the last `cap` bytes;
+    /// everything in between is discarded as it arrives. The child is
+    /// still fully drained (no SIGPIPE behavior change), only buffered.
+    async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> (Vec<u8>, u64) {
+        use tokio::io::AsyncReadExt;
+        let mut head: Vec<u8> = Vec::with_capacity(cap.min(1024 * 1024));
+        let mut tail: Vec<u8> = Vec::new();
+        let mut total: u64 = 0;
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            match r.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n as u64;
+                    let data = &chunk[..n];
+                    if head.len() < cap {
+                        let take = (cap - head.len()).min(n);
+                        head.extend_from_slice(&data[..take]);
+                        tail.extend_from_slice(&data[take..]);
+                    } else {
+                        tail.extend_from_slice(data);
+                    }
+                    if tail.len() > cap {
+                        let overflow = tail.len() - cap;
+                        tail.drain(..overflow);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if head.len() < cap && !tail.is_empty() {
+            head.extend_from_slice(&tail);
+            (head, total)
+        } else {
+            (head, total)
+        }
+    }
+
+    /// Env-var names that look like credentials are stripped from the
+    /// inherited environment before spawning a model-authored command —
+    /// the parent env routinely carries API keys / OAuth tokens, and every
+    /// exec'd command can read them. Explicit `env_delta` entries bypass
+    /// the filter (the user asked for them by name).
+    fn is_secret_env_name(name: &str) -> bool {
+        let upper = name.to_ascii_uppercase();
+        upper.contains("API_KEY")
+            || upper.contains("APIKEY")
+            || upper.contains("TOKEN")
+            || upper.contains("SECRET")
+            || upper.contains("PASSWORD")
+            || upper.contains("PASSWD")
+            || upper.contains("CREDENTIAL")
+            || upper.ends_with("_KEY")
+    }
+
+    /// Apply the env hygiene policy + explicit env_delta to a command.
+    ///
+    /// CRITICAL: iterate `vars_os`, never `vars` — `vars()` unwraps
+    /// `into_string()` and PANICS the whole runtime when the environment
+    /// contains a single non-UTF-8 variable name/value (observed in the
+    /// wild with paths containing non-UTF-8 bytes).
+    fn apply_env_hygiene(cmd: &mut Command, env_delta: &[String]) {
+        for (name, _) in std::env::vars_os() {
+            match name.into_string() {
+                Ok(name) => {
+                    if Self::is_secret_env_name(&name) {
+                        cmd.env_remove(&name);
+                    }
+                }
+                Err(bad) => {
+                    // Non-UTF-8 names can neither match the secret list nor
+                    // be re-added via env_delta — drop them from the child.
+                    cmd.env_remove(&bad);
+                }
+            }
+        }
+        for entry in env_delta {
+            if let Some((k, v)) = entry.split_once('=') {
+                cmd.env(k, v);
+            }
+        }
+    }
+
     fn truncate(s: &str, max_bytes: usize) -> (String, bool) {
         if s.len() <= max_bytes {
             return (s.to_string(), false);

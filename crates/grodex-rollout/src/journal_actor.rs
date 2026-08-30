@@ -340,10 +340,12 @@ async fn run_actor(mut actor: JournalActor, mut rx: mpsc::UnboundedReceiver<Acto
             } => {
                 let res = actor_do_append(&mut actor, &mut event);
                 if let Ok(seq) = res {
-                    // seq is committed to the file bytes (in userspace buf
-                    // at minimum); decide on fsync now.
+                    // Perf: BufWriter flush only when we are about to
+                    // fsync — a flush per event forced a kernel write
+                    // syscall per journal append even for the
+                    // "last ~8 may be lost" durability tier.
                     if should_fsync_now(actor.fsync_policy, &mut actor.fsync_batch_counter, force_fsync) {
-                        if let Err(e) = actor.file.sync_data() {
+                        if let Err(e) = actor.file.flush().and_then(|_| actor.file.sync_data()) {
                             let _ = reply.send(Err(GrodexError::Internal(anyhow::anyhow!(
                                 "journal fsync seq={seq}: {e}"
                             ))));
@@ -405,45 +407,31 @@ fn actor_do_append(actor: &mut JournalActor, event: &mut RolloutEvent) -> Result
         )));
     }
 
-    // ── Serialize FIRST (before bumping seq) ──────────────────────
-    // If serde fails we return Err without consuming a seq → no gaps.
-    // (We discard the first serialization output because the event's
-    // seq field isn't stamped yet; only used to catch serde bugs early
-    // so we don't allocate a seq for obviously-invalid payloads.)
-    let _line = serde_json::to_string(event).map_err(|e| {
-        GrodexError::Internal(anyhow::anyhow!("serialize rollout event: {e}"))
-    })?;
-
-    // ── Allocate seq ONLY after serialization succeeds ────────────
+    // ── Stamp seq, serialize ONCE ─────────────────────────────────
+    // (Perf: the previous code serialized every event TWICE — once to
+    // "pre-validate" before consuming a seq, once after stamping. Seq
+    // allocation is an in-memory counter on the single-writer actor, so
+    // a serialize failure before ANY write can simply roll the counter
+    // back — no other observer can have seen the value. The strict
+    // no-rollback policy still applies AFTER the write, where bytes may
+    // already be on disk.)
     let seq = actor.next_seq;
     event.seq = seq;
 
-    // Re-serialize now that seq has been stamped onto the event.
-    // (We deliberately don't reuse the previous `line` because it
-    // had whatever seq the caller put in — usually 0 or stale.)
     let line = serde_json::to_string(event).map_err(|e| {
-        // seq was already assigned in-memory; this is a non-recoverable
-        // serialization bug (shouldn't happen since it just worked
-        // above). We deliberately DO NOT roll next_seq back: the only
-        // way to stay gap-free is crash loudly rather than silently
-        // reuse a seq number. Crashing here is fail-closed.
-        GrodexError::Internal(anyhow::anyhow!(
-            "re-serialize rollout event after seq stamp: {e}"
-        ))
+        // Nothing was written to disk with this seq — rolling the
+        // in-memory counter back keeps the stream gap-free.
+        actor.next_seq = seq;
+        GrodexError::Internal(anyhow::anyhow!("serialize rollout event: {e}"))
     })?;
 
-    // ── Write + flush userspace buffer ────────────────────────────
-    // writeln! calls the underlying Write::write_all once for the
-    // payload + once for the '\n' byte.
+    // ── Write (userspace buffer; flush/fsync decided by the loop) ──
     writeln!(actor.file, "{line}").map_err(|e| {
         // Partial write possible. Same policy as above: do NOT roll back
         // seq (another writer may already observe this seq value on
         // disk and assume it's committed). Return error so the caller
         // aborts the turn instead of corrupting the journal.
         GrodexError::Internal(anyhow::anyhow!("write journal seq={seq}: {e}"))
-    })?;
-    actor.file.flush().map_err(|e| {
-        GrodexError::Internal(anyhow::anyhow!("flush journal seq={seq}: {e}"))
     })?;
 
     // ── Bump seq — commit point reached for metadata ──────────────

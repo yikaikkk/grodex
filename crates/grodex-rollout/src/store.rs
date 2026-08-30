@@ -55,6 +55,13 @@ pub trait RolloutStore: Send + Sync + 'static {
     fn journal_path(&self) -> Option<PathBuf> {
         None
     }
+
+    /// On-disk directory of the session (journal + blobs + approval db),
+    /// when file-backed. Used by shutdown cleanup to remove sessions that
+    /// never recorded any conversation. Non-file stores return `None`.
+    fn session_dir_path(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -337,6 +344,10 @@ impl FileRolloutStore {
 impl RolloutStore for FileRolloutStore {
     fn journal_path(&self) -> Option<PathBuf> {
         Some(self.journal_file())
+    }
+
+    fn session_dir_path(&self) -> Option<PathBuf> {
+        Some(self.session_dir.clone())
     }
 
     async fn append_event(&self, event: RolloutEvent) -> Result<u64, GrodexError> {

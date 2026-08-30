@@ -26,7 +26,7 @@ pub const COMPACTION_SYSTEM_PROMPT: &str = r#"You are a context compaction assis
 
 3. The summary must be self-contained — after compaction, only the summary will remain. The AI must be able to continue the conversation from the summary alone.
 
-4. Keep the summary concise but complete. Prefer specifics over generalities.
+4. Keep the summary concise but complete. Prefer specifics over generalities. TARGET LENGTH: at most ~500 words (a few paragraphs plus bullets). Only exceed this if the conversation contains many distinct unfinished threads — do NOT pad, and do NOT re-narrate completed work in detail.
 
 5. Format the summary in clear paragraphs. Use bullet points for lists of actions or files.
 

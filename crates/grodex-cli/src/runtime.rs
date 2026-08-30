@@ -39,7 +39,10 @@ use grodex_rollout::store::{FileRolloutStore, RolloutStore};
 use grodex_sampler::{ModelRoute, SamplingActor, SamplingClient, SamplingClientConfig};
 use grodex_sandbox::SandboxRuntimeClient;
 use grodex_subagent::supervisor::SubAgentConfig;
-use grodex_tools::{ApplyPatchTool, EditTool, ExecTool, GlobTool, GrepTool, LoadSkillTool, ReadFileTool, WebFetchTool, WriteFileTool};
+use grodex_tools::{
+    ApplyPatchTool, EditTool, ExecTool, GlobTool, GrepTool, LoadSkillTool, ReadArtifactTool,
+    ReadFileTool, WebFetchTool, WriteFileTool,
+};
 use tokio::sync::mpsc;
 
 /// A fully-wired session runtime ready to serve turns.
@@ -635,27 +638,15 @@ impl SessionRuntimeBuilder {
         // its JSON schema. The delegate_task tool is wired with:
         //   - a shared SamplingActor (so it can actually run sub-agent turns)
         //   - a RolloutWriter clone (so spawn/complete are journaled)
-        coordinator
-            .register_tool("read_file", Arc::new(ReadFileTool::new()), ReadFileTool::new().input_schema())
-            .await;
+        register_builtin(&coordinator, ReadFileTool::new()).await;
         // load_skill:复用 supervisor 的 SkillCatalog 发现(cwd/trusted 一致),
         // 共享一份 Arc<Mutex<_>>,避免重复扫描且保证 load 的是同一批 skill。
         let skill_catalog = Arc::new(std::sync::Mutex::new(
             grodex_skills::SkillCatalog::discover(&self.cwd, workspace_trusted),
         ));
-        coordinator
-            .register_tool(
-                "load_skill",
-                Arc::new(LoadSkillTool::new(skill_catalog)),
-                LoadSkillTool::default().input_schema(),
-            )
-            .await;
-        coordinator
-            .register_tool("write_file", Arc::new(WriteFileTool::new()), WriteFileTool::new().input_schema())
-            .await;
-        coordinator
-            .register_tool("edit_file", Arc::new(EditTool::new()), EditTool::new().input_schema())
-            .await;
+        register_builtin(&coordinator, LoadSkillTool::new(skill_catalog)).await;
+        register_builtin(&coordinator, WriteFileTool::new()).await;
+        register_builtin(&coordinator, EditTool::new()).await;
         // ExecTool: when the session enabled OS-level sandbox enforcement
         // (`[sandbox] enforce`/`external_supervisor`), wire the runtime
         // client + effective profile so `sh -c <cmd>` runs under
@@ -665,25 +656,14 @@ impl SessionRuntimeBuilder {
             Some((client, profile)) => ExecTool::new().with_sandbox_runtime(client, profile),
             None => ExecTool::new(),
         };
-        let exec_schema = exec_tool.input_schema();
-        coordinator
-            .register_tool("exec", Arc::new(exec_tool), exec_schema)
-            .await;
-        coordinator
-            .register_tool("apply_patch", Arc::new(ApplyPatchTool::new()), ApplyPatchTool::new().input_schema())
-            .await;
-        coordinator
-            .register_tool("web_fetch", Arc::new(WebFetchTool::new()), WebFetchTool::new().input_schema())
-            .await;
+        register_builtin(&coordinator, exec_tool).await;
+        register_builtin(&coordinator, ApplyPatchTool::new()).await;
+        register_builtin(&coordinator, WebFetchTool::new()).await;
         // grep / glob: read-only codebase search tools. Give the model
         // grep (content search) and glob (file-pattern search) so it
         // doesn't need read_file for every search operation.
-        coordinator
-            .register_tool("grep", Arc::new(GrepTool::new()), GrepTool::new().input_schema())
-            .await;
-        coordinator
-            .register_tool("glob", Arc::new(GlobTool::new()), GlobTool::new().input_schema())
-            .await;
+        register_builtin(&coordinator, GrepTool::new()).await;
+        register_builtin(&coordinator, GlobTool::new()).await;
         // ── Subagent progress channel ───────────────────────────
         // The DelegateTool sends structured lifecycle events
         // (started/step/finished) via this channel. The forwarder task
@@ -706,6 +686,16 @@ impl SessionRuntimeBuilder {
             .filter(|v| *v > 0)
             .map(|v| v as usize);
 
+        // ── 7c. Parent-child collaboration protocol tools (Doc 12) ──
+        // send_message / followup_task / wait_agent / mailbox_read /
+        // list_agents / interrupt_agent. The session itself is the root
+        // agent; followup TaskRuns execute through the DelegateTool above.
+        // The host is created BEFORE the DelegateTool and shared with it,
+        // so delegate children and protocol tools share ONE tree.
+        let protocol_host = Arc::new(grodex_loop::protocol_tools::ProtocolToolHost::new(
+            max_subagents_total.unwrap_or(16),
+            Default::default(),
+        ));
         let mut delegate = DelegateTool::new(SubAgentConfig::default())
             .with_sampling(sub_actor, model_config.clone())
             .with_progress_sender(subagent_progress_tx.clone())
@@ -716,39 +706,54 @@ impl SessionRuntimeBuilder {
             .with_readonly_tools(vec![
                 ("read_file".to_string(),
                  Arc::new(ReadFileTool::new()) as Arc<dyn ToolRuntime>,
-                 ReadFileTool::new().input_schema()),
+                 ReadFileTool::new().input_schema(),
+                 ReadFileTool::new().metadata().description),
                 ("grep".to_string(),
                  Arc::new(GrepTool::new()) as Arc<dyn ToolRuntime>,
-                 GrepTool::new().input_schema()),
+                 GrepTool::new().input_schema(),
+                 GrepTool::new().metadata().description),
                 ("glob".to_string(),
                  Arc::new(GlobTool::new()) as Arc<dyn ToolRuntime>,
-                 GlobTool::new().input_schema()),
+                 GlobTool::new().input_schema(),
+                 GlobTool::new().metadata().description),
+                ("read_artifact".to_string(),
+                 Arc::new(ReadArtifactTool::new()) as Arc<dyn ToolRuntime>,
+                 ReadArtifactTool::new().input_schema(),
+                 ReadArtifactTool::new().metadata().description),
             ]);
         if let Some(ref w) = writer {
             delegate = delegate.with_writer(w.clone(), SubAgentConfig::default());
         }
         // P3 fix: sub-agent tool calls go through the shared permission
         // gate (deny rules apply; Ask fails closed inside a sub-agent).
-        let delegate = delegate.with_permission(permission_mgr.clone());
+        let delegate = delegate
+            .with_permission(permission_mgr.clone())
+            .with_protocol_host(protocol_host.clone());
         // Shared Arc: the collaboration-protocol followup executor reuses
         // the same DelegateTool child loop.
         let delegate = Arc::new(delegate);
         let subagent_recovery = delegate.durable_supervisor();
+        let delegate_meta = delegate.metadata();
         let delegate_schema = delegate.input_schema();
         coordinator
-            .register_tool("delegate_task", delegate.clone(), delegate_schema)
+            .register_tool_with_metadata(
+                "delegate_task",
+                delegate.clone(),
+                delegate_schema,
+                delegate_meta,
+            )
             .await;
 
         // ── 7c. Parent-child collaboration protocol tools (Doc 12) ──
         // send_message / followup_task / wait_agent / mailbox_read /
         // list_agents / interrupt_agent. The session itself is the root
         // agent; followup TaskRuns execute through the DelegateTool above.
-        let protocol_host = Arc::new(grodex_loop::protocol_tools::ProtocolToolHost::new(
-            max_subagents_total.unwrap_or(16),
-            Default::default(),
-        ));
-        for (name, runtime, schema) in protocol_host.tool_set(Some(delegate.clone())) {
-            coordinator.register_tool(name, runtime, schema).await;
+        // NOTE: the host is created BEFORE the DelegateTool and shared with
+        // it, so delegate children and protocol tools share ONE tree.
+        for (name, runtime, schema, meta) in protocol_host.tool_set(Some(delegate.clone())) {
+            coordinator
+                .register_tool_with_metadata(name, runtime, schema, meta)
+                .await;
         }
 
         // ── 7b. MCP tools (from config `[[mcp_server]]`) ──────────
@@ -1084,6 +1089,17 @@ impl SessionRuntimeBuilder {
             subagent_recovery,
         })
     }
+}
+
+/// Register a builtin tool using its OWN `Tool` metadata — the previous
+/// `register_tool` path set `ToolSpec.description = tool_name`, so the
+/// model never saw the written tool descriptions at all.
+async fn register_builtin(coordinator: &TurnCoordinator, tool: impl grodex_core::tool::Tool + grodex_core::tool::ToolRuntime + 'static) {
+    let meta = tool.metadata();
+    let schema = tool.input_schema();
+    coordinator
+        .register_tool_with_metadata(meta.name.clone(), Arc::new(tool), schema, meta)
+        .await;
 }
 
 /// Build a `PermissionPolicy` from the config.

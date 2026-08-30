@@ -8,6 +8,8 @@ rust-version.workspace = true
 description = "MCP (Model Context Protocol) client runtime for Grodex"
 
 [dependencies]
+tracing = "0.1"
+
 grodex-core.workspace = true
 grodex-auth.workspace = true
 async-trait.workspace = true

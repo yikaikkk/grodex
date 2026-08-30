@@ -15,6 +15,9 @@
 //! (reusing its child sampling loop); the FIFO follow-up chain is driven
 //! through `CollaborationProtocol::finish_task_run`.
 
+use tokio_util::sync::CancellationToken;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,10 +41,33 @@ pub type SharedProtocol = Arc<Mutex<CollaborationProtocol>>;
 /// The session itself is the ROOT agent: every tool call issued by the
 /// main loop runs as `caller = root`, so descendant/ownership checks
 /// cover exactly the agents this session created.
+/// Handles for a delegate_task child registered in the protocol tree.
+/// `DelegateTool` obeys `cancel` at step boundaries and flips `finished`.
+pub struct DelegateChildLink {
+    pub agent_id: AgentId,
+    pub cancel: CancellationToken,
+    pub finished: Arc<AtomicBool>,
+    pub interrupted: Arc<AtomicBool>,
+}
+
+struct DelegateChildEntry {
+    #[allow(dead_code)]
+    task_id: String,
+    #[allow(dead_code)]
+    label: String,
+    cancel: CancellationToken,
+    finished: Arc<AtomicBool>,
+    interrupted: Arc<AtomicBool>,
+}
+
 pub struct ProtocolToolHost {
     protocol: SharedProtocol,
     caller: AgentId,
     default_budget: TaskBudget,
+    /// delegate_task children registered into the protocol tree so the
+    /// collaboration tools operate on the SAME set of agents that
+    /// DelegateTool spawns (previously two disconnected trees).
+    delegate_children: Mutex<HashMap<AgentId, DelegateChildEntry>>,
 }
 
 impl ProtocolToolHost {
@@ -62,6 +88,7 @@ impl ProtocolToolHost {
                 max_turns: Some(8),
                 max_duration_secs: None,
             },
+            delegate_children: Mutex::new(HashMap::new()),
         }
     }
 
@@ -86,13 +113,136 @@ impl ProtocolToolHost {
         Ok(id)
     }
 
-    /// Build the six `(name, runtime, input_schema)` triples for the
+    // ── delegate_task child unification (Doc 12 gap fix) ────────────
+
+    /// Register a delegate_task child into the protocol tree and return
+    /// the handles the child loop obeys: a cancellation token (fed to
+    /// interrupt_agent) and lifecycle flags for list/wait.
+    pub fn attach_delegate_child(
+        &self,
+        label: &str,
+        task_id: &str,
+    ) -> Result<DelegateChildLink, String> {
+        let agent_id = self.spawn_child(label)?;
+        let entry = DelegateChildEntry {
+            task_id: task_id.to_string(),
+            label: label.to_string(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            finished: Arc::new(AtomicBool::new(false)),
+            interrupted: Arc::new(AtomicBool::new(false)),
+        };
+        self.delegate_children.lock().unwrap().insert(agent_id, entry);
+        Ok(DelegateChildLink {
+            agent_id,
+            finished: self
+                .delegate_children
+                .lock()
+                .unwrap()
+                .get(&agent_id)
+                .map(|e| e.finished.clone())
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            interrupted: self
+                .delegate_children
+                .lock()
+                .unwrap()
+                .get(&agent_id)
+                .map(|e| e.interrupted.clone())
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            cancel: self
+                .delegate_children
+                .lock()
+                .unwrap()
+                .get(&agent_id)
+                .map(|e| e.cancel.clone())
+                .unwrap_or_else(tokio_util::sync::CancellationToken::new),
+        })
+    }
+
+    /// Mark a delegate child finished (ok=true → completed, false → failed).
+    pub fn finish_delegate_child(&self, agent_id: &AgentId, ok: bool) {
+        if let Some(e) = self.delegate_children.lock().unwrap().get(agent_id) {
+            e.finished.store(true, Ordering::SeqCst);
+            if !ok {
+                e.interrupted.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// interrupt_agent support: cancel a delegate child's execution loop.
+    /// Returns true when the target IS a delegate child.
+    pub fn interrupt_delegate_child(&self, agent_id: &AgentId) -> bool {
+        match self.delegate_children.lock().unwrap().get_mut(agent_id) {
+            Some(e) if !e.finished.load(Ordering::SeqCst) => {
+                e.cancel.cancel();
+                e.finished.store(true, Ordering::SeqCst);
+                e.interrupted.store(true, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a delegate child has finished (true) or is not one (false).
+    pub fn delegate_child_finished(&self, agent_id: &AgentId) -> bool {
+        self.delegate_children
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(|e| e.finished.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    /// Status string override for delegate children: running / interrupted
+    /// / completed (protocol nodes carry no TaskRun of their own).
+    pub fn delegate_child_status(&self, agent_id: &AgentId) -> Option<&'static str> {
+        self.delegate_children
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(|e| {
+                if e.interrupted.load(Ordering::SeqCst) {
+                    "Interrupted"
+                } else if e.finished.load(Ordering::SeqCst) {
+                    "Completed"
+                } else {
+                    "Running"
+                }
+            })
+    }
+
+    /// Drain pending mailbox payloads for a delegate child (read-then-ack,
+    /// same at-least-once semantics as mailbox_read).
+    pub fn drain_delegate_messages(&self, agent_id: &AgentId) -> Vec<String> {
+        let mut proto = self.protocol.lock().unwrap();
+        let read = match proto.mailbox_read(*agent_id, 20) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let _ = proto.confirm_consumed(*agent_id, &read.pending_confirmation);
+        read.messages.into_iter().map(|m| m.payload).collect()
+    }
+
+    /// Model-facing description per protocol tool. These previously never
+    /// reached the model (registered with `description = tool_name`).
+    fn description(kind: ProtocolToolKind) -> &'static str {
+        use ProtocolToolKind::*;
+        match kind {
+            SendMessage => "Send an async message to a running sub-agent's mailbox. Queued only — it does NOT interrupt or start a turn; the sub-agent reads it between steps.",
+            FollowupTask => "Queue a follow-up instruction for a sub-agent and (re)start its turn. Returns a task run id you can wait on with wait_agent.",
+            WaitAgent => "Block until the given descendant sub-agent(s) finish, or until the timeout. Returns their final status.",
+            MailboxRead => "Read messages from a sub-agent's mailbox (or the root mailbox). Returns up to `limit` messages, newest first.",
+            ListAgents => "List live sub-agents in this session with their status and mailbox depth.",
+            InterruptAgent => "Interrupt a sub-agent's current turn at the next step boundary. Use for cancellation, not for passing data (use send_message).",
+        }
+    }
+
+    /// Build the six `(name, runtime, input_schema, metadata)` entries for the
     /// TurnCoordinator tool registry. `executor` runs follow-up TaskRuns
     /// (None → runs are recorded but never executed).
     pub fn tool_set(
         self: &Arc<Self>,
         executor: Option<Arc<DelegateTool>>,
-    ) -> Vec<(String, Arc<dyn ToolRuntime>, Value)> {
+    ) -> Vec<(String, Arc<dyn ToolRuntime>, Value, grodex_core::tool::ToolMetadata)> {
         use ProtocolToolKind::*;
         [
             (SendMessage, "send_message"),
@@ -109,10 +259,19 @@ impl ProtocolToolHost {
                 kind,
                 executor: executor.clone(),
             });
+            let metadata = grodex_core::tool::ToolMetadata {
+                name: name.to_string(),
+                display_name: name.to_string(),
+                description: Self::description(kind).to_string(),
+                concurrency_class: grodex_core::tool::ConcurrencyClass::Serial,
+                side_effect_class: grodex_core::tool::SideEffectClass::NonIdempotent,
+                default_policy: grodex_core::policy::PolicyDecision::Allow,
+            };
             (
                 name.to_string(),
                 adapter.clone() as Arc<dyn ToolRuntime>,
                 adapter.input_schema(),
+                metadata,
             )
         })
         .collect()
@@ -314,6 +473,8 @@ impl ToolRuntime for ProtocolToolAdapter {
                                     .first()
                                     .map(|r| r.is_terminal())
                                     .unwrap_or(false)
+                                    // delegate children: observe the loop flags
+                                    || self.host.delegate_child_finished(t)
                             })
                         };
                         if all_terminal || Instant::now() >= deadline {
@@ -377,10 +538,17 @@ impl ToolRuntime for ProtocolToolAdapter {
                 let agents: Vec<Value> = rows
                     .iter()
                     .map(|r| {
+                        // Delegate children have no TaskRun — their live
+                        // status comes from the host's tracking map.
+                        let status = self
+                            .host
+                            .delegate_child_status(&r.agent_id)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("{:?}", r.status));
                         json!({
                             "agent_id": r.agent_id.to_string(),
                             "path": r.path,
-                            "status": format!("{:?}", r.status),
+                            "status": status,
                             "latest_task_run_id": r.latest_task_run_id.map(|t| t.to_string()),
                             "latest_task_terminal": r.latest_task_terminal,
                             "unread_messages": r.unread_messages,
@@ -391,16 +559,27 @@ impl ToolRuntime for ProtocolToolAdapter {
             }
 
             // 6. interrupt_agent — cancel the target run, keep the node.
+            // Also cancels delegate_task children (their execution loop
+            // observes the token at step boundaries).
             ProtocolToolKind::InterruptAgent => {
                 let target = Self::parse_agent(&args, "target")?;
-                let n = self
+                let delegate_hit = self.host.interrupt_delegate_child(&target);
+                let proto_result = self
                     .host
                     .protocol()
                     .lock()
                     .unwrap()
-                    .interrupt_agent(caller, target)
-                    .map_err(Self::protocol_err)?;
-                Ok(json!({"target": target.to_string(), "interrupted_tasks": n}))
+                    .interrupt_agent(caller, target);
+                let n = match &proto_result {
+                    Ok(n) => *n,
+                    Err(_) if delegate_hit => 0,
+                    Err(e) => return Err(Self::protocol_err(e.clone())),
+                };
+                Ok(json!({
+                    "target": target.to_string(),
+                    "interrupted_tasks": n,
+                    "delegate_child_cancelled": delegate_hit,
+                }))
             }
         }
     }
@@ -487,7 +666,7 @@ mod tests {
         let h = host();
         let set = h.tool_set(None);
         assert_eq!(set.len(), 6);
-        let names: Vec<&str> = set.iter().map(|(n, _, _)| n.as_str()).collect();
+        let names: Vec<&str> = set.iter().map(|(n, ..)| n.as_str()).collect();
         for expected in [
             "send_message",
             "followup_task",

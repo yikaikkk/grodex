@@ -168,6 +168,18 @@ pub enum RolloutEventType {
     /// acceptance and turn completion leaves the turn invisible to the
     /// projection. Schema: input_chars: usize
     TurnStarted,
+    /// A user-minted "always allow" session grant (Doc 16 §15). Durable —
+    /// replay restores the grant so "always allow" survives a restart.
+    /// Schema: grant_id, tool_name, matcher (structured k=v list),
+    /// policy_generation.
+    SessionGrantCreated,
+    /// An ephemeral steering note was injected into the live transcript
+    /// (repair prompt after a no-tool stop, or the length-continuation
+    /// note). **Non-durable** — journaled so a replayed context matches
+    /// the live one exactly, but the payload is a synthetic user message,
+    /// not real user input. Schema: note_kind ("repair"|"continuation"),
+    /// content, role: "user".
+    PromptInjected,
     /// One model sampling round started (observability-only, NOT
     /// durable). One round may internally perform several provider
     /// attempts (retry/failover) — those surface via ModelRouteEvent.

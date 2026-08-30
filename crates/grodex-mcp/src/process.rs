@@ -11,6 +11,10 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
+/// Per-call JSON-RPC timeout — the one unguarded await class in the
+/// runtime before this: a hung MCP server used to block tools/call forever.
+const RPC_TIMEOUT_SECS: u64 = 60;
+
 /// A connected MCP server process.
 pub struct McpProcess {
     config: McpServerConfig,
@@ -18,6 +22,10 @@ pub struct McpProcess {
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
     next_id: u64,
+    /// Responses that arrived out of order — buffered so a later caller
+    /// finds them (arrival-order matching desyncs on servers that emit
+    /// notifications between request and response).
+    pending: HashMap<u64, JsonRpcResponse>,
 }
 
 /// A JSON-RPC request sent to the MCP server.
@@ -30,14 +38,12 @@ struct JsonRpcRequest {
 }
 
 /// A JSON-RPC response from the MCP server.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct JsonRpcResponse {
     #[allow(dead_code)]
     jsonrpc: Option<String>,
-    #[allow(dead_code)]
     id: Option<u64>,
     result: Option<serde_json::Value>,
-    #[allow(dead_code)]
     error: Option<serde_json::Value>,
 }
 
@@ -62,6 +68,20 @@ impl McpProcess {
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let reader = BufReader::new(stdout);
+        // Drain stderr in the background — a chatty server that fills the
+        // pipe would otherwise deadlock itself, and its logs end up in
+        // tracing instead of an unread pipe buffer.
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => tracing::debug!(target: "grodex_mcp_stderr", "{line}"),
+                        _ => break,
+                    }
+                }
+            });
+        }
 
         Ok(Self {
             config,
@@ -69,6 +89,7 @@ impl McpProcess {
             stdin,
             reader,
             next_id: 1,
+            pending: HashMap::new(),
         })
     }
 
@@ -88,12 +109,49 @@ impl McpProcess {
         json.push('\n');
         self.stdin.write_all(json.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
 
-        // Read response.
-        let mut line = String::new();
-        self.reader.read_line(&mut line).await.map_err(|e| format!("read: {e}"))?;
-
-        let response: JsonRpcResponse = serde_json::from_str(&line).map_err(|e| format!("parse: {e}"))?;
-        response.result.ok_or_else(|| format!("rpc error: {line}"))
+        // Read until the response with OUR id arrives, buffering any
+        // out-of-order responses (notifications and interleaved replies
+        // are skipped/buffered — arrival-order matching desyncs on servers
+        // that emit notifications between request and response).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(RPC_TIMEOUT_SECS);
+        loop {
+            // Drain the out-of-order buffer FIRST — a response that arrived
+            // early (before its caller was waiting) must not leave us
+            // stalling on the wire for a reply that will never come.
+            if let Some(response) = self.pending.remove(&id) {
+                if let Some(err) = &response.error {
+                    return Err(format!("rpc error: {err}"));
+                }
+                return response
+                    .result
+                    .ok_or_else(|| format!("rpc {method}: empty result"));
+            }
+            let mut line = String::new();
+            match tokio::time::timeout_at(deadline, self.reader.read_line(&mut line)).await {
+                Err(_) => return Err(format!("rpc {method} timed out after {RPC_TIMEOUT_SECS}s")),
+                Ok(Err(e)) => return Err(format!("read: {e}")),
+                Ok(Ok(0)) => return Err(format!("rpc {method}: server closed stdout")),
+                Ok(Ok(_)) => {}
+            }
+            let response: JsonRpcResponse = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(_) => continue, // not a response line (log line etc.)
+            };
+            match response.id {
+                Some(rid) if rid == id => {
+                    if let Some(err) = &response.error {
+                        return Err(format!("rpc error: {err}"));
+                    }
+                    return response
+                        .result
+                        .ok_or_else(|| format!("rpc {method}: empty result"));
+                }
+                Some(rid) => {
+                    self.pending.insert(rid, response);
+                }
+                None => continue, // notification
+            }
+        }
     }
 
     /// List tools from the MCP server.

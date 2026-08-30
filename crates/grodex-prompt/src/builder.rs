@@ -33,6 +33,37 @@ pub struct EnvironmentInfo {
     pub cwd: String,
     pub date: String,
     pub home: Option<String>,
+    /// Active sandbox profile name, if the session configured one. `None`
+    /// means "not known here" — the environment XML omits the tag instead
+    /// of inventing a default.
+    pub sandbox_profile: Option<String>,
+}
+
+/// Query git for the current branch + dirty flag. `None` when the cwd is
+/// not a repo or git is unavailable — the caller omits the tag rather
+/// than fabricating values.
+fn detect_git_state(cwd: &str) -> Option<(String, bool)> {
+    let branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !branch.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+    if branch.is_empty() {
+        return None;
+    }
+    let dirty = match std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+    {
+        Ok(out) if out.status.success() => !out.stdout.is_empty(),
+        _ => return None,
+    };
+    Some((branch, dirty))
 }
 
 impl EnvironmentInfo {
@@ -44,6 +75,7 @@ impl EnvironmentInfo {
             cwd: cwd.to_string(),
             date: date.to_string(),
             home: home.map(|h| h.to_string()),
+            sandbox_profile: None,
         }
     }
 
@@ -57,6 +89,7 @@ impl EnvironmentInfo {
                 .unwrap_or_else(|_| ".".into()),
             date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
             home: dirs::home_dir().map(|p| p.display().to_string()),
+            sandbox_profile: None,
         }
     }
 }
@@ -100,13 +133,17 @@ impl PromptBuilder {
             base_instructions: vec![
                 "You are Grodex, an AI coding agent. You help users write, understand, and modify code.".into(),
                 // Tool-first execution: always act, don't narrate.
-                "When a user asks you to read, write, edit files or run commands, you MUST use the available tools (read_file, write_file, edit_file, exec, apply_patch, grep, glob) to accomplish the task. Do not just say you will do it — actually call the tool. Do not describe your plan and then stop — execute it immediately.".into(),
+                "When a user asks you to read, write, edit files or run commands, you MUST use the available tools listed in the Available Tools section to accomplish the task — pick the tool whose description matches the need. Do not just say you will do it — actually call the tool. Do not describe your plan and then stop — execute it immediately.".into(),
                 // Autonomous continuation: never stop mid-task.
                 "Work autonomously: once the user gives a task, carry it through to completion. Do NOT stop after each sub-step to ask \"should I proceed?\", \"shall I fix this?\", or \"want me to continue?\" — just keep going. Only stop when (a) the ENTIRE task is fully done and verified, or (b) you are genuinely blocked (missing information, ambiguous requirement, or need a decision only the user can make).".into(),
                 // CRITICAL: distinguish user-requested work from model-proposed optional actions.
-                "When YOU propose an optional action and ask the user for confirmation (e.g. \"要不要我把…\", \"shall I…\", \"do you want me to…\", \"是否需要…\"), you MUST STOP and wait for their explicit response. Do NOT auto-execute your own proposed actions in a subsequent step — the proposal is a question, not a self-authorization. This does NOT apply to work the user directly requested: for direct requests, execute immediately without asking.".into(),
+                "When YOU propose an optional action and ask the user for confirmation (e.g. \"要不要我把…\", \"shall I…\", \"do you want me to…\", \"是否需要…\"), you MUST STOP and wait for their explicit response. Do NOT auto-execute your own proposed actions in a subsequent step — the proposal is a question, not a self-authorization. PRECEDENCE: this stop-for-confirmation rule OVERRIDES the work-autonomously rule above — autonomous continuation applies to work the user directly requested, never to actions you merely proposed yourself.".into(),
                 // Conciseness applies to EXPLANATIONS, not to work effort.
                 "Be concise in your text explanations. Let tool results speak for themselves. But never let conciseness cause you to stop working early — finish every task completely.".into(),
+                // Runtime notes convention: continuation/repair notes arrive
+                // as user-role messages wrapped in [System: ...]. Declare the
+                // convention so the model knows to obey them.
+                "Messages from the user that begin with the literal token [System: ...] are runtime control notes injected by the agent harness, not human input. Follow their instructions exactly.".into(),
             ],
             skills: SkillCatalog::default(),
             tool_registry: ToolRegistry::builtin(),
@@ -228,8 +265,22 @@ impl PromptBuilder {
         };
 
         // Look for AGENTS.md in cwd.
+        // Dedup: discovery ALSO loads AGENTS.md files from the workspace
+        // chain — if a discovered node came from this same file, skipping
+        // it here avoids a double copy in `prompt explain` output.
         let agents_md = cwd.join("AGENTS.md");
-        if agents_md.exists() {
+        let already_discovered = agents_md.exists()
+            && std::fs::canonicalize(&agents_md).ok().map(|c| c.as_path().to_path_buf())
+                .map(|canon| {
+                    self.discovered_nodes.iter().any(|n| {
+                        std::fs::canonicalize(&n.source_uri)
+                            .ok()
+                            .map(|s| s == canon)
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+        if agents_md.exists() && !already_discovered {
             if let Ok(content) = std::fs::read_to_string(&agents_md) {
                 self.project_rules.push((content, trust));
             }
@@ -307,18 +358,37 @@ impl PromptBuilder {
         }
 
         // 4. Environment info (Zone A).
+        // Honest-worldview fix: <vcs> previously hardcoded branch="unknown"
+        // dirty="unknown" and <sandbox> hardcoded profile="default"
+        // regardless of reality. Query git when the cwd is a repo; omit the
+        // sandbox tag entirely when no profile is known (an absent tag
+        // cannot lie).
         let env = &self.env_info;
         let home_tag = match &env.home {
             Some(h) => format!("<home>{}</home>", xml_escape(h)),
             None => "<home />".to_string(),
         };
+        let vcs_tag = match detect_git_state(&env.cwd) {
+            Some((branch, dirty)) => format!(
+                "<vcs branch=\"{}\" dirty=\"{}\" />",
+                xml_escape(&branch),
+                dirty
+            ),
+            None => String::new(),
+        };
+        let sandbox_tag = match &self.env_info.sandbox_profile {
+            Some(p) => format!("<sandbox profile=\"{}\" />", xml_escape(p)),
+            None => String::new(),
+        };
         let env_content = format!(
-            "<environment_context version=\"2\">\n  <os>{}</os>\n  <shell>{}</shell>\n  <cwd>{}</cwd>\n  {}\n  <date timezone=\"UTC\">{}</date>\n  <vcs branch=\"unknown\" dirty=\"unknown\" />\n  <sandbox profile=\"default\" />\n</environment_context>",
+            "<environment_context version=\"2\">\n  <os>{}</os>\n  <shell>{}</shell>\n  <cwd>{}</cwd>\n  {}\n  <date timezone=\"UTC\">{}</date>\n  {}{}\n</environment_context>",
             xml_escape(&env.os),
             xml_escape(&env.shell),
             xml_escape(&env.cwd),
             home_tag,
             xml_escape(&env.date),
+            vcs_tag,
+            sandbox_tag,
         );
         nodes.push(InstructionNode::new(
             "environment",
@@ -345,6 +415,51 @@ impl PromptBuilder {
 
         // 6. Discovered instructions (managed/user-global/path-rule from §7 discovery).
         nodes.extend(self.discovered_nodes.clone());
+
+        // ── Global size budget (Doc 19 fix) ─────────────────────────
+        // Per-file cap is 256KiB but the FILE COUNT is unbounded across
+        // the workspace chain, user-global rules and compat vendors, and
+        // len/4 under-counts CJK by ~2x. Estimate with CJK awareness and
+        // drop LOWEST-authority nodes first (path-rules, project rules,
+        // user-global) until under budget. Base/managed/runtime nodes are
+        // never trimmed; a warning node is appended when trimming fired so
+        // the model knows instructions may be incomplete.
+        let budget = std::env::var("GRODEX_PROMPT_BUDGET_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40_000u64);
+        let total: u64 = nodes.iter().map(|n| estimate_tokens_cjk(&n.content)).sum();
+        if total > budget {
+            let mut over = total - budget;
+            nodes.retain(|n| {
+                if over == 0 || n.authority.0 >= 80 {
+                    return true;
+                }
+                let est = estimate_tokens_cjk(&n.content);
+                if est <= over {
+                    over -= est;
+                    false
+                } else {
+                    true
+                }
+            });
+            eprintln!(
+                "[prompt] budget {budget} tokens exceeded ({total}) — lowest-authority instruction nodes trimmed"
+            );
+            nodes.push(InstructionNode::new(
+                "budget_warning",
+                InstructionKind::Base,
+                InstructionScope::Session,
+                "builtin://budget_warning",
+                format!(
+                    "[System: The system prompt exceeded its token budget ({total} estimated tokens). \
+                     Lower-priority instruction files were omitted. Key rules may be missing — \
+                     rely on the instructions you CAN see, and ask the user if a rule you need seems absent.]"
+                ),
+                TrustState::Trusted,
+                config_gen,
+            ));
+        }
 
         // Use from_nodes_with_zones if Zone C or D content is present,
         // otherwise fall back to the simpler from_nodes.
@@ -483,4 +598,24 @@ mod tests {
 
         assert!(!manifest.content.contains("Dangerous untrusted rule"), "untrusted content must not appear");
     }
+}
+
+/// CJK-aware token estimate: ASCII ≈ 1 token per 4 chars (chars/4
+/// under-counts CJK by ~2x — each CJK char consumes ~1 token, not 0.25).
+fn estimate_tokens_cjk(text: &str) -> u64 {
+    let mut other = 0u64;
+    let mut cjk = 0u64;
+    for ch in text.chars() {
+        let cp = ch as u32;
+        if (0x2E80..=0x9FFF).contains(&cp)
+            || (0xF900..=0xFAFF).contains(&cp)
+            || (0xFF00..=0xFFEF).contains(&cp)
+            || (0x30000..=0x3134F).contains(&cp)
+        {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    other / 4 + cjk
 }

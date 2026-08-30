@@ -8,6 +8,7 @@ use crate::chat_state::ChatStateHandle;
 use crate::command::{SessionCommand, SessionEvent};
 use crate::reducer::SessionReducer;
 use crate::rollout_writer::RolloutWriter;
+use grodex_rollout::event::RolloutEventType;
 use crate::session::Session;
 use crate::step::TurnOutcome;
 use crate::turn::TurnContext;
@@ -209,6 +210,11 @@ pub struct SessionSupervisor {
     /// to the new session's journal as a `ContextRestored` event at startup
     /// so a second crash does not lose the recovered history.
     recovered_context: Option<Vec<grodex_core::context::ContextItem>>,
+    /// SessionStarted/ContextRestored 是否已写入 journal（惰性：首轮对话才写，
+    /// 空会话不在磁盘留任何 journal 内容）。
+    session_start_written: bool,
+    /// recovered_context 尚未落盘（随首个 turn 的 SessionStarted 一起写）。
+    recovered_context_pending: bool,
     /// Model configuration for Turn creation.
     model_config: ModelConfig,
     /// Optional memory database for RAG context injection (SQLite + FTS5).
@@ -304,6 +310,8 @@ impl SessionSupervisor {
             completion_tx,
             writer,
             recovered_context,
+            session_start_written: false,
+            recovered_context_pending: false,
             memory,
             embedding,
             model_config,
@@ -346,21 +354,6 @@ impl SessionSupervisor {
             return;
         }
 
-        // ── Telemetry anchor: SessionStarted (durable) ────────────────
-        // Gives the telemetry projection its `sessions.started_at`. On a
-        // fresh session this is the first journal entry; on a resumed
-        // session (writer rebound to the old journal) it re-anchors the
-        // resumed session id. Cwd is stored raw in the journal (the
-        // telemetry projection keeps only its hash).
-        if let Some(ref writer) = self.writer {
-            let details = serde_json::json!({
-                "cwd": self.cwd.to_string_lossy(),
-                "model_provider": self.model_config.provider,
-                "model": self.model_config.model,
-            });
-            let _ = writer.write_session_started(&details).await;
-        }
-
         // ── Crash recovery: replay the journal into the live transcript ──
         // On startup, if a rollout exists for this session we fold it back
         // into the ChatStateActor so a restarted session continues from
@@ -374,9 +367,11 @@ impl SessionSupervisor {
                     // Continue the writer's seq after replay so new events
                     // don't collide with replayed ones.
                     writer.resume_from(seq_count);
+                    // Informational, not an Error — a successful recovery is
+                    // the expected resume path, not a failure.
                     let _ = self.event_tx
-                        .send(SessionEvent::Error {
-                            message: format!("recovered session from journal ({} events)", seq_count),
+                        .send(SessionEvent::Info {
+                            message: format!("已从 journal 恢复会话（{seq_count} 条事件）"),
                         })
                         .await;
                 }
@@ -398,18 +393,14 @@ impl SessionSupervisor {
         // lose the recovered history. This is a no-op for fresh sessions
         // (recovered_context is None) and for sessions that already have a
         // journal (the items were already replayed above).
-        if let (Some(writer), Some(items)) = (&self.writer, &self.recovered_context) {
+        if let Some(items) = &self.recovered_context {
             if !items.is_empty() {
                 // Inject into the live chat state so the first sampling step
-                // sees the restored transcript.
+                // sees the restored transcript. The journal write is DEFERRED
+                // to the first turn (empty-session hygiene: a session with no
+                // conversation leaves nothing on disk).
                 self.chat_state.replace_conversation(items.clone(), false).await;
-                if let Err(e) = writer.write_context_restored(items).await {
-                    let _ = self.event_tx
-                        .send(SessionEvent::Error {
-                            message: format!("failed to persist recovered context: {e}"),
-                        })
-                        .await;
-                }
+                self.recovered_context_pending = true;
             }
         }
 
@@ -544,6 +535,7 @@ impl SessionSupervisor {
                     .pending_ticket_info(&ticket_id);
                 let call_id = pending.as_ref().and_then(|p| p.call_id.as_deref());
                 let tool_name = pending.as_ref().and_then(|p| p.tool_name.as_deref());
+                let pending_args = pending.as_ref().and_then(|p| p.args.clone());
 
                 // (2) Persist ApprovalResolved to journal BEFORE
                 // calling resolve() — if we crash between the broker
@@ -584,18 +576,24 @@ impl SessionSupervisor {
                     }
                 }
 
-                // "Always allow": mint a session-level grant keyed to this
-                // tool so later `PermissionManager::check()` calls hit the
-                // grant fast-path instead of re-prompting. Doc 10 §20.12.
+                // "Always allow": mint a session-level grant keyed to the
+                // PRECISE call shape (doc 10 §20.12 / doc 16 §15) —
+                // tool + path / command_prefix / host constraints — so
+                // approving one narrow command does not grant the whole
+                // tool for the session.
                 if always_allow && accepted {
                     if let Some(tool_name) = tool_name {
+                        let matcher = grodex_permission::compiler::always_allow_matcher_for(
+                            tool_name,
+                            pending_args.as_ref().unwrap_or(&serde_json::Value::Null),
+                        );
                         let generation = self.permission.lock().await.revocation_epoch();
                         let grant = grodex_permission::session_grant::SessionPolicyGrant {
                             grant_id: format!("grant_{ticket_id}"),
                             origin_approval_id: ticket_id.clone(),
                             subject_id: "user".into(),
                             capability_id: tool_name.to_string(),
-                            normalized_operation_matcher: format!("tool={tool_name}"),
+                            normalized_operation_matcher: matcher.clone(),
                             normalized_resource_or_command_matcher: None,
                             ceiling_hash: format!("policy_gen:{generation}"),
                             policy_generation_created: generation,
@@ -604,8 +602,20 @@ impl SessionSupervisor {
                             max_uses: None,
                             revoked_at: None,
                         };
+                        // Durable (doc 16 §15): the grant survives a restart
+                        // via journal replay.
+                        if let Some(ref writer) = self.writer {
+                            let _ = writer
+                                .write_session_grant_created(
+                                    grant.grant_id.as_str(),
+                                    tool_name,
+                                    matcher.as_str(),
+                                    generation,
+                                )
+                                .await;
+                        }
                         self.permission.lock().await.add_session_grant(grant);
-                        tracing::info!(ticket_id = %ticket_id, tool = %tool_name, "session grant minted (always allow)");
+                        tracing::info!(ticket_id = %ticket_id, tool = %tool_name, matcher = %matcher, "session grant minted (always allow)");
                     }
                 }
 
@@ -717,15 +727,22 @@ impl SessionSupervisor {
                     // readers (chat state, diagnostics) report the
                     // resumed id rather than the transient new one.
                     self.session.id = new_session_id;
-                    // Telemetry anchor for the resumed session id (the
-                    // boot-time SessionStarted went to the ephemeral
-                    // empty journal, not this rebound one).
-                    let details = serde_json::json!({
-                        "cwd": self.cwd.to_string_lossy(),
-                        "model_provider": self.model_config.provider,
-                        "model": self.model_config.model,
-                    });
-                    let _ = w.write_session_started(&details).await;
+                    // Lazy SessionStarted: the rebound (resumed) journal may
+                    // already contain one from the previous process. Scan and
+                    // arm the flag accordingly — the FIRST TURN writes the
+                    // anchor if the journal lacks it.
+                    let has_start = w
+                        .store()
+                        .replay_from(0)
+                        .await
+                        .map(|evs| {
+                            evs.iter().any(|e| {
+                                matches!(e.event_type, grodex_rollout::event::RolloutEventType::SessionStarted)
+                            })
+                        })
+                        .unwrap_or(false);
+                    self.session_start_written = has_start;
+                    self.recovered_context_pending = false;
                 }
                 // Internal diagnostic — use tracing, NOT SessionEvent::Info
                 // which would leak session_id/next_seq to the user.
@@ -1139,6 +1156,28 @@ impl SessionSupervisor {
 
         let _ = self.event_tx.send(SessionEvent::TurnStarted { turn_id }).await;
 
+        // Lazy session anchors (empty-session hygiene): SessionStarted +
+        // ContextRestored are written on the FIRST turn — a session that
+        // never had a conversation leaves nothing in its journal.
+        if !self.session_start_written {
+            if let Some(ref writer) = self.writer {
+                let details = serde_json::json!({
+                    "cwd": self.cwd.to_string_lossy(),
+                    "model_provider": self.model_config.provider,
+                    "model": self.model_config.model,
+                });
+                let _ = writer.write_session_started(&details).await;
+                if self.recovered_context_pending {
+                    if let Some(items) = &self.recovered_context {
+                        if let Err(e) = writer.write_context_restored(items).await {
+                            tracing::warn!("failed to persist recovered context: {e}");
+                        }
+                    }
+                }
+                self.session_start_written = true;
+            }
+        }
+
         // Write rollout event.
         if let Some(ref writer) = self.writer {
             if let Err(e) = writer.write_user_input(turn_id, &user_input_for_memory).await {
@@ -1481,6 +1520,40 @@ impl SessionSupervisor {
             self.chat_state.replace_conversation(rebuilt, false).await;
         }
 
+        // Doc 16 §15: session grants survive a restart — re-mint every
+        // SessionGrantCreated found in the journal (add_session_grant is
+        // idempotent by grant_id).
+        for ev in events.iter().filter(|e| matches!(e.event_type, RolloutEventType::SessionGrantCreated)) {
+            let (Some(gid), Some(tool), Some(matcher)) = (
+                ev.payload.get("grant_id").and_then(|v| v.as_str()),
+                ev.payload.get("tool_name").and_then(|v| v.as_str()),
+                ev.payload.get("matcher").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let generation = ev
+                .payload
+                .get("policy_generation")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let grant = grodex_permission::session_grant::SessionPolicyGrant {
+                grant_id: gid.to_string(),
+                origin_approval_id: gid.to_string(),
+                subject_id: "user".into(),
+                capability_id: tool.to_string(),
+                normalized_operation_matcher: matcher.to_string(),
+                normalized_resource_or_command_matcher: None,
+                ceiling_hash: format!("policy_gen:{generation}"),
+                policy_generation_created: generation,
+                created_at: chrono::Utc::now(),
+                expires_at: None,
+                max_uses: None,
+                revoked_at: None,
+            };
+            self.permission.lock().await.add_session_grant(grant);
+        }
+        tracing::debug!("journal replay: session grants re-minted");
+
         Ok(Some(events.len() as u64))
     }
 
@@ -1586,6 +1659,30 @@ impl SessionSupervisor {
 
     async fn shutdown(&mut self) {
         self.cancel_turn().await;
+        // Empty-session cleanup: a session that never recorded a single
+        // journal event (no conversation happened) leaves only scaffolding
+        // on disk (empty journal + approval db) — remove the whole session
+        // directory. Journals WITH events are never touched here.
+        if let Some(writer) = &self.writer {
+            let empty = writer
+                .store()
+                .replay_from(0)
+                .await
+                .map(|evs| evs.is_empty())
+                .unwrap_or(false);
+            if empty {
+                if let Some(dir) = writer.store().session_dir_path() {
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => {
+                            tracing::info!(target: "grodex_session", dir = %dir.display(), "removed empty session directory");
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "grodex_session", dir = %dir.display(), error = %e, "empty session cleanup failed (ignored)");
+                        }
+                    }
+                }
+            }
+        }
         // Doc 11 §22: reclaim this session's offloaded tool-result blobs
         // (revoke owner refs + GC) instead of leaking them on disk.
         self.coordinator

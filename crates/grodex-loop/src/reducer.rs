@@ -133,6 +133,18 @@ impl SessionReducer {
                     };
                 }
             }
+            RolloutEventType::PromptInjected => {
+                // Ephemeral steering notes (repair / length-continuation)
+                // are synthetic user-role messages: journal them so a
+                // replayed context matches the live one exactly, but flag
+                // them so the UI/projection can tell them from real input.
+                if let Some(content) = event.payload.get("content").and_then(|v| v.as_str()) {
+                    self.context.push(ContextItem::User {
+                        content: content.to_string(),
+                        message_id: None,
+                    });
+                }
+            }
             RolloutEventType::UserInputAccepted => {
                 if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
                     self.context.push(ContextItem::User {
@@ -625,6 +637,33 @@ mod tests {
         assert_eq!(ctx.len(), 2);
         assert!(matches!(ctx[0], ContextItem::User { .. }));
         assert!(matches!(ctx[1], ContextItem::Assistant { .. }));
+    }
+
+    /// R 修复回归：repair/continuation 注入提示必须随 journal 重建，
+    /// 否则 resume 后 live 上下文与 replay 上下文发散。
+    #[test]
+    fn prompt_injected_rebuilds_as_user_item() {
+        let sid = SessionId::new();
+        let mut reducer = SessionReducer::new(sid);
+        reducer
+            .apply_all(&[
+                make_event(sid, 0, RolloutEventType::RuntimeStateChanged, serde_json::json!({"state": "idle"})),
+                make_event(sid, 1, RolloutEventType::UserInputAccepted, serde_json::json!({"text": "do work"})),
+                make_event(sid, 2, RolloutEventType::ModelItemProduced, serde_json::json!({"assistant_text": "I will check next."})),
+                make_event(sid, 3, RolloutEventType::PromptInjected, serde_json::json!({
+                    "note_kind": "repair",
+                    "role": "user",
+                    "content": "[System: You stopped without calling a tool.]"
+                })),
+                make_event(sid, 4, RolloutEventType::ModelItemProduced, serde_json::json!({"assistant_text": "Done."})),
+            ])
+            .expect("clean replay with injected note");
+        let ctx = reducer.finish();
+        assert_eq!(ctx.len(), 4, "user + assistant + injected note + assistant");
+        assert!(
+            matches!(&ctx[2], grodex_core::context::ContextItem::User { content, .. } if content.contains("[System:")),
+            "injected note must restore as a user-role item"
+        );
     }
 
     #[test]
