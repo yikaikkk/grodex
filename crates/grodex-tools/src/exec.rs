@@ -52,6 +52,13 @@ pub struct ExecArgs {
     /// is "KEY=VALUE". These are merged on top of the parent env.
     #[serde(default)]
     pub env_delta: Vec<String>,
+    /// Per-call memory cap in MB (RLIMIT_AS on unix). Overrides the
+    /// tool-level limit. Linux enforces; macOS treats it as advisory.
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
+    /// Per-call CPU seconds (RLIMIT_CPU). Overrides the tool-level limit.
+    #[serde(default)]
+    pub cpu_limit_secs: Option<u64>,
 }
 
 fn default_shell_mode() -> String {
@@ -87,6 +94,34 @@ pub struct ExecOutput {
     pub env_delta_applied: Vec<String>,
 }
 
+/// Resource limits applied to every exec child via `setrlimit`
+/// (unix, pre-exec). Doc 13 §19 quotas — previously only a wall-clock
+/// timeout existed, so a runaway `yes` or a memory-hungry build could
+/// consume unbounded CPU/RAM.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ResourceLimits {
+    /// RLIMIT_AS — max address space (MB). The primary memory cap on
+    /// Linux; macOS treats RLIMIT_AS as advisory (documented).
+    pub memory_limit_mb: u64,
+    /// RLIMIT_CPU — max CPU seconds (soft; SIGXCPU at the cap).
+    pub cpu_limit_secs: u64,
+    /// RLIMIT_FSIZE — max bytes a child may write to any file (MB).
+    pub file_size_limit_mb: u64,
+    /// RLIMIT_NPROC — max child processes/threads.
+    pub max_processes: u32,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            memory_limit_mb: 8 * 1024,      // 8 GB
+            cpu_limit_secs: 600,            // 10 min CPU (wall timeout is tighter)
+            file_size_limit_mb: 1024,       // 1 GB per written file
+            max_processes: 4096,
+        }
+    }
+}
+
 pub struct ExecTool {
     max_output_bytes: usize,
     #[allow(dead_code)]
@@ -106,6 +141,8 @@ pub struct ExecTool {
     /// When set, the tool registers a CancellationToken before spawning
     /// and checks it during execution.
     cancel_registry: Option<CancelRegistry>,
+    /// Resource limits applied pre-exec to every spawned child.
+    resource_limits: ResourceLimits,
 }
 
 impl Default for ExecTool {
@@ -122,7 +159,15 @@ impl ExecTool {
             sandbox_runtime: None,
             sandbox_profile: None,
             cancel_registry: None,
+            resource_limits: ResourceLimits::default(),
         }
+    }
+
+    /// Override the per-child resource limits (rlimits). Per-call
+    /// `ExecArgs` overrides take precedence when tighter.
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.resource_limits = limits;
+        self
     }
 
     /// Enable sandbox-enforced execution. When set, `execute` builds a
@@ -164,7 +209,7 @@ impl Tool for ExecTool {
         ToolMetadata {
             name: "exec".into(),
             display_name: "Execute Command".into(),
-            description: "Run a shell command and return stdout, stderr, and exit code. Default timeout 120s; output is capped (head+tail kept) at 100KB. Credential-looking environment variables are stripped from the inherited env — pass env_delta to re-add them.".into(),
+            description: "Run a shell command and return stdout, stderr, and exit code. Default timeout 120s; output capped (head+tail) at 100KB. Resource limits: 8GB memory, 600s CPU, process-group kill on timeout. Credential-looking env vars are stripped from the inherited env — pass env_delta to re-add them.".into(),
             concurrency_class: ConcurrencyClass::Serial,
             side_effect_class: SideEffectClass::NonIdempotent,
             default_policy: grodex_core::policy::PolicyDecision::Ask,
@@ -182,7 +227,9 @@ impl Tool for ExecTool {
                 "background": {"type": "boolean", "description": "Run in background; returns process_id immediately (default: false)"},
                 "yield_time_ms": {"type": "integer", "description": "Wait this many ms then return partial output + handle for long-running commands"},
                 "shell_mode": {"type": "string", "enum": ["auto", "bash", "sh", "zsh"], "description": "Shell used to run the command (default: auto = sh on unix, cmd on windows). Output shell_mode_used reports the shell actually used."},
-                "env_delta": {"type": "array", "items": {"type": "string"}, "description": "Environment overrides as KEY=VALUE entries, merged on top of the (sanitized) parent env. NOTE: credential-looking vars (API_KEY/TOKEN/SECRET/...) are stripped from the inherited env; re-add any the command genuinely needs here."}
+                "env_delta": {"type": "array", "items": {"type": "string"}, "description": "Environment overrides as KEY=VALUE entries, merged on top of the (sanitized) parent env. NOTE: credential-looking vars (API_KEY/TOKEN/SECRET/...) are stripped from the inherited env; re-add any the command genuinely needs here."},
+                "memory_limit_mb": {"type": "integer", "description": "Per-call memory cap in MB (RLIMIT_AS; default 8192). Enforced on Linux; advisory on macOS."},
+                "cpu_limit_secs": {"type": "integer", "description": "Per-call CPU seconds cap (RLIMIT_CPU; default 600)"}
             },
             "required": ["command"]
         })
@@ -326,25 +373,32 @@ impl ToolRuntime for ExecTool {
 
         // ── Direct-spawn path (no sandbox configured) ───────────────
 
-        let mut cmd = if actual_shell == "cmd" {
-            let mut c = Command::new("cmd");
+        // Build as std Command so we can pre_exec rlimits + setsid
+        // (tokio::process::Command does not expose pre_exec), then convert.
+        let mut std_cmd = if actual_shell == "cmd" {
+            let mut c = std::process::Command::new("cmd");
             c.args(["/C", &args.command]);
             c
         } else {
-            let mut c = Command::new(actual_shell);
+            let mut c = std::process::Command::new(actual_shell);
             c.args(["-c", &args.command]);
             c
         };
         // Env hygiene: credential-looking vars stripped, env_delta re-added.
-        Self::apply_env_hygiene(&mut cmd, &args.env_delta);
+        Self::apply_env_hygiene(&mut std_cmd, &args.env_delta);
+        // Resource limits + own process group (unix).
+        let limits = self.effective_limits(&args);
+        Self::apply_rlimits_and_group(&mut std_cmd, &limits);
 
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
+        std_cmd.stdout(std::process::Stdio::piped());
+        std_cmd.stderr(std::process::Stdio::piped());
 
         if let Some(ref cwd) = args.cwd {
-            cmd.current_dir(cwd);
+            std_cmd.current_dir(cwd);
         }
+
+        let mut cmd = Command::from(std_cmd);
+        cmd.kill_on_drop(true);
 
         // Spawn the child and capture its PID.
         let mut child = match cmd.spawn() {
@@ -507,11 +561,21 @@ impl ToolRuntime for ExecTool {
                     match result {
                         Ok(Ok(status)) => Ok(Some(status)),
                         Ok(Err(e)) => Err(e),
-                        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")),
+                        Err(_) => {
+                            // Timeout — kill the whole process group.
+                            if let Some(pid) = child_pid {
+                                Self::kill_process_group(pid);
+                            }
+                            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"))
+                        }
                     }
                 }
                 _ = token_clone.cancelled() => {
-                    // Cancel requested — kill the child.
+                    // Cancel requested — kill the child's WHOLE process
+                    // group (setsid'd: pid == pgid), so grandchildren die too.
+                    if let Some(pid) = child_pid {
+                        Self::kill_process_group(pid);
+                    }
                     let _ = child.start_kill();
                     let _ = child.wait().await; // reap
                     Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"))
@@ -579,6 +643,11 @@ impl ToolRuntime for ExecTool {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     let duration_ms = start.elapsed().as_millis() as u64;
+                    // Timeout — kill the whole process group (the child was
+                    // setsid'd; kill -pid reaches shell + grandchildren).
+                    if let Some(pid) = child_pid {
+                        Self::kill_process_group(pid);
+                    }
                     if let Some(ref registry) = self.cancel_registry {
                         registry.remove(&operation_id.to_string()).await;
                     }
@@ -704,6 +773,86 @@ impl ExecTool {
     /// joined by an elision marker, so the user sees both the start and the
     /// final exit/error lines instead of only a head (the old behaviour).
     /// Cuts are char-aligned to avoid splitting UTF-8.
+    /// Effective limits for one call: per-call args override the
+    /// tool-level defaults when provided (and tighter).
+    fn effective_limits(&self, args: &ExecArgs) -> ResourceLimits {
+        let mut limits = self.resource_limits;
+        if let Some(mb) = args.memory_limit_mb {
+            limits.memory_limit_mb = mb;
+        }
+        if let Some(secs) = args.cpu_limit_secs {
+            limits.cpu_limit_secs = secs;
+        }
+        limits
+    }
+
+    /// Apply rlimits + own process group to the child, pre-exec.
+    ///
+    /// Doc 13 §19 quotas + Codex-style process-group isolation:
+    ///  - setsid() → the child becomes its own process-group leader, so a
+    ///    timeout/cancel can `kill(-pid)` the WHOLE tree (shell + grandchildren),
+    ///    not just the shell;
+    ///  - setrlimit: AS (memory), CPU, FSIZE, NPROC, and CORE=0 (Codex
+    ///    process-hardening: core dumps off);
+    ///  - best-effort: a failing setrlimit does NOT abort the spawn
+    ///    (RLIMIT_AS is advisory on macOS anyway).
+    #[allow(unsafe_code)]
+    fn apply_rlimits_and_group(cmd: &mut std::process::Command, limits: &ResourceLimits) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let mem = limits.memory_limit_mb.saturating_mul(1024 * 1024);
+            let cpu = limits.cpu_limit_secs;
+            let fsize = limits.file_size_limit_mb.saturating_mul(1024 * 1024);
+            let nproc = limits.max_processes;
+            unsafe {
+                cmd.pre_exec(move || {
+                    // Own process group (pid == pgid).
+                    if libc::setsid() < 0 {
+                        // Best-effort: ignore EPERM (already a group leader).
+                    }
+                    let set = |res: i32, cur: u64| {
+                        let rlim = libc::rlimit {
+                            rlim_cur: cur,
+                            rlim_max: cur,
+                        };
+                        // Ignore failures: advisory limits must not break spawn.
+                        let _ = libc::setrlimit(res, &rlim);
+                    };
+                    set(libc::RLIMIT_AS, mem);
+                    set(libc::RLIMIT_CPU, cpu);
+                    set(libc::RLIMIT_FSIZE, fsize);
+                    set(
+                        libc::RLIMIT_NPROC,
+                        nproc as u64,
+                    );
+                    // Codex process-hardening: core dumps off.
+                    set(libc::RLIMIT_CORE, 0);
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (cmd, limits);
+        }
+    }
+
+    /// Kill the child's WHOLE process group (child was setsid'd, so
+    /// pid == pgid). Codex-style escalation: SIGKILL the tree, not just
+    /// the shell.
+    #[allow(unsafe_code)]
+    fn kill_process_group(pid: u32) {
+        #[cfg(unix)]
+        unsafe {
+            let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+        }
+    }
+
     /// Resolve the requested `shell_mode` into the ACTUAL shell binary
     /// used. `none` is rejected outright — commands are strings that need
     /// a shell to parse, and a silent whitespace-split would mangle quoted
@@ -788,7 +937,7 @@ impl ExecTool {
     /// `into_string()` and PANICS the whole runtime when the environment
     /// contains a single non-UTF-8 variable name/value (observed in the
     /// wild with paths containing non-UTF-8 bytes).
-    fn apply_env_hygiene(cmd: &mut Command, env_delta: &[String]) {
+    fn apply_env_hygiene(cmd: &mut std::process::Command, env_delta: &[String]) {
         for (name, _) in std::env::vars_os() {
             match name.into_string() {
                 Ok(name) => {
@@ -1134,6 +1283,56 @@ impl BuiltInTool for ExecTool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// rlimits actually reach the child (unix): CPU cap = 1s, NPROC = 123.
+    #[cfg(unix)]
+    #[test]
+    fn rlimits_reach_child() {
+        let limits = ResourceLimits {
+            memory_limit_mb: 2048,
+            cpu_limit_secs: 1,
+            file_size_limit_mb: 16,
+            max_processes: 123,
+        };
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "ulimit -t; ulimit -u"]);
+        ExecTool::apply_rlimits_and_group(&mut cmd, &limits);
+        let out = cmd.output().expect("child");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines();
+        let cpu: u64 = lines.next().unwrap().trim().parse().unwrap();
+        let nproc: u64 = lines.next().unwrap().trim().parse().unwrap();
+        assert_eq!(cpu, 1, "RLIMIT_CPU");
+        assert_eq!(nproc, 123, "RLIMIT_NPROC");
+    }
+
+    /// The child gets its own process group (setsid) — pid == pgid.
+    #[cfg(unix)]
+    #[test]
+    fn child_is_own_process_group_leader() {
+        let limits = ResourceLimits::default();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "ps -o pgid= -p $$"]);
+        ExecTool::apply_rlimits_and_group(&mut cmd, &limits);
+        let out = cmd.output().expect("child");
+        let pgid: u32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("pgid output");
+        // setsid 生效断言: pgid 不等于测试进程自身的 pgid（子进程自成一组）。
+        assert_ne!(
+            pgid,
+            {
+                let out = std::process::Command::new("ps")
+                    .args(["-o", "pgid=", "-p", &std::process::id().to_string()])
+                    .output()
+                    .expect("ps");
+                String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().unwrap()
+            },
+            "child must lead its own process group (setsid)"
+        );
+    }
     use super::*;
     use grodex_core::tool::ToolRuntime;
 

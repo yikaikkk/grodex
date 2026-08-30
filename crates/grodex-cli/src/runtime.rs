@@ -652,9 +652,37 @@ impl SessionRuntimeBuilder {
         // client + effective profile so `sh -c <cmd>` runs under
         // kernel-enforced deny/network rules. Otherwise register the plain
         // direct-spawn tool (back-compat).
+        // Exec resource limits (doc 13 §19): config-overridable defaults,
+        // per-call ExecArgs overrides take precedence.
+        let mut exec_limits = grodex_tools::exec::ResourceLimits::default();
+        if let Some(v) = cfg
+            .get("exec_memory_limit_mb")
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+        {
+            exec_limits.memory_limit_mb = v as u64;
+        }
+        if let Some(v) = cfg
+            .get("exec_cpu_limit_secs")
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+        {
+            exec_limits.cpu_limit_secs = v as u64;
+        }
+        if let Some(v) = cfg
+            .get("exec_file_size_limit_mb")
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+        {
+            exec_limits.file_size_limit_mb = v as u64;
+        }
         let exec_tool = match exec_sandbox.take() {
-            Some((client, profile)) => ExecTool::new().with_sandbox_runtime(client, profile),
-            None => ExecTool::new(),
+            Some((client, profile)) => {
+                ExecTool::new()
+                    .with_sandbox_runtime(client, profile)
+                    .with_resource_limits(exec_limits)
+            }
+            None => ExecTool::new().with_resource_limits(exec_limits),
         };
         register_builtin(&coordinator, exec_tool).await;
         register_builtin(&coordinator, ApplyPatchTool::new()).await;

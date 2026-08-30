@@ -47,7 +47,7 @@ pub use common::{
     ToolResultEnvelope, ToolStatus, TruncationInfo, TruncationStrategy,
 };
 pub use edit::EditTool;
-pub use exec::ExecTool;
+pub use exec::{ExecTool, ResourceLimits};
 pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
 pub use load_skill::{LoadSkillTool, SharedSkillCatalog};

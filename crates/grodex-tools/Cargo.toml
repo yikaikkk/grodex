@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Built-in tools (Read, Write, Edit, Exec) for Grodex"
 
 [dependencies]
+libc = "0.2"
 reqwest.workspace = true
 
 grodex-core.workspace = true

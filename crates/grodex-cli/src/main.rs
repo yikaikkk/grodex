@@ -1035,10 +1035,19 @@ async fn route_command(
             // next_seq = last_seq + 1 so the actor's counter starts
             // where the old journal left off (see JournalHandle::start).
             use grodex_rollout::FsyncPolicy;
+            // Seed fix: an EMPTY journal (no conversation yet) must resume
+            // with next_seq = 0 — seeding last_seq+1 = 1 made the first
+            // appended event start at seq 1, permanently breaking the
+            // journal's gap-free-from-0 invariant.
+            let seed_seq = if full_journal.is_empty() {
+                0
+            } else {
+                last_seq.saturating_add(1)
+            };
             let writable_store = match FileRolloutStore::new(
                 &base_dir,
                 &resume_sid.to_string(),
-                last_seq.saturating_add(1),
+                seed_seq,
                 FsyncPolicy::default(),
             ).await {
                 Ok(s) => s,
@@ -1058,7 +1067,7 @@ async fn route_command(
                 .send(SessionCommand::RebindRolloutWriter {
                     new_store: resume_store_arc,
                     new_session_id: resume_sid,
-                    next_seq: last_seq + 1,
+                    next_seq: seed_seq,
                 })
                 .await
             {

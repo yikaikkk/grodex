@@ -572,9 +572,19 @@ pub fn replay_journal_lean(
                 payload: serde_json::json!({ "items": [] }),
                 sensitivity: hdr.sensitivity.unwrap_or(SensitivityLevel::Normal),
             };
-            reducer
-                .apply(&ev)
-                .map_err(|e| GrodexError::Internal(anyhow::anyhow!("{e}")))?;
+            // First event re-baseline (mirrors apply_all leniency): some
+            // journals start at seq 1 (resume of an empty journal seeded
+            // next_seq=1 then wrote an anchor). Without this, resume fails
+            // with "missing event seq: expected 0, got 1".
+            if events.is_empty() {
+                reducer
+                    .apply_all(std::slice::from_ref(&ev))
+                    .map_err(|e| GrodexError::Internal(anyhow::anyhow!("{e}")))?;
+            } else {
+                reducer
+                    .apply(&ev)
+                    .map_err(|e| GrodexError::Internal(anyhow::anyhow!("{e}")))?;
+            }
             events.push(ev);
             return Ok(());
         }
@@ -582,9 +592,17 @@ pub fn replay_journal_lean(
             GrodexError::Internal(anyhow::anyhow!("resume: journal parse: {e}"))
         })?;
         last_seq = last_seq.max(ev.seq);
-        reducer
-            .apply(&ev)
-            .map_err(|e| GrodexError::Internal(anyhow::anyhow!("{e}")))?;
+        // First event re-baseline (see above) — journals whose first event
+        // is seq 1 (corrupted-by-resume-seed) must still resume.
+        if events.is_empty() && ev.seq > 0 {
+            reducer
+                .apply_all(std::slice::from_ref(&ev))
+                .map_err(|e| GrodexError::Internal(anyhow::anyhow!("{e}")))?;
+        } else {
+            reducer
+                .apply(&ev)
+                .map_err(|e| GrodexError::Internal(anyhow::anyhow!("{e}")))?;
+        }
         events.push(ev);
         Ok(())
     })
@@ -641,6 +659,32 @@ mod tests {
 
     /// R 修复回归：repair/continuation 注入提示必须随 journal 重建，
     /// 否则 resume 后 live 上下文与 replay 上下文发散。
+    /// R 修复回归：resume 一个首事件为 seq 1 的 journal（空会话 + 旧
+    /// next_seq 种子缺陷产生）必须成功，不再报
+    /// "missing event seq: expected 0, got 1"。
+    #[test]
+    fn replay_lean_tolerates_journal_starting_at_seq_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"schema_version":2,"seq":1,"session_id":"0197aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa","turn_id":null,"step_id":null,"generation":null,"timestamp":"2026-08-30T10:00:00Z","event_type":"SessionStarted","payload":{"cwd":"/w","model":"m","model_provider":"p"},"sensitivity":"Normal"}"#,
+                "\n",
+                r#"{"schema_version":2,"seq":2,"session_id":"0197aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa","turn_id":null,"step_id":null,"generation":null,"timestamp":"2026-08-30T10:00:01Z","event_type":"UserInputAccepted","payload":{"text":"hello"},"sensitivity":"Personal"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let sid = SessionId::from_string("0197aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let (events, last_seq, ctx) =
+            replay_journal_lean(&path, &sid).expect("seq-1 journal must resume");
+        assert_eq!(events.len(), 2);
+        assert_eq!(last_seq, 2);
+        assert_eq!(ctx.len(), 1, "user input restored");
+    }
+
+
     #[test]
     fn prompt_injected_rebuilds_as_user_item() {
         let sid = SessionId::new();
