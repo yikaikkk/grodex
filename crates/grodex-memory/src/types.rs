@@ -352,6 +352,26 @@ pub struct RetrievalResult {
     pub path: String,
     /// The matched text content.
     pub content: String,
+    /// Section title inside the source file (empty if not applicable).
+    #[serde(default)]
+    pub section: String,
+    /// Memory unit kind (Fact / Preference / …). Populated for memory
+    /// results only.
+    #[serde(skip)]
+    pub memory_kind: Option<MemoryKind>,
+    /// Memory: when the source was last updated.
+    /// Evidence: when the original event occurred.
+    #[serde(skip)]
+    pub updated_at: Option<chrono::DateTime<Utc>>,
+    /// Evidence-only: the originating rollout session id.
+    #[serde(skip)]
+    pub rollout_id: String,
+    /// Evidence-only: memory id that supersedes this evidence, if any.
+    #[serde(skip)]
+    pub superseded_by: Option<String>,
+    /// Evidence-only alias — populated by load_evidence_results_in_order.
+    #[serde(skip)]
+    pub occurred_at: Option<chrono::DateTime<Utc>>,
     /// BM25 score from FTS5 (for diagnostics; not used as an absolute threshold).
     #[serde(default)]
     pub bm25_score: f64,

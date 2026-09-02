@@ -155,6 +155,12 @@ impl MemoryStore {
                     path: String::new(),
                     content: entry.content.clone(),
                     source: crate::types::ResultSource::Memory,
+                    unit_kind: String::new(),
+                    section: String::new(),
+                    updated_at: None,
+                    rollout_id: None,
+                    superseded_by: None,
+                    provenance: Vec::new(),
                 });
             }
         }

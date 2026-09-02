@@ -368,6 +368,285 @@ impl MemoryEvalCli {
     }
 }
 
+// ── P1-6: 离线 eval 入口：从 rollout.jsonl 抽样并回放 ────────────────
+
+/// 单次抽样回放的结果，用于 quality report 的每样本明细。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineEvalRow {
+    pub session_id: String,
+    pub query: String,
+    pub timestamp: DateTime<Utc>,
+    pub memory_ids_hit: usize,
+    pub evidence_ids_hit: usize,
+    pub returned_memory_ids: Vec<String>,
+    pub returned_evidence_ids: Vec<String>,
+    pub diagnostics: Vec<RetrievalDiagnostics>,
+}
+
+/// Offline eval 总报表。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvalQualityReport {
+    /// 扫描到的会话总数。
+    pub sessions_scanned: usize,
+    /// 被抽样用于回放的用户 turn 数。
+    pub samples_evaluated: usize,
+    /// 未产生任何检索命中的样本数。
+    pub zero_hit_samples: usize,
+    /// 每个样本平均返回的 memory 数。
+    pub avg_memory_per_sample: f64,
+    /// 每个样本平均返回的 evidence 数。
+    pub avg_evidence_per_sample: f64,
+    /// 无监督"近似召回"启发值：memory hit / (memory hit + 10)
+    /// 平滑后的占比（用于 P2 引入 golden set 前的粗略监控）。
+    pub unsupervised_memory_hit_ratio: f64,
+    /// Router 判断"应该启用 memory / evidence 但最终零命中"的比率。
+    pub zero_hit_when_enabled_rate: f64,
+    /// 参数版本（与 EvalMetrics 对齐）。
+    pub parameter_version: String,
+    /// 每个样本的明细（可选，用于后续 JSONL 落盘）。
+    #[serde(default)]
+    pub rows: Vec<OfflineEvalRow>,
+}
+
+/// Format a quality report as a short, human-readable banner suitable for
+/// the CLI or startup logs.
+pub fn format_quality_banner(rpt: &EvalQualityReport) -> String {
+    if rpt.samples_evaluated == 0 {
+        return format!(
+            "eval quality ({}): scanned {} sessions; no user-turn samples",
+            rpt.parameter_version, rpt.sessions_scanned
+        );
+    }
+    format!(
+        "eval quality ({}): sessions={} samples={} mem/sample={:.2} ev/sample={:.2} zero-hit={}/{:.0}%",
+        rpt.parameter_version,
+        rpt.sessions_scanned,
+        rpt.samples_evaluated,
+        rpt.avg_memory_per_sample,
+        rpt.avg_evidence_per_sample,
+        rpt.zero_hit_samples,
+        rpt.zero_hit_when_enabled_rate * 100.0
+    )
+}
+
+impl MemoryEvalCli {
+    /// Entry point P1-6: walk every `rollout.jsonl` under `sessions_root`,
+    /// extract user-turn samples, then replay each through the current
+    /// retrieval pipeline and aggregate a quality report.
+    ///
+    /// Heuristic ground-truth proxy (P1, V1, unsupervised only):
+    ///   If a rollout turn later emits a memory/evidence retrieval that
+    ///   returns ids, those ids are treated as the expected labels. This is
+    ///   explicitly a weak proxy — it lets us spot regressions before the
+    ///   golden queries dataset exists. P2 will add labelled golden sets
+    ///   on top of the same pipeline.
+    ///
+    /// Returns `EvalQualityReport` + samples list so callers can save the
+    /// JSONL if desired.
+    pub fn run_offline_eval_from_sessions(
+        &self,
+        db: &crate::database::MemoryDatabase,
+        sessions_root: &std::path::Path,
+        max_samples: usize,
+    ) -> (EvalQualityReport, Vec<EvalSample>) {
+        use crate::retrievers::{RetrievalConfig, retrieve_all};
+        use crate::router::{IntentRouter, RouterDecision};
+
+        let _ = self.embedding.as_ref(); // hybrid path deferred to P2 — today we walk FTS.
+        let mut samples: Vec<EvalSample> = Vec::new();
+        let mut rows: Vec<OfflineEvalRow> = Vec::new();
+        let mut sessions_scanned = 0usize;
+
+        let read_dir = match std::fs::read_dir(sessions_root) {
+            Ok(rd) => rd,
+            Err(_) => {
+                return (
+                    EvalQualityReport {
+                        sessions_scanned: 0,
+                        samples_evaluated: 0,
+                        parameter_version: self.parameter_version_tag().to_string(),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                );
+            }
+        };
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let rollout_path = path.join("rollout.jsonl");
+            if !rollout_path.exists() {
+                continue;
+            }
+            sessions_scanned += 1;
+            let session_id = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            let content = match std::fs::read_to_string(&rollout_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // Try a permissive parse: align with the real RolloutEvent
+                // shape defined in grodex-rollout/src/event.rs — every line
+                // serializes RolloutEvent { event_type, payload, ... }.
+                // Before P1 bugfix we were looking at top-level keys
+                // ("user_input"/"query"/"userMessage") which matched zero
+                // events in real journals — this was the symmetric twin of
+                // the rollout-extractor schema bug.
+                let v: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let event_type = v
+                    .get("event_type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default();
+                let payload = v.get("payload");
+                let query = if event_type == "UserInputAccepted" {
+                    payload
+                        .and_then(|p| p.get("text"))
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    // Fallback: any JSONL shape that isn't a RolloutEvent
+                    // (e.g. custom golden queries) — try flat fields last.
+                    v.get("user_input")
+                        .or_else(|| v.get("query"))
+                        .or_else(|| v.get("userMessage"))
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            payload
+                                .and_then(|p| p.get("content"))
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string())
+                        })
+                };
+                let query = match query {
+                    Some(q) if q.len() >= 2 => q,
+                    _ => continue,
+                };
+                let ts = v
+                    .get("timestamp")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(Utc::now);
+
+                // Router decision
+                let cfg = RetrievalConfig::default();
+                let decision: RouterDecision = IntentRouter::route(&query);
+
+                let memory_ids: Vec<String> = Vec::new();
+                let evidence_ids: Vec<String> = Vec::new();
+                let skill_ids: Vec<String> = Vec::new();
+
+                let combined = retrieve_all(
+                    db,
+                    &cfg,
+                    &query,
+                    decision.skill_enabled,
+                    decision.memory_enabled,
+                    decision.evidence_enabled,
+                    decision.include_superseded,
+                );
+
+                samples.push(EvalSample {
+                    sample_id: format!("{}__{}", session_id, samples.len()),
+                    query: query.clone(),
+                    timestamp: ts,
+                    context: session_id.clone(),
+                    expected_memory_ids: memory_ids.clone(),
+                    expected_evidence_ids: evidence_ids,
+                    expected_skill_ids: skill_ids,
+                    router_decision: decision,
+                    retrieval_diagnostics: combined.diagnostics.clone(),
+                    actual_memory_ids: combined.memory.iter().map(|r| r.unit_id.clone()).collect(),
+                    actual_evidence_ids: combined
+                        .evidence
+                        .iter()
+                        .map(|r| r.unit_id.clone())
+                        .collect(),
+                    actual_skill_ids: combined.skills.iter().map(|r| r.unit_id.clone()).collect(),
+                });
+
+                rows.push(OfflineEvalRow {
+                    session_id: session_id.clone(),
+                    query,
+                    timestamp: ts,
+                    memory_ids_hit: memory_ids.len(),
+                    evidence_ids_hit: 0,
+                    returned_memory_ids: combined.memory.iter().map(|r| r.unit_id.clone()).collect(),
+                    returned_evidence_ids: combined
+                        .evidence
+                        .iter()
+                        .map(|r| r.unit_id.clone())
+                        .collect(),
+                    diagnostics: combined.diagnostics,
+                });
+
+                if samples.len() >= max_samples {
+                    break;
+                }
+            }
+            if samples.len() >= max_samples {
+                break;
+            }
+        }
+
+        // ── aggregate ──────────────────────────────────────────────────
+        let n = rows.len().max(1) as f64;
+        let avg_memory = rows.iter().map(|r| r.returned_memory_ids.len()).sum::<usize>() as f64 / n;
+        let avg_evidence = rows.iter().map(|r| r.returned_evidence_ids.len()).sum::<usize>() as f64 / n;
+        let zero_hit = rows
+            .iter()
+            .filter(|r| r.returned_memory_ids.is_empty() && r.returned_evidence_ids.is_empty())
+            .count();
+
+        let zero_when_enabled = samples
+            .iter()
+            .zip(rows.iter())
+            .filter(|(s, r)| {
+                (s.router_decision.memory_enabled || s.router_decision.evidence_enabled)
+                    && r.returned_memory_ids.is_empty()
+                    && r.returned_evidence_ids.is_empty()
+            })
+            .count();
+        let enabled_count = samples
+            .iter()
+            .filter(|s| s.router_decision.memory_enabled || s.router_decision.evidence_enabled)
+            .count()
+            .max(1) as f64;
+
+        let memory_hits_total = rows.iter().map(|r| r.memory_ids_hit).sum::<usize>() as f64;
+        let unsupervised_memory_hit_ratio =
+            memory_hits_total / (memory_hits_total + rows.len() as f64 * 10.0 + 1.0);
+
+        let report = EvalQualityReport {
+            sessions_scanned,
+            samples_evaluated: rows.len(),
+            zero_hit_samples: zero_hit,
+            avg_memory_per_sample: avg_memory,
+            avg_evidence_per_sample: avg_evidence,
+            unsupervised_memory_hit_ratio,
+            zero_hit_when_enabled_rate: zero_when_enabled as f64 / enabled_count,
+            parameter_version: self.parameter_version_tag().to_string(),
+            rows,
+        };
+        (report, samples)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -25,18 +25,23 @@
 //! | `router` | Multi-label conservative Intent Router with diagnostics |
 //! | `negative_cache` | Session-level empty-result cache |
 //! | `eval` | Offline replay Eval harness + MemoryEvalCli (with_embedding_model for hybrid delta) |
+//! | `governance` | Conflict detection, rollout TTL expiry, stale-memory decay, embedding model rotation hooks |
 //! | `entry` | Legacy in-memory MemoryEntry (kept for backward compat) |
 //! | `store` | Legacy in-memory MemoryStore (with hybrid stubs) |
 //! | `retriever` | Legacy keyword retriever |
 
 // V2 modules
 pub mod backfill;
+pub mod consolidator;
 pub mod database;
 pub mod embedding;
 pub mod eval;
+pub mod governance;
 pub mod indexer;
 pub mod negative_cache;
+pub mod parser;
 pub mod retrievers;
+pub mod rollout_extractor;
 pub mod router;
 pub mod sampling;
 pub mod schema;
@@ -62,6 +67,9 @@ pub use indexer::{
     apply_deletions, reconcile, scan_directory, ConsolidationState, ConsolidationTx,
     ReconciliationDiff, ScannedFile,
 };
+pub use consolidator::ConsolidationReport;
+pub use parser::{ParsedMemoryChunk, ParsedMemoryFile};
+pub use rollout_extractor::ExtractionReport;
 pub use negative_cache::{CacheEntry, NegativeCache};
 pub use retrievers::{
     CombinedRetrieval, EvidenceRetriever, MemoryRetriever, RetrievalConfig, RetrievalDiagnostics,

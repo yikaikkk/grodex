@@ -1252,43 +1252,218 @@ impl SessionSupervisor {
         // prompt caching. Instead they travel as a trailing Developer
         // instruction block, which the sampler emits AFTER the stable
         // system prompt (see client.rs) so the cached prefix survives.
+        //
+        // P1-bugfix: this used to be a single-pipeline call into
+        // `db.retrieve_hybrid_memory` (Memory only). SkillRetriever and
+        // EvidenceRetriever were dead-code (only wired inside the offline
+        // eval harness). We now run the full V2 3-way choreography:
+        //   IntentRouter → [SkillRetriever; MemoryRetriever; EvidenceRetriever]
+        //   → capacity cap → merged block injection.
+        // This makes the live turn surface exactly the same retrieval
+        // graph that the eval harness exercises, so offline quality
+        // metrics actually correlate with live behaviour.
         let mut memory_block: Option<String> = None;
         if let Some(ref db) = self.memory {
-            // Hybrid RRF retrieval (FTS5 + vector, fail-open to pure FTS).
-            // emb=None → vector list empty → RRF degrades to pure FTS5 ranking.
-            // emb=Some → embed query, search vectors, fuse with FTS5 results.
+            use grodex_memory::{
+                IntentRouter, RetrievalConfig, RetrievedUnit, ResultSource,
+                retrievers::{RetrievalDiagnostics, SkillRetriever},
+            };
+
+            let decision = IntentRouter::route(&user_input_for_memory);
+            let cfg = RetrievalConfig::default();
+
+            // ── 3 concurrent retrieval legs ────────────────────────────
+            // Leg 1: SkillRetriever (FTS-only, pure sync + blocking)
+            let skill_db = db.clone();
+            let query_skill = user_input_for_memory.clone();
+            let cfg_skill = cfg.clone();
+            let skill_handle = if decision.skill_enabled {
+                Some(tokio::task::spawn_blocking(move || {
+                    let (res, diag) =
+                        SkillRetriever::new((*skill_db).clone(), cfg_skill).retrieve(&query_skill);
+                    (res, diag)
+                }))
+            } else {
+                None
+            };
+
+            // Leg 2: Memory (FTS + Vector RRF) — `retrieve_hybrid_memory`
+            // already does: access counter bump, provenance summary, top-K
+            // truncation, fail-open to pure FTS when embedding is None.
+            let mem_top_k = cfg.max_results.min(cfg.memory_quota + cfg.preference_quota);
+            let mem_query = user_input_for_memory.clone();
+            let db_mem = db.clone();
+            let emb_mem = self.embedding.clone();
+            let mem_handle = if decision.memory_enabled {
+                Some(tokio::spawn(async move {
+                    db_mem
+                        .retrieve_hybrid_memory(&mem_query, mem_top_k, emb_mem.as_ref())
+                        .await
+                        .unwrap_or_default()
+                }))
+            } else {
+                None
+            };
+
+            // Leg 3: Evidence — BREAKPOINT-1 FIX. Previously
+            // `retrieve_hybrid_evidence` had ZERO production callers;
+            // now it's live in exactly the same wiring as Memory, so
+            // evidence units actually surface in the prompt on the next
+            // turn that happens to query for them.
+            let ev_top_k = cfg.max_results.min(cfg.evidence_quota.max(3));
+            let ev_query = user_input_for_memory.clone();
+            let db_ev = db.clone();
+            let emb_ev = self.embedding.clone();
+            let inc_sup = decision.include_superseded;
+            let ev_handle = if decision.evidence_enabled {
+                Some(tokio::spawn(async move {
+                    db_ev
+                        .retrieve_hybrid_evidence(&ev_query, ev_top_k, inc_sup, emb_ev.as_ref())
+                        .await
+                        .unwrap_or_default()
+                }))
+            } else {
+                None
+            };
+
             let retrieval_started = std::time::Instant::now();
-            let retrieval_result =
-                db.retrieve_hybrid_memory(&user_input_for_memory, 5, self.embedding.as_ref()).await;
-            // P3 telemetry: retrieval latency + yield (out-of-band record).
+
+            // Join all three legs — each join arm returns empty on a
+            // failed handle (never kill the turn because of memory).
+            let (skill_out, diagnostics_skill): (
+                Vec<grodex_memory::RetrievalResult>,
+                Option<RetrievalDiagnostics>,
+            ) = match skill_handle {
+                Some(h) => match h.await {
+                    Ok((r, d)) => (r, Some(d)),
+                    Err(_) => (Vec::new(), None),
+                },
+                None => (Vec::new(), None),
+            };
+            let memory_units: Vec<RetrievedUnit> = match mem_handle {
+                Some(h) => h.await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let evidence_units: Vec<RetrievedUnit> = match ev_handle {
+                Some(h) => h.await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let mut diagnostics: Vec<RetrievalDiagnostics> =
+                diagnostics_skill.into_iter().collect();
+
+            // Skill pipeline returns RetrievalResult; convert to RetrievedUnit.
+            let skill_units: Vec<RetrievedUnit> = skill_out
+                .iter()
+                .map(|r| RetrievedUnit {
+                    unit_id: r.unit_id.clone(),
+                    path: r.path.clone(),
+                    content: r.content.clone(),
+                    source: ResultSource::Skill,
+                    unit_kind: "skill".into(),
+                    section: r.section.clone(),
+                    updated_at: None,
+                    rollout_id: None,
+                    superseded_by: None,
+                    provenance: Vec::new(),
+                })
+                .collect();
+
+            // ── Enforce global Memory + Evidence cap ──────────────────
+            // Same semantics as retrieve_all: trim Evidence first, then
+            // Memory if still over.
+            let cfg_cap = RetrievalConfig::default().max_results;
+            let (mut memory_final, mut evidence_final) = (memory_units, evidence_units);
+            {
+                let mut total = memory_final.len() + evidence_final.len();
+                if total > cfg_cap {
+                    let excess = total - cfg_cap;
+                    let from_ev = excess.min(evidence_final.len());
+                    evidence_final.truncate(evidence_final.len() - from_ev);
+                    total = memory_final.len() + evidence_final.len();
+                    let remaining = total.saturating_sub(cfg_cap);
+                    if remaining > 0 {
+                        memory_final.truncate(memory_final.len() - remaining);
+                    }
+                }
+            }
+
+            // P3 telemetry.
             if let Some(ref writer) = self.writer {
-                let selected = match &retrieval_result {
-                    Ok(units) => units.len(),
-                    Err(_) => 0,
-                };
                 writer.emit_out_of_band_telemetry(
                     grodex_telemetry::kind::MEMORY_RETRIEVAL,
                     Some(turn_id),
                     None,
                     &serde_json::json!({
                         "query_chars": user_input_for_memory.chars().count(),
-                        "selected_count": selected,
+                        "memory_count": memory_final.len(),
+                        "evidence_count": evidence_final.len(),
+                        "skill_count": skill_units.len(),
+                        "router_memory": decision.memory_enabled,
+                        "router_evidence": decision.evidence_enabled,
+                        "router_skill": decision.skill_enabled,
                         "duration_ms": retrieval_started.elapsed().as_millis() as u64,
-                        "router_kind": "hybrid_rrf",
+                        "router_kind": "3way_hybrid_rrf",
+                        "vector_enabled": self.embedding.is_some(),
                     }),
                 );
             }
-            match retrieval_result {
-                Ok(units) if !units.is_empty() => {
-                    memory_block = Some(grodex_memory::RetrievedUnit::format_for_prompt(&units));
+
+            let total = skill_units.len() + memory_final.len() + evidence_final.len();
+            if total > 0 {
+                let mut formatted = String::new();
+                if !skill_units.is_empty() {
+                    formatted.push_str("## Recommended Skills\n\n");
+                    formatted.push_str(
+                        "These SKILL modules matched the user's intent. Prefer them over \
+                         ad-hoc tooling when a match applies — the entry path points at the \
+                         workflow doc.\n\n"
+                    );
+                    formatted.push_str(&RetrievedUnit::format_for_prompt(&skill_units));
+                    formatted.push('\n');
                 }
-                Ok(_) => {} // no results — nothing to inject
-                Err(e) => {
-                    // Fail-open: memory unavailable must not block the turn.
-                    eprintln!("[warn] memory retrieve_hybrid_memory failed: {e}");
+                // Provenance-rich memory block.
+                formatted.push_str(&RetrievedUnit::format_for_prompt(&memory_final));
+                if !evidence_final.is_empty() {
+                    if memory_final.is_empty() {
+                        formatted.push_str(
+                            "## Relevant Evidence from Past Sessions\n\n\
+                             The entries below are HISTORICAL EVIDENCE (past tool results, \
+                             assistant turn summaries). They are context only — do NOT \
+                             treat them as stable facts; promote them to MEMORY only when \
+                             they recur across multiple sessions.\n\n"
+                        );
+                    }
+                    formatted.push_str(&RetrievedUnit::format_for_prompt(&evidence_final));
                 }
+                if !diagnostics.is_empty() {
+                    let empty_retrievals = diagnostics
+                        .iter()
+                        .filter(|d| d.qualified_count == 0 && d.returned_count == 0)
+                        .count();
+                    if empty_retrievals > 0 {
+                        formatted.push_str(&format!(
+                            "\n_Router diagnostics: {} empty-result pipelines, {} total legs_\n",
+                            empty_retrievals,
+                            diagnostics.len()
+                        ));
+                    }
+                }
+                if !decision.reason_codes.is_empty() {
+                    formatted.push_str(&format!(
+                        "\n_Router reason codes: {}_\n",
+                        decision.reason_codes.join(", ")
+                    ));
+                }
+                if let Some(reason) = &decision.hard_skip_reason {
+                    formatted.push_str(&format!(
+                        "_Router hard-skip: {}_\n",
+                        reason
+                    ));
+                }
+                memory_block = Some(formatted);
             }
         }
+
         let manifest = builder.build();
         // The manifest already assembled all instruction nodes in four-zone
         // order (A → C → B → D) into `content`. We pass it as a single

@@ -930,8 +930,8 @@ impl SessionRuntimeBuilder {
 
         // Initial index scan + reconcile: walk the workspace for .md files,
         // diff against the indexed_files table, and apply deletions. New/changed
-        // files are registered in indexed_files (content parsing into MemoryUnit
-        // is deferred to a later phase when a Markdown parser is available).
+        // files are registered in indexed_files AND fully parsed into MemoryUnits
+        // (with stable IDs written back to disk when missing).
         // Fail-open: scan errors must not block session startup.
         //
         // P3 fix: the scan previously ran ONCE at startup, so memory never
@@ -940,6 +940,69 @@ impl SessionRuntimeBuilder {
         // `GRODEX_MEMORY_RESCAN_SECS` overrides; 0 disables).
         if let Some(ref db) = memory {
             reindex_memory(db, &self.cwd);
+            // P0-5: crash recovery for non-terminal consolidation transactions.
+            match db.recover_nonterminal_txs() {
+                Ok((p, a)) if p + a > 0 => {
+                    eprintln!("[memory] crash recovery: {p} prepared + {a} db_applied txs reset");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[warn] memory crash recovery failed: {e}"),
+            }
+            // P0-2: extract EvidenceUnits from historical rollouts in the
+            // background so old sessions can feed the consolidation pass.
+            let db_extract = db.clone();
+            let sessions_root = dirs::home_dir()
+                .map(|h| h.join(".grodex").join("sessions"));
+            if let Some(sessions_root) = sessions_root {
+                tokio::task::spawn_blocking(move || {
+                    match db_extract.extract_evidence_from_rollouts(&sessions_root) {
+                        Ok(r) if r.evidence_created > 0 || r.sessions_new > 0 => {
+                            eprintln!(
+                                "[memory] rollout extract: {} sessions ({} new), +{} evidence",
+                                r.sessions_scanned, r.sessions_new, r.evidence_created
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[warn] rollout extract failed: {e}"),
+                    }
+                });
+            }
+            // P0-3: periodic consolidation pass (default every 30 min,
+            // `GRODEX_CONSOLIDATE_SECS` overrides; 0 disables).
+            let consolidate_secs: u64 = std::env::var("GRODEX_CONSOLIDATE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1800);
+            if consolidate_secs > 0 {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    // Run an initial pass 10s after startup, then on schedule.
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    let db1 = db.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        match db1.run_consolidation_pass() {
+                            Ok(r) if r.memories_created > 0 => {
+                                eprintln!(
+                                    "[memory] consolidation: +{} memories ({} promoted groups, {} evidences superseded)",
+                                    r.memories_created, r.groups_promoted, r.evidence_superseded
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[warn] consolidation failed: {e}"),
+                        }
+                    }).await;
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(consolidate_secs));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        let db = db.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = db.run_consolidation_pass();
+                        }).await;
+                    }
+                });
+            }
             let rescan_secs: u64 = std::env::var("GRODEX_MEMORY_RESCAN_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -956,6 +1019,85 @@ impl SessionRuntimeBuilder {
                         let db = db.clone();
                         let cwd = cwd.clone();
                         let _ = tokio::task::spawn_blocking(move || reindex_memory(&db, &cwd)).await;
+                    }
+                });
+            }
+            // P1-3/P1-4/P1-5: periodic governance pass.
+            //   - Conflict detection + ConflictsWith edges
+            //   - Rollout TTL expiry (when sessions dir is gone on disk)
+            //   - Stale-memory access-count decay
+            //   - Embedding model rotation (when upstream config changes)
+            // Default every 60 min; GRODEX_GOVERNANCE_SECS=0 disables.
+            let governance_secs: u64 = std::env::var("GRODEX_GOVERNANCE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600);
+            if governance_secs > 0 {
+                let db = db.clone();
+                let sessions_root = dirs::home_dir()
+                    .map(|h| h.join(".grodex").join("sessions"));
+                tokio::spawn(async move {
+                    // Initial governance pass 20s after startup so rollout
+                    // extract + consolidation have had a head start.
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    let db1 = db.clone();
+                    let sr = sessions_root.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let rpt = db1.run_governance_pass(sr.as_deref(), None);
+                        let banner = grodex_memory::governance::format_governance_banner(&rpt);
+                        if rpt.conflicts_with_edges_created + rpt.rollout_evidences_expired
+                            + rpt.stale_memories_decayed
+                            + rpt.embedding_old_rows_deleted
+                            > 0
+                            || rpt.errors > 0
+                        {
+                            eprintln!("[memory] {banner}");
+                        }
+                    })
+                    .await;
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(governance_secs));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        let db = db.clone();
+                        let sr = sessions_root.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = db.run_governance_pass(sr.as_deref(), None);
+                        })
+                        .await;
+                    }
+                });
+            }
+            // P1-6: one-shot offline eval quality snapshot.
+            //   Replays ~20 user turns from disk into the current retrieval
+            //   pipeline and logs a short banner. Runs ~60s after start to
+            //   stay off the startup hot path; can be disabled by setting
+            //   GRODEX_EVAL_MAX_SAMPLES=0.
+            let eval_max_samples: usize = std::env::var("GRODEX_EVAL_MAX_SAMPLES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
+            if eval_max_samples > 0 {
+                let db = db.clone();
+                let sessions_root = dirs::home_dir()
+                    .map(|h| h.join(".grodex").join("sessions"));
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    if let (Some(sr), Some(db)) = (sessions_root, Some(db)) {
+                        let db_cloned = db.clone();
+                        let sr2 = sr.clone();
+                        let (rpt, _samples) = tokio::task::spawn_blocking(move || {
+                            let cli = grodex_memory::eval::MemoryEvalCli::new()
+                                .with_recall_at_k(6);
+                            cli.run_offline_eval_from_sessions(&db_cloned, &sr2, eval_max_samples)
+                        })
+                        .await
+                        .unwrap_or_default();
+                        eprintln!(
+                            "[memory] {}",
+                            grodex_memory::eval::format_quality_banner(&rpt)
+                        );
                     }
                 });
             }
@@ -1324,9 +1466,19 @@ fn build_sandbox(cfg: &toml::Value) -> grodex_sandbox::SandboxManager {
 }
 
 /// One memory index pass: scan the workspace for .md files, diff against
-/// `indexed_files`, apply deletions and register new/changed files.
-/// Blocking (fs walk) — call from `spawn_blocking`. Fail-open by caller.
+/// `indexed_files`, apply deletions, register new/changed files, and fully
+/// parse changed/new Markdown files into MemoryUnits with stable IDs.
+///
+/// Stable-ID lifecycle:
+///   - Chunks without `<!-- memory-unit: ... -->` get IDs generated from
+///     (path + section + content) SHA256 prefix and written back to disk.
+///   - `replace_file_memory_units` atomically swaps old units inside a
+///     transaction so a crash mid-write never produces half-indexed files.
+///
+/// Blocking (fs walk + parsing) — call from `spawn_blocking`. Fail-open by caller.
 fn reindex_memory(db: &Arc<grodex_memory::MemoryDatabase>, cwd: &std::path::Path) {
+    use grodex_memory::{MemoryScope, ParsedMemoryFile};
+
     let scanned = grodex_memory::scan_directory(cwd);
     let diff = grodex_memory::reconcile(db, &scanned);
     if diff.is_empty() {
@@ -1334,10 +1486,45 @@ fn reindex_memory(db: &Arc<grodex_memory::MemoryDatabase>, cwd: &std::path::Path
     }
     // Apply deletions (orphan units, bump generation).
     let _ = grodex_memory::apply_deletions(db, &diff);
-    // Register new/changed files in indexed_files so the index table
-    // reflects the current filesystem state.
+
     let current_gen = db.read_generation().unwrap_or(1);
+    let mut total_units: usize = 0;
+    let mut files_with_rewrite: usize = 0;
+
     for file in diff.new_files.iter().chain(diff.changed_files.iter()) {
+        let file_path = cwd.join(&file.key);
+        let scope = if file.key.contains("MEMORY.md")
+            || file.key.contains(".grodex/")
+            || file.key.contains("docs/")
+        {
+            MemoryScope::Global
+        } else {
+            MemoryScope::Workspace
+        };
+
+        // Step A: read + parse
+        let parsed_units = match std::fs::read_to_string(&file_path) {
+            Ok(raw) => {
+                let parsed = ParsedMemoryFile::parse(&file.key, &raw);
+                // Step B: inject stable IDs, rewrite to disk when at least one chunk lacked one.
+                let with_ids = parsed.with_stable_ids();
+                if let Some(rewritten) = &with_ids.rewritten_content {
+                    // Atomic write via temp + rename so a crash doesn't corrupt the MD.
+                    let tmp = file_path.with_extension("md.tmp");
+                    if std::fs::write(&tmp, rewritten).is_ok() {
+                        let _ = std::fs::rename(&tmp, &file_path);
+                        files_with_rewrite += 1;
+                    } else {
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                }
+                with_ids.into_memory_units(scope)
+            }
+            Err(_) => Vec::new(),
+        };
+
+        // Step C: upsert IndexedFile row (do this BEFORE replace_file_memory_units
+        // so foreign keys referencing indexed_files.path are happy).
         let indexed = grodex_memory::IndexedFile {
             path: file.key.clone(),
             source_kind: grodex_memory::types::SourceKind::Memory,
@@ -1347,14 +1534,32 @@ fn reindex_memory(db: &Arc<grodex_memory::MemoryDatabase>, cwd: &std::path::Path
             index_generation: current_gen,
             last_indexed_at: chrono::Utc::now(),
         };
-        let _ = db.upsert_indexed_file(&indexed);
+        if db.upsert_indexed_file(&indexed).is_err() {
+            continue;
+        }
+
+        // Step D: atomically replace memory units for this file.
+        match db.replace_file_memory_units(&file.key, &parsed_units, Some(&indexed)) {
+            Ok(n) => total_units += n,
+            Err(e) => eprintln!(
+                "[warn] memory parse {} failed: {e}",
+                file.key
+            ),
+        }
     }
+
     // Bump generation after inserts so the snapshot invalidates.
     let _ = db.bump_generation();
     eprintln!(
-        "[memory] reindex: +{} new, ~{} changed, -{} removed",
+        "[memory] reindex: +{} new, ~{} changed, -{} removed; {} units indexed{}",
         diff.new_files.len(),
         diff.changed_files.len(),
-        diff.deleted_files.len()
+        diff.deleted_files.len(),
+        total_units,
+        if files_with_rewrite > 0 {
+            format!("; {} md files got stable IDs", files_with_rewrite)
+        } else {
+            String::new()
+        }
     );
 }

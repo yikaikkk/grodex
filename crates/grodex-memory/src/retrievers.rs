@@ -195,6 +195,12 @@ impl SkillRetriever {
                     unit_id: skill_id,
                     path: entry_path,
                     content: format!("{name}: {desc}"),
+                    section: String::new(),
+                    memory_kind: None,
+                    updated_at: None,
+                    rollout_id: String::new(),
+                    superseded_by: None,
+                    occurred_at: None,
                     bm25_score: score,
                     term_coverage: coverage,
                     total_terms: query_terms.len(),
@@ -271,6 +277,12 @@ impl MemoryRetriever {
                     unit_id,
                     path,
                     content,
+                    section: String::new(),
+                    memory_kind: None,
+                    updated_at: None,
+                    rollout_id: String::new(),
+                    superseded_by: None,
+                    occurred_at: None,
                     bm25_score: score,
                     term_coverage: coverage,
                     total_terms: query_terms.len(),
@@ -285,6 +297,11 @@ impl MemoryRetriever {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results.truncate(self.config.memory_quota);
+
+        // P1-1: bump access counters for the truncated top-K.
+        for r in &results {
+            let _ = self.db.record_memory_access(&r.unit_id);
+        }
 
         let diagnostics = RetrievalDiagnostics {
             source: ResultSource::Memory,
@@ -357,6 +374,12 @@ impl EvidenceRetriever {
                     unit_id,
                     path,
                     content,
+                    section: String::new(),
+                    memory_kind: None,
+                    updated_at: None,
+                    rollout_id: String::new(),
+                    superseded_by: None,
+                    occurred_at: None,
                     bm25_score: score,
                     term_coverage: coverage,
                     total_terms: query_terms.len(),
@@ -371,6 +394,10 @@ impl EvidenceRetriever {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results.truncate(self.config.evidence_quota);
+
+        for r in &results {
+            let _ = self.db.record_evidence_access(&r.unit_id);
+        }
 
         let diagnostics = RetrievalDiagnostics {
             source: ResultSource::Evidence,
@@ -408,6 +435,18 @@ pub struct CombinedRetrieval {
 }
 
 impl CombinedRetrieval {
+    /// Empty retrieval — returned when the Router disables all three
+    /// pipelines, or as a fail-open fallback when the blocking task
+    /// panics.
+    pub fn empty() -> Self {
+        Self {
+            skills: Vec::new(),
+            memory: Vec::new(),
+            evidence: Vec::new(),
+            total_memory_evidence: 0,
+            diagnostics: Vec::new(),
+        }
+    }
     /// Format the partitioned context for injection into the system prompt.
     ///
     /// Sections are separated so the agent never confuses execution
@@ -611,6 +650,12 @@ pub fn load_memory_results_in_order(
             out.push(RetrievalResult {
                 unit_id: unit.id,
                 path: unit.path,
+                section: unit.section,
+                memory_kind: Some(unit.kind),
+                updated_at: Some(unit.updated_at),
+                rollout_id: String::new(),
+                superseded_by: None,
+                occurred_at: None,
                 content: unit.content,
                 bm25_score: 0.0,
                 term_coverage: 0,
@@ -633,6 +678,12 @@ pub fn load_evidence_results_in_order(
             out.push(RetrievalResult {
                 unit_id: unit.id,
                 path: unit.path,
+                section: unit.section,
+                memory_kind: None,
+                updated_at: None,
+                rollout_id: unit.rollout_id,
+                superseded_by: unit.superseded_by,
+                occurred_at: Some(unit.occurred_at),
                 content: unit.content,
                 bm25_score: 0.0,
                 term_coverage: 0,
@@ -848,6 +899,12 @@ mod tests {
                 unit_id: "skill_1".to_string(),
                 path: "skills/test/SKILL.md".to_string(),
                 content: "Test skill".to_string(),
+                section: String::new(),
+                memory_kind: None,
+                updated_at: None,
+                rollout_id: String::new(),
+                superseded_by: None,
+                occurred_at: None,
                 bm25_score: 0.0,
                 term_coverage: 1,
                 total_terms: 1,
@@ -857,6 +914,12 @@ mod tests {
                 unit_id: "mem_1".to_string(),
                 path: "MEMORY.md".to_string(),
                 content: "Important fact".to_string(),
+                section: String::new(),
+                memory_kind: None,
+                updated_at: None,
+                rollout_id: String::new(),
+                superseded_by: None,
+                occurred_at: None,
                 bm25_score: 0.0,
                 term_coverage: 1,
                 total_terms: 1,
@@ -866,6 +929,12 @@ mod tests {
                 unit_id: "ev_1".to_string(),
                 path: "summary.md".to_string(),
                 content: "Past event".to_string(),
+                section: String::new(),
+                memory_kind: None,
+                updated_at: None,
+                rollout_id: String::new(),
+                superseded_by: None,
+                occurred_at: None,
                 bm25_score: 0.0,
                 term_coverage: 1,
                 total_terms: 1,

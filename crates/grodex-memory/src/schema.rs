@@ -14,7 +14,8 @@ use rusqlite::Connection;
 /// rebuild via `index_generation` increment.
 ///   v1: 10-table baseline (skill/memory/evidence + FTS5 + edges + indexed_files + tx + meta)
 ///   v2: +document_embeddings (brute-force vector blob store) + embedding_metadata
-pub const SCHEMA_VERSION: u32 = 2;
+///   v3: +evidence_units.access_count/last_accessed_at + governance runtime columns
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Apply the full DDL to a fresh connection. Idempotent — safe to call on
 /// every open. Uses `CREATE TABLE IF NOT EXISTS` for all tables.
@@ -117,7 +118,9 @@ pub fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
             superseded_at       TEXT,
             rollout_available   INTEGER NOT NULL DEFAULT 1,
             rollout_expired_at  TEXT,
-            subchunk_index      INTEGER NOT NULL DEFAULT 0
+            subchunk_index      INTEGER NOT NULL DEFAULT 0,
+            access_count        INTEGER NOT NULL DEFAULT 0,
+            last_accessed_at    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_evidence_path ON evidence_units(path);
         CREATE INDEX IF NOT EXISTS idx_evidence_rollout ON evidence_units(rollout_id);
@@ -258,6 +261,38 @@ pub fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
         "INSERT OR IGNORE INTO embedding_metadata (key, value_json) VALUES ('schema_embedding_version', '\"1\"')",
         [],
     )?;
+
+    // ─── v3 migration: add access counters if upgrading from v1/v2 ───
+    // SQLite has no "ALTER TABLE ADD IF NOT EXISTS", so we check column
+    // existence via PRAGMA and only ALTER when missing. Errors are
+    // tolerated (duplicate column is a no-op, any other failure must not
+    // abort startup — fail-open).
+    {
+        fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+            let mut stmt = match conn.prepare(&format!("PRAGMA table_info({table})")) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .ok()
+                .and_then(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .find(|c| c == column)
+                        .map(|_| true)
+                })
+                .unwrap_or(false)
+        }
+        if !has_column(conn, "evidence_units", "access_count") {
+            let _ = conn.execute_batch(
+                "ALTER TABLE evidence_units ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
+            );
+        }
+        if !has_column(conn, "evidence_units", "last_accessed_at") {
+            let _ = conn.execute_batch(
+                "ALTER TABLE evidence_units ADD COLUMN last_accessed_at TEXT",
+            );
+        }
+    }
 
     Ok(())
 }
