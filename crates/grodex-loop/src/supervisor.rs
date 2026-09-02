@@ -1135,6 +1135,47 @@ impl SessionSupervisor {
             "invariant #1: a new Turn started while another was still running"
         );
 
+        // ── W4 Global UserPreference 快速通道 ────────────────────────
+        // 「记住我叫 X / 以后叫我 X / 我是 X / 请记住我喜欢 Y / 请记住 X」
+        // 这类用户显式表达偏好的输入，直接写 scope=Global kind=Preference
+        // 的 MemoryUnit，无需等 consolidation（W3 的 MIN_OCCURRENCES 阀门）。
+        // 命中失败（DB 错 / 正则不匹配）不阻塞本轮 turn，fail-open。
+        if let Some(db) = self.memory.clone() {
+            if let Some(unit) = extract_user_preference_fast_path(&user_input) {
+                // 提前把 tracing 用的字段 clone 出来，避免 unit 被 move
+                // 进 spawn_blocking 之后再访问（E0382）。
+                let trace_id = unit.id.clone();
+                let trace_scope = unit.scope.as_str().to_string();
+                let trace_preview: String = unit.content.chars().take(80).collect();
+                let task = tokio::task::spawn_blocking(move || db.upsert_memory_unit(&unit));
+                match task.await {
+                    Ok(Ok(())) => {
+                        tracing::info!(
+                            target: "grodex_session",
+                            id = %trace_id,
+                            scope = %trace_scope,
+                            content_preview = %trace_preview,
+                            "w4 global preference written (fast path)"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            target: "grodex_session",
+                            error = %e,
+                            "w4 global preference fast path DB write failed (ignored)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "grodex_session",
+                            error = %e,
+                            "w4 global preference fast path task panicked (ignored)"
+                        );
+                    }
+                }
+            }
+        }
+
         // Admit turn in session state machine.
         let turn_id = match self.session.admit_turn(user_input.clone()) {
             Ok(id) => id,
@@ -1834,6 +1875,64 @@ impl SessionSupervisor {
 
     async fn shutdown(&mut self) {
         self.cancel_turn().await;
+
+        // ── W2 会话退出触发 rollout → Evidence 抽取 ────────────────────
+        // 在清理空目录之前执行，确保当前 session 的 journal 还在磁盘上。
+        // 抽取是同步 CPU/IO 操作，用 spawn_blocking 包一层 + 等待完成；
+        // 抽取失败不影响退出（fail-open，启动时全量扫还会兜底）。
+        if let (Some(db), Some(writer)) = (self.memory.clone(), &self.writer) {
+            let session_id = self.session.id.to_string();
+            let journal_path = writer
+                .store()
+                .session_dir_path()
+                .map(|d| d.join("rollout.jsonl"));
+            if let Some(journal) = journal_path {
+                let db_for_task = Arc::clone(&db);
+                // spawn_blocking 内只消耗 &session_id + &journal，不能 move
+                // 这两个值 —— 外层 tracing 分支里还会用到。所以单独
+                // clone 进 move closure，避免 E0382。
+                let sid_for_task = session_id.clone();
+                let journal_for_task = journal.clone();
+                match tokio::task::spawn_blocking(move || {
+                    db_for_task.extract_evidence_from_session(&sid_for_task, &journal_for_task)
+                })
+                .await
+                {
+                    Ok(Ok(n)) if n > 0 => {
+                        tracing::info!(
+                            target: "grodex_session",
+                            session_id = %session_id,
+                            evidence_created = n,
+                            "shutdown rollout extract completed"
+                        );
+                    }
+                    Ok(Ok(_)) => {
+                        tracing::debug!(
+                            target: "grodex_session",
+                            session_id = %session_id,
+                            "shutdown rollout extract completed (no new evidence)"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            target: "grodex_session",
+                            session_id = %session_id,
+                            error = %e,
+                            "shutdown rollout extract failed (ignored)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "grodex_session",
+                            session_id = %session_id,
+                            error = %e,
+                            "shutdown rollout extract task panicked (ignored)"
+                        );
+                    }
+                }
+            }
+        }
+
         // Empty-session cleanup: a session that never recorded a single
         // journal event (no conversation happened) leaves only scaffolding
         // on disk (empty journal + approval db) — remove the whole session
@@ -1865,6 +1964,154 @@ impl SessionSupervisor {
             .await;
         let _ = self.session.transition_to(SessionState::ShuttingDown);
     }
+}
+
+// ── W4 Global UserPreference fast path ────────────────────────────────
+// 用一次性懒加载的正则匹配常见的"请记住 X / 叫我 X / 我是 X"表达。
+// 匹配命中后直接生成 scope=Global kind=Preference 的 MemoryUnit，绕过
+// consolidation（W3 阈值）。所有 ID / content_hash 做确定性构造，确保
+// 同一偏好反复写也只保留一行（upsert 幂等）。
+
+fn extract_user_preference_fast_path(input: &str) -> Option<grodex_memory::MemoryUnit> {
+    use grodex_memory::{MemoryKind, MemoryScope, MemoryUnit, UnitStatus};
+    use sha2::{Digest, Sha256};
+    use chrono::Utc;
+
+    let text = input.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    // 按优先级匹配：更具体的（"叫我 X" → 身份）在前，通用（"请记住 X"）在后。
+    struct Rule {
+        re: &'static str,
+        /// 对命中组做格式化，产生 "用户希望被叫 XXX" 这类正文
+        fmt: fn(&str, &regex::Captures) -> Option<(String, String)>,
+    }
+
+    fn format_capture(name: &str, c: &regex::Captures) -> Option<(String, String)> {
+        let v = c.get(1)?.as_str().trim().trim_end_matches(|ch: char| ch.is_ascii_punctuation() || ch == '。' || ch == '，' || ch == '！' || ch == '？' || ch == '!').to_string();
+        if v.is_empty() {
+            return None;
+        }
+        let key = name;
+        let content = format!("用户明确要求记住：{key}为「{v}」。此偏好跨工作区全局有效。");
+        let id_slug = make_id_slug(&format!("{key}:{v}"));
+        Some((format!("mem_pref_global_{id_slug}"), content))
+    }
+
+    fn format_freetext(_name: &str, c: &regex::Captures) -> Option<(String, String)> {
+        let v = c.get(1)?.as_str().trim().trim_end_matches(|ch: char| ch.is_ascii_punctuation() || ch == '。' || ch == '，' || ch == '！' || ch == '？').to_string();
+        if v.is_empty() {
+            return None;
+        }
+        let content = format!("用户明确要求记住：{v}。此偏好跨工作区全局有效。");
+        let id_slug = make_id_slug(&v);
+        Some((format!("mem_pref_global_freetext_{id_slug}"), content))
+    }
+
+    fn make_id_slug(s: &str) -> String {
+        use std::fmt::Write as _;
+        let hash = Sha256::digest(s.as_bytes());
+        let mut out = String::with_capacity(16);
+        for b in &hash[..8] {
+            let _ = write!(out, "{:02x}", b);
+        }
+        out
+    }
+
+    use std::sync::OnceLock;
+    static RULES: OnceLock<Vec<(regex::Regex, fn(&regex::Captures) -> Option<(String, String)>)>> =
+        OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        let build = |pat: &'static str,
+                     f: fn(&regex::Captures) -> Option<(String, String)>|
+         -> Option<(regex::Regex, _)> {
+            Some((regex::Regex::new(pat).ok()?, f))
+        };
+        vec![
+            // 注意：中英文的每条 regex 都用 (?im)（Unicode 默认开启），
+            // 不要写成 (?im-u)，含中文会 parse error 导致 runtime panic。
+            //
+            // 排序原则：更具体的 pattern 在前，避免"记住我叫X"被兜底的
+            // "记住 X" 自由文本提前吞掉导致捕获内容不对。
+
+            // ── 身份/称呼：最具体 ─────────────────────
+            build(r"(?im)^\s*(?:以后|之后)?\s*(?:请?把我|请?叫我|喊我|称呼我)\s*(?:做|为)?\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
+                |c| format_capture("用户希望被称呼", c)),
+            build(r"(?im)^\s*(?:我叫|我的名字是|我是)\s*(?:做|为)?\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
+                |c| format_capture("用户姓名/身份", c)),
+            // 记住我叫 / 记住我是
+            build(r"(?im)^\s*(?:请?|麻烦|劳烦)?\s*记住?我(?:叫|名字是|是)\s*(?:做|为)?\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
+                |c| format_capture("用户希望被称呼", c)),
+
+            // ── 我喜欢/讨厌：比较具体 ───────────────────
+            build(r"(?im)^\s*(?:请?记住|记得|要?记住)?我(?:喜欢|偏好|比较?喜欢|更爱|最爱)\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
+                |c| format_capture("用户偏好(喜欢)", c)),
+            build(r"(?im)^\s*(?:请?记住|记得|要?记住)?我(?:不喜欢|讨厌|反感)\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
+                |c| format_capture("用户偏好(不喜欢)", c)),
+
+            // ── 我的 XX 是 XX（邮箱/微信/QQ 等）──────────
+            build(r"(?im)^\s*(?:我)?\s*的\s*(名字|姓名|昵称|称呼|邮箱|邮件|email|手机|电话|微信|wechat|qq|tg|telegram|discord|github|用户名|id|工号|部门|职位|公司)\s*(?:是|为|=)\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
+                |c| {
+                    let field = c.get(1)?.as_str().trim();
+                    let value = c.get(2)?.as_str().trim();
+                    if value.is_empty() { return None; }
+                    let content = format!("用户明确要求记住：用户的{field}为「{value}」。此偏好跨工作区全局有效。");
+                    let slug = {
+                        use sha2::{Digest, Sha256};
+                        use std::fmt::Write as _;
+                        let h = Sha256::digest(format!("{field}:{value}").as_bytes());
+                        let mut o = String::with_capacity(16);
+                        for b in &h[..8] { let _ = write!(o, "{:02x}", b); }
+                        o
+                    };
+                    Some((format!("mem_pref_global_{slug}"), content))
+                }),
+
+            // ── 自由记忆：请记住 <任意> / remember <任意> ──
+            // 必须放在最后，避免吞掉前面的具体 pattern。
+            // （前面有前缀的 "请记住 / 麻烦记住 XXX" 也走这里：匹配第 1 组。）
+            build(r"(?im)^\s*(?:请?|麻烦|劳烦)?\s*(?:记下来|记住|mark一下|mark 一下|存一下|记好)\s*[:：]?\s*(.+?)\s*$",
+                |c| format_freetext("", c)),
+            build(r"(?i)^\s*remember\s+(?:that\s+)?(.+?)\s*$",
+                |c| format_freetext("", c)),
+            build(r"(?i)^\s*call\s+me\s+(.+?)\s*[.!?]?\s*$",
+                |c| format_capture("用户希望被称呼(英文)", c)),
+            build(r"(?i)^\s*my\s+name\s+is\s+(.+?)\s*[.!?]?\s*$",
+                |c| format_capture("用户姓名(英文)", c)),
+        ].into_iter().flatten().collect()
+    });
+
+    for (re, f) in rules.iter() {
+        if let Some(caps) = re.captures(text) {
+            if let Some((id, content)) = f(&caps) {
+                let content_hash = {
+                    let mut hasher = Sha256::new();
+                    hasher.update(content.as_bytes());
+                    let h = hasher.finalize();
+                    use std::fmt::Write as _;
+                    let mut s = String::with_capacity(16);
+                    for b in &h[..8] { let _ = write!(s, "{:02x}", b); }
+                    s
+                };
+                let now = Utc::now();
+                return Some(MemoryUnit {
+                    id,
+                    path: "grodex://runtime/global-user-preference".to_string(),
+                    section: "global-runtime".to_string(),
+                    kind: MemoryKind::Preference,
+                    scope: MemoryScope::Global,
+                    status: UnitStatus::Active,
+                    content,
+                    content_hash,
+                    updated_at: now,
+                    created_at: now,
+                });
+            }
+        }
+    }
+    None
 }
 
 /// The frontend's handle to the session.
@@ -1951,5 +2198,63 @@ mod barrier_tests {
         b.reset();
         assert_eq!(b.completed_epoch(), 0);
         assert_eq!(b.consumed_epoch(), 0);
+    }
+}
+
+/// W4 fast path regex 防回归：
+/// - 确保含中文的每条 regex 能 parse（之前 (?im-u) Unicode 禁用会 panic）
+/// - 确保中英文各一条典型输入能生成 scope=Global kind=Preference 的 MemoryUnit
+#[cfg(test)]
+mod w4_preference_fast_path_tests {
+    use super::extract_user_preference_fast_path;
+    use grodex_memory::{MemoryKind, MemoryScope};
+
+    #[test]
+    fn regex_parses_and_matches_chinese_call_me() {
+        let cases = [
+            ("以后叫我 9527", "用户希望被称呼"),
+            ("请记住我叫9527!", "用户希望被称呼"),
+            ("我叫小明", "用户姓名"),
+            ("请记住我喜欢 Rust。", "用户偏好"),
+            ("记住我讨厌香菜", "用户偏好"),
+            ("我的邮箱是 dev@example.com", "邮箱"),
+            ("我的微信是 wx_abc", "微信"),
+            ("call me bob", "用户希望被称呼"),
+            ("My name is Charles.", "用户姓名"),
+            ("remember that I prefer dark mode", "明确要求记住"),
+            ("记下来 每周一 10:00 站会", "明确要求记住"),
+        ];
+        for (input, snippet) in cases {
+            let unit = extract_user_preference_fast_path(input)
+                .unwrap_or_else(|| panic!("W4 fast path failed to match: {input}"));
+            assert_eq!(unit.scope, MemoryScope::Global, "input: {input}");
+            assert_eq!(unit.kind, MemoryKind::Preference, "input: {input}");
+            assert!(
+                unit.content.contains(snippet),
+                "input={input}\nexpected snippet={snippet}\nactual={}",
+                unit.content
+            );
+            // 确定 id：同一句再次输入 → id 不变（幂等）
+            let unit2 = extract_user_preference_fast_path(input).unwrap();
+            assert_eq!(unit.id, unit2.id, "id must be stable: {input}");
+        }
+    }
+
+    #[test]
+    fn does_not_match_normal_questions() {
+        // 正常工作提问，不应该误触发
+        let negs = [
+            "帮我写个 rust hello world",
+            "explain memory consolidation",
+            "请问现在几点了",
+            "fix the build error",
+            "/help",
+        ];
+        for n in negs {
+            assert!(
+                extract_user_preference_fast_path(n).is_none(),
+                "W4 should NOT match ordinary question: {n}"
+            );
+        }
     }
 }

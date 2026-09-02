@@ -420,6 +420,7 @@ async fn build_session_parts(
     SessionId,
     Option<Arc<dyn RolloutStore>>,
     Option<Arc<tokio::sync::Mutex<grodex_loop::durable_subagent::DurableSubAgentSupervisor>>>,
+    tokio::task::JoinHandle<()>,
 )> {
     // Unified composition root: the builder assembles Config, Auth,
     // SamplingActor, PermissionManager (config `[rules]`), SandboxRuntime
@@ -441,6 +442,7 @@ async fn build_session_parts(
         session_id,
         runtime.rollout_store,
         runtime.subagent_recovery,
+        runtime.supervisor_task,
     ))
 }
 
@@ -1186,7 +1188,7 @@ async fn route_command(
 
 async fn serve_acp() -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (handle, mut acp_rx, mut session_id, rollout_store, subagent_recovery) =
+    let (handle, mut acp_rx, mut session_id, rollout_store, subagent_recovery, supervisor_task) =
         match build_session_parts(cwd).await {
         Ok(x) => x,
         Err(e) => {
@@ -1318,6 +1320,9 @@ async fn serve_acp() -> Result<()> {
     }
 
     let _ = handle.send(SessionCommand::Shutdown).await;
+    // 必须等 supervisor 把 shutdown 内部的 rollout 抽取 + blob 回收跑完，
+    // 否则 TUI 子进程直接退出，抽取写入被打断。
+    let _ = supervisor_task.await;
     Ok(())
 }
 

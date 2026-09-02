@@ -324,9 +324,56 @@ impl StdioClient {
 
 impl Drop for StdioClient {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Graceful shutdown path:
+        //   1) Close the agent's stdin pipe → serve_acp's read loop sees
+        //      EOF, breaks out, sends SessionCommand::Shutdown →
+        //      supervisor.run() drains into shutdown() which runs
+        //      rollout-extractor + blob reclaim + empty-dir cleanup.
+        //   2) Busy-poll try_wait() up to a bounded window; if the agent
+        //      exits itself we're done cleanly.
+        //   3) Otherwise SIGKILL as a hard fallback.
+        //
+        // The previous drop used `child.kill()` unconditionally —
+        // supervisor.shutdown() was never invoked on the TUI (ACP) path,
+        // so session-close evidence extraction was effectively disabled.
+        // (The CLI REPL path was fine because it awaited supervisor_task.)
+
+        // Explicitly drop the Write side of the stdin pipe so the agent's
+        // `next_line().await` returns Ok(None) / EOF. We replace the
+        // boxed writer with a no-op so subsequent accidental writes in
+        // sibling drops don't panic.
+        {
+            let old_stdin =
+                std::mem::replace(&mut self.stdin, Box::new(NoopWrite) as Box<dyn Write + Send>);
+            drop(old_stdin);
+        }
+
+        const GRACE_MS: u64 = 1500;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(GRACE_MS);
+        let mut exited = false;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => { exited = true; break; }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !exited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
+}
+
+struct NoopWrite;
+impl std::io::Write for NoopWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
 fn truncate_str(s: &str, max: usize) -> String {

@@ -1399,6 +1399,48 @@ impl MemoryDatabase {
         Ok(groups.into_iter().collect())
     }
 
+    /// 返回全部 active evidence 的扁平列表（无分组）。
+    ///
+    /// P1 W3 用：consolidator 对 content 做归一化（trim/lower/去标点/压缩空白）
+    /// 后再分桶，解决原始 content_hash 精确分桶无法合并同义文本的问题。
+    pub fn list_active_evidence_flat(&self) -> Result<Vec<EvidenceUnit>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, rollout_id, path, section, scope, status, content, content_hash,
+                    occurred_at, created_at, superseded_by, superseded_at,
+                    rollout_available, rollout_expired_at, subchunk_index
+             FROM evidence_units WHERE status = 'active'
+             ORDER BY occurred_at"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let rollout_avail: i64 = row.get(12)?;
+            Ok(EvidenceUnit {
+                id: row.get(0)?,
+                rollout_id: row.get(1)?,
+                path: row.get(2)?,
+                section: row.get(3)?,
+                scope: MemoryScope::from_str(&row.get::<_, String>(4)?)
+                    .unwrap_or(MemoryScope::Workspace),
+                status: EvidenceStatus::from_str(&row.get::<_, String>(5)?)
+                    .unwrap_or(EvidenceStatus::Active),
+                content: row.get(6)?,
+                content_hash: row.get(7)?,
+                occurred_at: parse_ts(&row.get::<_, String>(8)?),
+                created_at: parse_ts(&row.get::<_, String>(9)?),
+                superseded_by: row.get(10)?,
+                superseded_at: row.get::<_, Option<String>>(11)?.as_deref().map(parse_ts),
+                rollout_available: rollout_avail != 0,
+                rollout_expired_at: row.get::<_, Option<String>>(13)?.as_deref().map(parse_ts),
+                subchunk_index: row.get(14)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Bump access_count + last_accessed_at for a retrieved memory unit.
     /// Called by the retrieval pipeline after a unit actually matches a
     /// query and is returned (not just FTS candidate).

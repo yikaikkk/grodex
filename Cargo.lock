@@ -951,6 +951,7 @@ dependencies = [
  "grodex-telemetry",
  "grodex-tools",
  "loom",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

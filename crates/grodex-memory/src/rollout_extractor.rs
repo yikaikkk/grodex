@@ -122,6 +122,25 @@ impl MemoryDatabase {
         report.evidence_dedup = 0; // TODO: count deduplications inside loop if need
         Ok(report)
     }
+
+    /// 抽取单一会话的 rollout.jsonl → EvidenceUnits（会话退出时用）。
+    ///
+    /// 与 [Self::extract_evidence_from_rollouts] 的区别：
+    /// - 只处理指定 session_id 的 rollout.jsonl，不枚举 sessions 根目录
+    /// - 不按 `evidence_units.rollout_id` 跳过会话（同一个会话的增量事件允许重复扫）；
+    ///   去重由 `(rollout_id, content_hash)` 的 DB UNIQUE 约束保证（INSERT OR IGNORE）。
+    ///
+    /// 幂等、fail-safe：`rollout.jsonl` 不存在 / 不可读时返回 `0`，不报错。
+    pub fn extract_evidence_from_session(
+        &self,
+        session_id: &str,
+        rollout_jsonl: &Path,
+    ) -> Result<usize, DbError> {
+        if !rollout_jsonl.exists() {
+            return Ok(0);
+        }
+        extract_single_session(self, session_id, rollout_jsonl, MAX_EVIDENCE_PER_SESSION)
+    }
 }
 
 fn extract_single_session(
