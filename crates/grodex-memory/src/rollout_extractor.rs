@@ -316,33 +316,12 @@ fn extract_single_session(
                 pending_assistant_texts.clear();
                 pending_assistant_ts = None;
             }
-            // ── Sub-agent 结束: 视为 assistant 的一部分 ────────────
-            "SubAgentTaskFinished" => {
-                if let Some(result) = payload
-                    .get("final_result")
-                    .or_else(|| payload.get("summary"))
-                    .or_else(|| payload.get("result"))
-                {
-                    let s = match result {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    let s = s.trim().to_string();
-                    if !s.is_empty() && count < max_units {
-                        if let Some(eu) = build_evidence(
-                            rollout_id,
-                            journal,
-                            "subagent_summary",
-                            &s,
-                            MemoryScope::Workspace,
-                            occurred,
-                        ) {
-                            let _ = db.upsert_evidence_unit(&eu);
-                            count += 1;
-                        }
-                    }
-                }
-            }
+            // ── Sub-agent 事件不提取 ────────────────────────────────
+            // 用户约束：subagent 的所有输入来自主 agent，而非用户直接输入，
+            // 因此 SubAgentTaskFinished 不应产生 evidence（避免污染长期记忆）。
+            "SubAgentTaskFinished" => {}
+            // ── 中间推理不提取：非稳定事实 ──────────────────────────
+            "ModelItemProduced" => {}
             _ => {}
         }
     }
@@ -435,4 +414,86 @@ fn pick_timestamp(evt: &Value) -> chrono::DateTime<Utc> {
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(Utc::now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write each JSON value as a line into a rollout.jsonl under `dir`.
+    fn write_rollout(dir: &std::path::Path, events: &[serde_json::Value]) -> std::path::PathBuf {
+        let journal = dir.join("rollout.jsonl");
+        let mut f = std::fs::File::create(&journal).unwrap();
+        for evt in events {
+            writeln!(f, "{}", evt).unwrap();
+        }
+        f
+        .flush()
+        .unwrap();
+        journal
+    }
+
+    fn mk_event(event_type: &str, payload: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "event_type": event_type,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "payload": payload,
+        })
+    }
+
+    /// SubAgentTaskFinished must NOT produce evidence (user constraint:
+    /// subagent inputs come from the main agent, not the user directly).
+    #[test]
+    fn subagent_task_finished_produces_no_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = write_rollout(tmp.path(), &[
+            mk_event("SubAgentTaskFinished", serde_json::json!({
+                "final_result": "subagent did some work",
+                "summary": "subagent summary",
+            })),
+            mk_event("SubAgentTaskFinished", serde_json::json!({
+                "result": "another subagent result",
+            })),
+        ]);
+
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let n = db.extract_evidence_from_session("test_subagent", &journal).unwrap();
+        assert_eq!(n, 0, "SubAgentTaskFinished must not produce evidence");
+        // DB should also have zero evidence units.
+        let count = db.conn.lock().unwrap()
+            .query_row("SELECT COUNT(*) FROM evidence_units", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// ModelItemProduced (intermediate reasoning) must NOT produce evidence.
+    #[test]
+    fn model_item_produced_produces_no_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = write_rollout(tmp.path(), &[
+            mk_event("ModelItemProduced", serde_json::json!({
+                "text": "thinking about the problem",
+            })),
+        ]);
+
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let n = db.extract_evidence_from_session("test_model_item", &journal).unwrap();
+        assert_eq!(n, 0, "ModelItemProduced must not produce evidence");
+    }
+
+    /// Control: UserInputAccepted DOES produce evidence (positive case).
+    #[test]
+    fn user_input_accepted_produces_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = write_rollout(tmp.path(), &[
+            mk_event("UserInputAccepted", serde_json::json!({
+                "text": "记住我喜欢 Rust",
+            })),
+        ]);
+
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let n = db.extract_evidence_from_session("test_user_input", &journal).unwrap();
+        assert_eq!(n, 1, "UserInputAccepted should produce 1 evidence unit");
+    }
 }

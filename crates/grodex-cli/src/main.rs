@@ -829,6 +829,27 @@ async fn route_command(
                     }
                 };
 
+            // Content caps for snapshot items — keep the ACP frame well
+            // under the TUI's 16MB single-line cap. Reasoning can grow to
+            // tens of KB/step (a 100-turn session → ~2MB JSON just from
+            // reasoning). If the full content matters for *model* context
+            // it's already in ContextRestored; the preview shown to the
+            // user only needs a head slice.
+            const CAP_USER: usize = 4000;
+            const CAP_ASSISTANT: usize = 8000;
+            const CAP_REASONING: usize = 2000;
+            const CAP_TOOL_CALL: usize = 4000;
+            const CAP_TOOL_RESULT: usize = 4000;
+
+            fn truncate_content(s: &str, max: usize) -> String {
+                let count = s.chars().count();
+                if count <= max {
+                    return s.to_string();
+                }
+                let head: String = s.chars().take(max).collect();
+                format!("{head}\n…[{count} chars total, truncated for snapshot]")
+            }
+
             let mut snapshot_items: Vec<grodex_protocol::acp::SnapshotItem> = Vec::new();
             for ev in &full_journal {
                 use grodex_rollout::event::RolloutEventType;
@@ -838,7 +859,7 @@ async fn route_command(
                             snapshot_items.push(grodex_protocol::acp::SnapshotItem {
                                 item_id: format!("u-{}", ev.seq),
                                 item_type: "user".to_string(),
-                                content: text.to_string(),
+                                content: truncate_content(text, CAP_USER),
                                 complete: true,
                             });
                         }
@@ -852,7 +873,7 @@ async fn route_command(
                                     grodex_protocol::acp::SnapshotItem {
                                         item_id: format!("th-{}", ev.seq),
                                         item_type: "thinking".to_string(),
-                                        content: reasoning.to_string(),
+                                        content: truncate_content(reasoning, CAP_REASONING),
                                         complete: true,
                                     },
                                 );
@@ -866,7 +887,7 @@ async fn route_command(
                                     grodex_protocol::acp::SnapshotItem {
                                         item_id: format!("a-{}", ev.seq),
                                         item_type: "assistant".to_string(),
-                                        content: text.to_string(),
+                                        content: truncate_content(text, CAP_ASSISTANT),
                                         complete: true,
                                     },
                                 );
@@ -899,7 +920,7 @@ async fn route_command(
                                     grodex_protocol::acp::SnapshotItem {
                                         item_id: format!("tc-{}-{}", ev.seq, i),
                                         item_type: "tool_call".to_string(),
-                                        content: merged.to_string(),
+                                        content: truncate_content(&merged.to_string(), CAP_TOOL_CALL),
                                         complete: true,
                                     },
                                 );
@@ -931,7 +952,7 @@ async fn route_command(
                         snapshot_items.push(grodex_protocol::acp::SnapshotItem {
                             item_id: format!("tr-{}", ev.seq),
                             item_type: "tool_result".to_string(),
-                            content: merged.to_string(),
+                            content: truncate_content(&merged.to_string(), CAP_TOOL_RESULT),
                             complete: true,
                         });
                     }

@@ -32,19 +32,24 @@
 
 // V2 modules
 pub mod backfill;
+pub mod conflict_judge;
 pub mod consolidator;
 pub mod database;
 pub mod embedding;
 pub mod eval;
 pub mod governance;
 pub mod indexer;
+pub mod llm_extractor;
 pub mod negative_cache;
 pub mod parser;
+pub mod proposal;
+pub mod query_understanding;
 pub mod retrievers;
 pub mod rollout_extractor;
 pub mod router;
 pub mod sampling;
 pub mod schema;
+pub mod static_context;
 pub mod template;
 pub mod types;
 
@@ -67,8 +72,23 @@ pub use indexer::{
     apply_deletions, reconcile, scan_directory, ConsolidationState, ConsolidationTx,
     ReconciliationDiff, ScannedFile,
 };
+pub use llm_extractor::{
+    EvidenceExtractor, ExtractionContext, ExtractionError, ExtractionResult, ExtractedClaim,
+    MockEvidenceExtractor, RolloutEventSummary, SourceRef, ToolCallSummary, ToolResultSummary,
+    EXTRACTOR_SYSTEM_PROMPT, render_context_for_llm,
+};
 pub use consolidator::ConsolidationReport;
+pub use governance::{GovernanceReport, format_governance_banner, run_conflict_resolution_pass};
 pub use parser::{ParsedMemoryChunk, ParsedMemoryFile};
+pub use proposal::{ProposalCommitReport, RejectedClaim, propose_and_commit, validate_claim, create_proposal};
+pub use conflict_judge::{
+    ConflictJudge, ConflictJudgeError, ConflictJudgeInput, ConflictJudgeResult,
+    MockConflictJudge, CONFLICT_JUDGE_PROMPT,
+};
+pub use query_understanding::{
+    MockQueryUnderstanding, QueryUnderstanding, QueryUnderstandingError, QueryUnderstandingModel,
+    QueryIntent, QUERY_UNDERSTANDING_PROMPT,
+};
 pub use rollout_extractor::ExtractionReport;
 pub use negative_cache::{CacheEntry, NegativeCache};
 pub use retrievers::{
@@ -82,6 +102,7 @@ pub use sampling::{
     run_eval_cycle, EvalLabels, ExtractedQuery, QueryLabels,
 };
 pub use schema::{SCHEMA_VERSION, apply_schema, bump_index_generation, read_index_generation};
+pub use static_context::{StaticContext, StaticContextLoader};
 pub use template::{EvidenceMetadata, EvidenceTemplate, EvidenceValidation};
 pub use types::*;
 

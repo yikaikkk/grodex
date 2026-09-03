@@ -18,6 +18,85 @@ use crate::indexer::ConsolidationState;
 use crate::schema;
 use crate::types::*;
 
+/// Enrich content for SQLite FTS5 indexing so CJK queries with bigram/
+/// unigram expansion match against it.
+///
+/// Background: FTS5 with tokenize='unicode61' treats an unspaced CJK run
+/// as a single token. When queries split CJK into bigram/unigram tokens
+/// (see `retrievers::build_fts_query`), the two token sets have zero
+/// overlap — candidate set is empty even for semantically identical
+/// content.
+///
+/// Fix: append an auxiliary `_CJKTOKENS_` block to every FTS row that
+/// contains every CJK bigram and CJK unigram of the content, separated
+/// by spaces. Unicode61 tokenizes space-delimited tokens individually,
+/// so `"我 叫 什 么 我叫 叫什 什么"` becomes 7 tokens, perfectly matching
+/// the query-side expansion.
+///
+/// Latin/ASCII content keeps the original verbatim (FTS works on it natively).
+fn enrich_content_for_fts(content: &str) -> String {
+    // Collect CJK tokens.
+    let mut cjk_runs: Vec<String> = Vec::new();
+    let mut cur_run = String::new();
+    for c in content.chars() {
+        if is_cjk_char(c) {
+            cur_run.push(c);
+        } else {
+            if !cur_run.is_empty() {
+                cjk_runs.push(std::mem::take(&mut cur_run));
+            }
+        }
+    }
+    if !cur_run.is_empty() {
+        cjk_runs.push(cur_run);
+    }
+
+    if cjk_runs.is_empty() {
+        // No CJK — no enrichment needed.
+        return content.to_string();
+    }
+
+    let mut enriched = String::with_capacity(content.len() + cjk_runs.len() * 8);
+    enriched.push_str(content);
+    enriched.push_str("\n\n_CJKTOKENS_ ");
+    let mut first = true;
+    for run in &cjk_runs {
+        let chars: Vec<char> = run.chars().collect();
+        // Bigrams first, then unigrams (same order as build_fts_query).
+        if chars.len() >= 2 {
+            for w in chars.windows(2) {
+                if !first {
+                    enriched.push(' ');
+                }
+                for c in w {
+                    enriched.push(*c);
+                }
+                first = false;
+            }
+        }
+        for c in &chars {
+            if !first {
+                enriched.push(' ');
+            }
+            enriched.push(*c);
+            first = false;
+        }
+    }
+    enriched
+}
+
+fn is_cjk_char(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x309F | // Hiragana
+        0x30A0..=0x30FF | // Katakana
+        0x3400..=0x4DBF | // CJK Ext A
+        0x4E00..=0x9FFF | // CJK Unified Ideographs
+        0xAC00..=0xD7A3 | // Hangul Syllables
+        0xF900..=0xFAFF | // CJK Compatibility Ideographs
+        0x20000..=0x2A6DF // CJK Ext B
+    )
+}
+
 /// Errors from the memory database.
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -102,10 +181,13 @@ impl MemoryDatabase {
             ],
         )?;
         // Sync standalone FTS: delete old row, insert new.
+        // CJK enrichment: append _CJKTOKENS_ block with bigrams + unigrams
+        // so that query-side CJK splitting matches unicode61 tokens.
+        let fts_content = enrich_content_for_fts(&unit.content);
         tx.execute("DELETE FROM memory_fts WHERE unit_id = ?1", params![unit.id])?;
         tx.execute(
             "INSERT INTO memory_fts (unit_id, content, path) VALUES (?1, ?2, ?3)",
-            params![unit.id, unit.content, unit.path],
+            params![unit.id, fts_content, unit.path],
         )?;
         schema::bump_index_generation(&tx)?;
         tx.commit()?;
@@ -226,10 +308,12 @@ impl MemoryDatabase {
             ],
         )?;
         // Sync standalone FTS: delete old row, insert new.
+        // CJK enrichment: evidence content is often CJK-heavy user dialogues.
+        let fts_content = enrich_content_for_fts(&unit.content);
         tx.execute("DELETE FROM evidence_fts WHERE unit_id = ?1", params![unit.id])?;
         tx.execute(
             "INSERT INTO evidence_fts (unit_id, content, path) VALUES (?1, ?2, ?3)",
-            params![unit.id, unit.content, unit.path],
+            params![unit.id, fts_content, unit.path],
         )?;
         schema::bump_index_generation(&tx)?;
         tx.commit()?;
@@ -431,15 +515,22 @@ impl MemoryDatabase {
             ],
         )?;
         // Sync standalone FTS: delete old row, insert new.
+        // CJK enrichment: name / description / when_to_use / triggers all can
+        // contain CJK text; enrich each column independently so bigram matches
+        // don't leak across unrelated columns.
+        let fts_name = enrich_content_for_fts(&skill.name);
+        let fts_description = enrich_content_for_fts(&skill.description);
+        let fts_when_to_use = enrich_content_for_fts(&skill.when_to_use);
+        let fts_triggers = enrich_content_for_fts(&triggers_json);
         tx.execute("DELETE FROM skill_fts WHERE skill_id = ?1", params![skill.skill_id])?;
         tx.execute(
             "INSERT INTO skill_fts (skill_id, name, description, when_to_use, triggers) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 skill.skill_id,
-                skill.name,
-                skill.description,
-                skill.when_to_use,
-                triggers_json,
+                fts_name,
+                fts_description,
+                fts_when_to_use,
+                fts_triggers,
             ],
         )?;
         schema::bump_index_generation(&tx)?;
@@ -1286,9 +1377,10 @@ impl MemoryDatabase {
                 ],
             )?;
             tx.execute("DELETE FROM memory_fts WHERE unit_id = ?1", params![unit.id])?;
+            let fts_content = enrich_content_for_fts(&unit.content);
             tx.execute(
                 "INSERT INTO memory_fts (unit_id, content, path) VALUES (?1, ?2, ?3)",
-                params![unit.id, unit.content, unit.path],
+                params![unit.id, fts_content, unit.path],
             )?;
         }
 
@@ -1672,6 +1764,338 @@ impl Clone for MemoryDatabase {
     }
 }
 
+impl MemoryDatabase {
+    // ─────────────── Memory Proposals (v4) ───────────────
+
+    /// Insert a memory proposal (status=pending by default).
+    /// Does NOT touch memory_units — use `commit_proposal` for that.
+    pub fn insert_proposal(&self, p: &MemoryProposal) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            r#"INSERT INTO memory_proposals
+               (proposal_id, content, kind, scope, confidence, certainty,
+                source_evidence_ids, source_rollout_id, source_seq_start,
+                source_seq_end, source_turn_id, extractor_model, status,
+                rejection_reason, created_at, resolved_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+               ON CONFLICT(proposal_id) DO UPDATE SET
+               content=excluded.content, kind=excluded.kind, scope=excluded.scope,
+               confidence=excluded.confidence, certainty=excluded.certainty,
+               source_evidence_ids=excluded.source_evidence_ids,
+               source_rollout_id=excluded.source_rollout_id,
+               source_seq_start=excluded.source_seq_start,
+               source_seq_end=excluded.source_seq_end,
+               source_turn_id=excluded.source_turn_id,
+               extractor_model=excluded.extractor_model"#,
+            params![
+                p.proposal_id,
+                p.content,
+                p.kind.as_str(),
+                p.scope.as_str(),
+                p.confidence,
+                p.certainty.as_str(),
+                serde_json::to_string(&p.source_evidence_ids).unwrap_or_else(|_| "[]".into()),
+                p.source_rollout_id,
+                p.source_seq_start,
+                p.source_seq_end,
+                p.source_turn_id,
+                p.extractor_model,
+                p.status.as_str(),
+                p.rejection_reason,
+                p.created_at.to_rfc3339(),
+                p.resolved_at.map(|t| t.to_rfc3339()),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark a proposal as dismissed (validation failure or conflict rejection).
+    pub fn dismiss_proposal(
+        &self,
+        proposal_id: &str,
+        reason: &str,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE memory_proposals SET status='dismissed', rejection_reason=?1, resolved_at=?2 \
+             WHERE proposal_id=?3",
+            params![reason, Utc::now().to_rfc3339(), proposal_id],
+        )?;
+        Ok(())
+    }
+
+    /// Commit a proposal: create a memory_unit (status=candidate) from the proposal,
+    /// link evidence edges, then mark proposal as committed.
+    /// Returns the new memory unit ID.
+    pub fn commit_proposal(
+        &self,
+        proposal_id: &str,
+        memory_id: &str,
+    ) -> Result<String, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+
+        // Load proposal
+        let (content, kind_str, scope_str, confidence, certainty_str,
+             source_evidence_ids_json, source_rollout_id,
+             source_seq_start, source_seq_end, source_turn_id,
+             extractor_model): (String, String, String, f64, String, String, String, i64, i64, String, String) = tx.query_row(
+            "SELECT content, kind, scope, confidence, certainty, source_evidence_ids, \
+             source_rollout_id, source_seq_start, source_seq_end, source_turn_id, extractor_model \
+             FROM memory_proposals WHERE proposal_id=?1",
+            params![proposal_id],
+            |row| Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?,
+            )),
+        )?;
+
+        let kind = MemoryKind::from_str(&kind_str).unwrap_or(MemoryKind::Fact);
+        let scope = MemoryScope::from_str(&scope_str).unwrap_or(MemoryScope::Workspace);
+        let certainty = Certainty::from_str(&certainty_str).unwrap_or(Certainty::Explicit);
+        let now = Utc::now();
+        let content_hash = sha256_hex(&content);
+
+        // Insert memory unit with v4 provenance columns.
+        //
+        // NOTE: We write status='active' here rather than 'candidate'.
+        // Review (2026-09-03) flagged a hard block: the FTS retrieval gate
+        // (`fts5_memory_candidates`) filters `WHERE m.status='active'`, and
+        // *no production code* was ever wired to promote candidate→active.
+        // This meant proposal-wrote memory was permanently invisible even
+        // after successful commit. The 'candidate' status remains useful as
+        // a lifecycle state in the schema (for future LLM conflict-judge
+        // pre-approval), but the default commit path for validated +
+        // human-explicit claims must go straight to active so retrieval
+        // can surface them. This mirrors how W3 consolidator also writes
+        // directly to Active status.
+        tx.execute(
+            r#"INSERT INTO memory_units
+               (id, path, section, kind, scope, status, content, content_hash,
+                updated_at, created_at, confidence, certainty, source_evidence_ids,
+                source_rollout_id, source_seq_start, source_seq_end, source_turn_id,
+                extractor_model, extractor_version, prompt_version)
+               VALUES (?1, ?2, '', ?3, ?4, 'active', ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, '', '')
+               ON CONFLICT(id) DO UPDATE SET
+               content=excluded.content, content_hash=excluded.content_hash,
+               kind=excluded.kind, scope=excluded.scope, confidence=excluded.confidence,
+               certainty=excluded.certainty, source_evidence_ids=excluded.source_evidence_ids,
+               source_rollout_id=excluded.source_rollout_id,
+               source_seq_start=excluded.source_seq_start,
+               source_seq_end=excluded.source_seq_end,
+               source_turn_id=excluded.source_turn_id,
+               extractor_model=excluded.extractor_model,
+               updated_at=excluded.updated_at"#,
+            params![
+                memory_id,
+                source_rollout_id, // path = rollout_id for traceability
+                kind.as_str(),
+                scope.as_str(),
+                content,
+                content_hash,
+                now.to_rfc3339(),
+                confidence,
+                certainty.as_str(),
+                source_evidence_ids_json,
+                source_rollout_id,
+                source_seq_start,
+                source_seq_end,
+                source_turn_id,
+                extractor_model,
+            ],
+        )?;
+        // Sync FTS — CJK-enrich proposal content so Chinese queries hit.
+        let fts_content = enrich_content_for_fts(&content);
+        tx.execute("DELETE FROM memory_fts WHERE unit_id=?1", params![memory_id])?;
+        tx.execute(
+            "INSERT INTO memory_fts (unit_id, content, path) VALUES (?1, ?2, ?3)",
+            params![memory_id, fts_content, source_rollout_id],
+        )?;
+
+        // Link evidence edges: each evidence_id → Supports.
+        // Tolerant: evidence may have been TTL-expired before commit; skip
+        // missing evidence_id instead of failing the whole proposal commit.
+        let ev_ids: Vec<String> = serde_json::from_str(&source_evidence_ids_json).unwrap_or_default();
+        for ev_id in &ev_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_evidence_edges (memory_id, evidence_id, relation, created_at) \
+                 SELECT ?1, ?2, 'supports', ?3 \
+                 WHERE EXISTS (SELECT 1 FROM evidence_units WHERE id=?2)",
+                params![memory_id, ev_id, now.to_rfc3339()],
+            )?;
+        }
+
+        // Mark proposal as committed
+        tx.execute(
+            "UPDATE memory_proposals SET status='committed', resolved_at=?1 WHERE proposal_id=?2",
+            params![now.to_rfc3339(), proposal_id],
+        )?;
+
+        schema::bump_index_generation(&tx)?;
+        tx.commit()?;
+        Ok(memory_id.to_string())
+    }
+
+    /// List pending proposals (for conflict check / batch processing).
+    pub fn list_pending_proposals(&self) -> Result<Vec<MemoryProposal>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT proposal_id, content, kind, scope, confidence, certainty, \
+             source_evidence_ids, source_rollout_id, source_seq_start, source_seq_end, \
+             source_turn_id, extractor_model, status, rejection_reason, created_at, resolved_at \
+             FROM memory_proposals WHERE status='pending' ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let created: String = row.get(14)?;
+            let resolved: Option<String> = row.get(15)?;
+            Ok(MemoryProposal {
+                proposal_id: row.get(0)?,
+                content: row.get(1)?,
+                kind: MemoryKind::from_str(&row.get::<_, String>(2)?).unwrap_or(MemoryKind::Fact),
+                scope: MemoryScope::from_str(&row.get::<_, String>(3)?).unwrap_or(MemoryScope::Workspace),
+                confidence: row.get(4)?,
+                certainty: Certainty::from_str(&row.get::<_, String>(5)?).unwrap_or(Certainty::Explicit),
+                source_evidence_ids: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+                source_rollout_id: row.get(7)?,
+                source_seq_start: row.get(8)?,
+                source_seq_end: row.get(9)?,
+                source_turn_id: row.get(10)?,
+                extractor_model: row.get(11)?,
+                status: ProposalStatus::from_str(&row.get::<_, String>(12)?).unwrap_or(ProposalStatus::Pending),
+                rejection_reason: row.get(13)?,
+                created_at: parse_ts(&created),
+                resolved_at: resolved.as_ref().map(|s| parse_ts(s)),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    /// Record a conflict between two memory units.
+    pub fn add_conflict(&self, c: &MemoryConflict) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO memory_conflicts
+               (conflict_id, left_memory_id, right_memory_id, relation, confidence,
+                reason, status, resolved_at, resolution, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+               ON CONFLICT(conflict_id) DO UPDATE SET
+               relation=excluded.relation, confidence=excluded.confidence,
+               reason=excluded.reason, status=excluded.status,
+               resolved_at=excluded.resolved_at, resolution=excluded.resolution"#,
+            params![
+                c.conflict_id,
+                c.left_memory_id,
+                c.right_memory_id,
+                c.relation.as_str(),
+                c.confidence,
+                c.reason,
+                c.status.as_str(),
+                c.resolved_at.map(|t| t.to_rfc3339()),
+                c.resolution,
+                c.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve a conflict and update memory unit statuses accordingly.
+    /// If relation=supersedes: left (old) → superseded, right (new) → active.
+    /// If relation=conflicts: both → conflicted.
+    /// If relation=duplicate or equivalent: right → dismissed.
+    pub fn resolve_conflict(
+        &self,
+        conflict_id: &str,
+        relation: ConflictRelation,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+
+        let (left_id, right_id): (String, String) = tx.query_row(
+            "SELECT left_memory_id, right_memory_id FROM memory_conflicts WHERE conflict_id=?1",
+            params![conflict_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let now = Utc::now().to_rfc3339();
+        match relation {
+            ConflictRelation::Supersedes => {
+                tx.execute("UPDATE memory_units SET status='superseded', updated_at=?1 WHERE id=?2", params![now, left_id])?;
+                tx.execute("UPDATE memory_units SET status='active', updated_at=?1 WHERE id=?2", params![now, right_id])?;
+            }
+            ConflictRelation::Conflicts => {
+                tx.execute("UPDATE memory_units SET status='conflicted', updated_at=?1 WHERE id=?2", params![now, left_id])?;
+                tx.execute("UPDATE memory_units SET status='conflicted', updated_at=?1 WHERE id=?2", params![now, right_id])?;
+            }
+            ConflictRelation::Duplicate | ConflictRelation::Equivalent => {
+                tx.execute("UPDATE memory_units SET status='dismissed', updated_at=?1 WHERE id=?2", params![now, right_id])?;
+                tx.execute("UPDATE memory_units SET status='active', updated_at=?1 WHERE id=?2", params![now, left_id])?;
+            }
+            ConflictRelation::Independent => {
+                tx.execute("UPDATE memory_units SET status='active', updated_at=?1 WHERE id=?2", params![now, left_id])?;
+                tx.execute("UPDATE memory_units SET status='active', updated_at=?1 WHERE id=?2", params![now, right_id])?;
+            }
+        }
+        tx.execute(
+            "UPDATE memory_conflicts SET status='resolved', resolved_at=?1, resolution=?2 WHERE conflict_id=?3",
+            params![now, relation.as_str(), conflict_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// List active (pending) conflicts.
+    pub fn list_pending_conflicts(&self) -> Result<Vec<MemoryConflict>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT conflict_id, left_memory_id, right_memory_id, relation, confidence, \
+             reason, status, resolved_at, resolution, created_at \
+             FROM memory_conflicts WHERE status='pending' ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let created: String = row.get(9)?;
+            let resolved: Option<String> = row.get(7)?;
+            Ok(MemoryConflict {
+                conflict_id: row.get(0)?,
+                left_memory_id: row.get(1)?,
+                right_memory_id: row.get(2)?,
+                relation: ConflictRelation::from_str(&row.get::<_, String>(3)?)
+                    .unwrap_or(ConflictRelation::Independent),
+                confidence: row.get(4)?,
+                reason: row.get(5)?,
+                status: ConflictStatus::from_str(&row.get::<_, String>(6)?)
+                    .unwrap_or(ConflictStatus::Pending),
+                resolved_at: resolved.as_ref().map(|s| parse_ts(s)),
+                resolution: row.get(8)?,
+                created_at: parse_ts(&created),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    /// Update a memory unit's status (used by governance / proposal flow).
+    pub fn set_memory_unit_status(&self, id: &str, status: UnitStatus) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE memory_units SET status=?1, updated_at=?2 WHERE id=?3",
+            params![status.as_str(), Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+}
+
+/// Compute SHA-256 hex digest of a string.
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(s.as_bytes());
+    let mut o = String::with_capacity(64);
+    for b in &h {
+        use std::fmt::Write;
+        let _ = write!(o, "{:02x}", b);
+    }
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1982,5 +2406,147 @@ mod tests {
             .expect("fail-open: empty embed result must not error");
         assert!(!results.is_empty());
         assert!(results.iter().any(|r| r.content.contains("cargo build")));
+    }
+
+    // ─────────── v4 DAO tests ───────────
+
+    #[test]
+    fn proposal_insert_commit_roundtrip() {
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let now = Utc::now();
+        let proposal = MemoryProposal {
+            proposal_id: "prop_1".into(),
+            content: "用户希望被称呼为 ikkk。".into(),
+            kind: MemoryKind::Preference,
+            scope: MemoryScope::Global,
+            confidence: 0.99,
+            certainty: Certainty::Explicit,
+            source_evidence_ids: vec!["ev_abc".into()],
+            source_rollout_id: "session_42".into(),
+            source_seq_start: 10,
+            source_seq_end: 12,
+            source_turn_id: "turn_1".into(),
+            extractor_model: "test-model".into(),
+            status: ProposalStatus::Pending,
+            rejection_reason: String::new(),
+            created_at: now,
+            resolved_at: None,
+        };
+        db.insert_proposal(&proposal).unwrap();
+
+        let pending = db.list_pending_proposals().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content, "用户希望被称呼为 ikkk。");
+
+        // Commit → creates memory unit
+        let mem_id = db.commit_proposal("prop_1", "mem_ikkk_1").unwrap();
+        assert_eq!(mem_id, "mem_ikkk_1");
+
+        // Proposal should now be committed
+        let pending2 = db.list_pending_proposals().unwrap();
+        assert_eq!(pending2.len(), 0);
+
+        // Memory unit should exist with status=candidate
+        let mem = db.get_memory_unit("mem_ikkk_1").unwrap().unwrap();
+        assert_eq!(mem.content, "用户希望被称呼为 ikkk。");
+        assert_eq!(mem.kind, MemoryKind::Preference);
+        assert_eq!(mem.scope, MemoryScope::Global);
+    }
+
+    #[test]
+    fn proposal_dismiss_roundtrip() {
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let now = Utc::now();
+        let proposal = MemoryProposal {
+            proposal_id: "prop_2".into(),
+            content: "test content".into(),
+            kind: MemoryKind::Fact,
+            scope: MemoryScope::Workspace,
+            confidence: 0.5,
+            certainty: Certainty::Inferred,
+            source_evidence_ids: vec![],
+            source_rollout_id: "s1".into(),
+            source_seq_start: 0,
+            source_seq_end: 1,
+            source_turn_id: "t1".into(),
+            extractor_model: "test".into(),
+            status: ProposalStatus::Pending,
+            rejection_reason: String::new(),
+            created_at: now,
+            resolved_at: None,
+        };
+        db.insert_proposal(&proposal).unwrap();
+        db.dismiss_proposal("prop_2", "contains secret key pattern").unwrap();
+        let pending = db.list_pending_proposals().unwrap();
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn conflict_add_resolve_supersedes() {
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        // Create two memory units that conflict
+        for (id, content) in [("mem_old", "用户希望被称呼为 Alice。"), ("mem_new", "用户希望被称呼为 ikkk。")] {
+            let unit = MemoryUnit {
+                id: id.into(),
+                path: "test".into(),
+                section: String::new(),
+                kind: MemoryKind::Preference,
+                scope: MemoryScope::Global,
+                status: UnitStatus::Active,
+                content: content.into(),
+                content_hash: format!("hash_{id}"),
+                updated_at: Utc::now(),
+                created_at: Utc::now(),
+            };
+            db.upsert_memory_unit(&unit).unwrap();
+        }
+
+        let conflict = MemoryConflict {
+            conflict_id: "conf_1".into(),
+            left_memory_id: "mem_old".into(),
+            right_memory_id: "mem_new".into(),
+            relation: ConflictRelation::Supersedes,
+            confidence: 0.95,
+            reason: "用户明确更改了称呼".into(),
+            status: ConflictStatus::Pending,
+            resolved_at: None,
+            resolution: String::new(),
+            created_at: Utc::now(),
+        };
+        db.add_conflict(&conflict).unwrap();
+
+        let pending = db.list_pending_conflicts().unwrap();
+        assert_eq!(pending.len(), 1);
+
+        // Resolve: old → superseded, new → active
+        db.resolve_conflict("conf_1", ConflictRelation::Supersedes).unwrap();
+        let pending2 = db.list_pending_conflicts().unwrap();
+        assert_eq!(pending2.len(), 0);
+
+        let old = db.get_memory_unit("mem_old").unwrap().unwrap();
+        assert_eq!(old.status, UnitStatus::Superseded);
+        let new = db.get_memory_unit("mem_new").unwrap().unwrap();
+        assert_eq!(new.status, UnitStatus::Active);
+    }
+
+    #[test]
+    fn set_memory_unit_status_works() {
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let unit = MemoryUnit {
+            id: "mem_s1".into(),
+            path: "test".into(),
+            section: String::new(),
+            kind: MemoryKind::Fact,
+            scope: MemoryScope::Workspace,
+            status: UnitStatus::Active,
+            content: "test".into(),
+            content_hash: "h".into(),
+            updated_at: Utc::now(),
+            created_at: Utc::now(),
+        };
+        db.upsert_memory_unit(&unit).unwrap();
+        db.set_memory_unit_status("mem_s1", UnitStatus::Conflicted).unwrap();
+        let got = db.get_memory_unit("mem_s1").unwrap().unwrap();
+        assert_eq!(got.status, UnitStatus::Conflicted);
     }
 }

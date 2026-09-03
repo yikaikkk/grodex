@@ -15,7 +15,8 @@ use rusqlite::Connection;
 ///   v1: 10-table baseline (skill/memory/evidence + FTS5 + edges + indexed_files + tx + meta)
 ///   v2: +document_embeddings (brute-force vector blob store) + embedding_metadata
 ///   v3: +evidence_units.access_count/last_accessed_at + governance runtime columns
-pub const SCHEMA_VERSION: u32 = 3;
+///   v4: +memory_units provenance/confidence columns + memory_conflicts + memory_proposals
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Apply the full DDL to a fresh connection. Idempotent — safe to call on
 /// every open. Uses `CREATE TABLE IF NOT EXISTS` for all tables.
@@ -294,6 +295,92 @@ pub fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
 
+    // ─── v4 migration: memory_units provenance columns ───────────
+    // These are ALTER TABLE ADD COLUMN (SQLite-safe, backward-compatible).
+    // Default values ensure old rows are readable without code changes.
+    {
+        fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+            let mut stmt = match conn.prepare(&format!("PRAGMA table_info({table})")) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .ok()
+                .and_then(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .find(|c| c == column)
+                        .map(|_| true)
+                })
+                .unwrap_or(false)
+        }
+        let mu = "memory_units";
+        let new_cols = [
+            ("confidence", "REAL NOT NULL DEFAULT 1.0"),
+            ("certainty", "TEXT NOT NULL DEFAULT 'explicit'"),
+            ("source_evidence_ids", "TEXT NOT NULL DEFAULT '[]'"),
+            ("source_rollout_id", "TEXT NOT NULL DEFAULT ''"),
+            ("source_seq_start", "INTEGER NOT NULL DEFAULT -1"),
+            ("source_seq_end", "INTEGER NOT NULL DEFAULT -1"),
+            ("source_turn_id", "TEXT NOT NULL DEFAULT ''"),
+            ("source_step_id", "TEXT NOT NULL DEFAULT ''"),
+            ("extractor_model", "TEXT NOT NULL DEFAULT ''"),
+            ("extractor_version", "TEXT NOT NULL DEFAULT ''"),
+            ("prompt_version", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (col, def) in &new_cols {
+            if !has_column(conn, mu, col) {
+                let _ = conn.execute_batch(&format!("ALTER TABLE {mu} ADD COLUMN {col} {def}"));
+            }
+        }
+    }
+
+    // ─── 13. memory_conflicts (v4) ──────────────────────────────
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_conflicts (
+            conflict_id      TEXT    PRIMARY KEY,
+            left_memory_id   TEXT    NOT NULL,
+            right_memory_id  TEXT    NOT NULL,
+            relation         TEXT    NOT NULL,
+            confidence       REAL    NOT NULL DEFAULT 0.5,
+            reason           TEXT    NOT NULL DEFAULT '',
+            status           TEXT    NOT NULL DEFAULT 'pending',
+            resolved_at      TEXT,
+            resolution       TEXT    NOT NULL DEFAULT '',
+            created_at       TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_conflict_left ON memory_conflicts(left_memory_id);
+        CREATE INDEX IF NOT EXISTS idx_conflict_right ON memory_conflicts(right_memory_id);
+        CREATE INDEX IF NOT EXISTS idx_conflict_status ON memory_conflicts(status);
+        "#,
+    )?;
+
+    // ─── 14. memory_proposals (v4) ─────────────────────────────
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_proposals (
+            proposal_id        TEXT    PRIMARY KEY,
+            content            TEXT    NOT NULL DEFAULT '',
+            kind               TEXT    NOT NULL DEFAULT 'fact',
+            scope              TEXT    NOT NULL DEFAULT 'workspace',
+            confidence         REAL    NOT NULL DEFAULT 1.0,
+            certainty          TEXT    NOT NULL DEFAULT 'explicit',
+            source_evidence_ids TEXT   NOT NULL DEFAULT '[]',
+            source_rollout_id  TEXT    NOT NULL DEFAULT '',
+            source_seq_start   INTEGER NOT NULL DEFAULT -1,
+            source_seq_end     INTEGER NOT NULL DEFAULT -1,
+            source_turn_id     TEXT    NOT NULL DEFAULT '',
+            extractor_model    TEXT    NOT NULL DEFAULT '',
+            status             TEXT    NOT NULL DEFAULT 'pending',
+            rejection_reason   TEXT    NOT NULL DEFAULT '',
+            created_at         TEXT    NOT NULL,
+            resolved_at        TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_proposal_status ON memory_proposals(status);
+        CREATE INDEX IF NOT EXISTS idx_proposal_rollout ON memory_proposals(source_rollout_id);
+        "#,
+    )?;
+
     Ok(())
 }
 
@@ -349,6 +436,8 @@ mod tests {
             "index_meta",
             "document_embeddings",
             "embedding_metadata",
+            "memory_conflicts",
+            "memory_proposals",
         ] {
             assert!(tables.contains(&expected.to_string()), "missing table: {expected}");
         }
@@ -376,5 +465,82 @@ mod tests {
         apply_schema(&conn).unwrap();
         apply_schema(&conn).unwrap();
         assert_eq!(read_index_generation(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn v4_migration_adds_memory_units_provenance_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_schema(&conn).unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(memory_units)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for expected in [
+            "confidence",
+            "certainty",
+            "source_evidence_ids",
+            "source_rollout_id",
+            "source_seq_start",
+            "source_seq_end",
+            "source_turn_id",
+            "source_step_id",
+            "extractor_model",
+            "extractor_version",
+            "prompt_version",
+        ] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "memory_units missing column: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn v4_creates_memory_conflicts_and_proposals_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_schema(&conn).unwrap();
+        let exists = |table: &str| -> bool {
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
+                rusqlite::params![table],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        };
+        assert!(exists("memory_conflicts"));
+        assert!(exists("memory_proposals"));
+    }
+
+    #[test]
+    fn v4_migration_preserves_existing_data() {
+        // Apply v3-era schema (simulated by applying v4 which is superset),
+        // insert a memory_unit, re-apply schema, verify data is intact.
+        let conn = Connection::open_in_memory().unwrap();
+        apply_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO memory_units (id, path, section, kind, scope, status, content, content_hash, updated_at, created_at)
+             VALUES ('m1', '/test', '', 'fact', 'workspace', 'active', 'test content', 'abc', '2024-01-01', '2024-01-01')",
+            [],
+        )
+        .unwrap();
+        // Re-apply schema (idempotent)
+        apply_schema(&conn).unwrap();
+        let content: String = conn
+            .query_row("SELECT content FROM memory_units WHERE id='m1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(content, "test content");
+        // New columns should have defaults
+        let confidence: f64 = conn
+            .query_row("SELECT confidence FROM memory_units WHERE id='m1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(confidence, 1.0);
+        let certainty: String = conn
+            .query_row("SELECT certainty FROM memory_units WHERE id='m1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(certainty, "explicit");
     }
 }

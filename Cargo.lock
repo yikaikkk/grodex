@@ -951,7 +951,6 @@ dependencies = [
  "grodex-telemetry",
  "grodex-tools",
  "loom",
- "regex",
  "serde",
  "serde_json",
  "sha2",
@@ -993,6 +992,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "toml",
+ "tracing",
  "uuid",
 ]
 

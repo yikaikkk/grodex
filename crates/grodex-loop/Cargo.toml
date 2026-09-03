@@ -30,7 +30,6 @@ serde_json.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 sha2 = "0.10"
-regex = "1"
 grodex-capability.workspace = true
 tracing = "0.1"
 

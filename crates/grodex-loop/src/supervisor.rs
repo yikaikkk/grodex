@@ -263,6 +263,10 @@ pub struct SessionSupervisor {
     /// agent consumption. Ensures the agent never reads a result that
     /// hasn't been fully produced yet.
     background_barrier: BackgroundTaskBarrier,
+    /// W4 evidence extractor: two-tier (LLM first, rule-based fallback).
+    /// When `None`, memory extraction is skipped entirely (e.g. when the
+    /// memory database itself is disabled).
+    memory_extractor: Option<Arc<dyn grodex_memory::EvidenceExtractor + Send + Sync>>,
 }
 
 impl SessionSupervisor {
@@ -274,6 +278,7 @@ impl SessionSupervisor {
         recovered_context: Option<Vec<grodex_core::context::ContextItem>>,
         memory: Option<Arc<grodex_memory::MemoryDatabase>>,
         embedding: Option<Arc<dyn grodex_memory::EmbeddingModel + Send + Sync>>,
+        memory_extractor: Option<Arc<dyn grodex_memory::EvidenceExtractor + Send + Sync>>,
         model_config: ModelConfig,
         cwd: PathBuf,
         workspace_trusted: bool,
@@ -326,6 +331,7 @@ impl SessionSupervisor {
             skill_generation: 1,
             cached_discovered_nodes: None,
             background_barrier: BackgroundTaskBarrier::new(),
+            memory_extractor,
         };
 
         let handle = SessionHandle { cmd_tx, event_rx };
@@ -973,26 +979,53 @@ impl SessionSupervisor {
         }
 
         // Build snapshot items from the context — each ContextItem becomes
-        // a SnapshotItem the UI can render.
+        // a SnapshotItem the UI can render. Contents are soft-capped so a
+        // mid-sized session never grows a Snapshot JSON past the ACP
+        // transport's 16MB line limit (which would cause the entire frame
+        // to be dropped by the TUI's fail-closed size guard).
+        const CAP_USER: usize = 4000;
+        const CAP_ASSISTANT: usize = 8000;
+        const CAP_REASONING: usize = 2000;
+        const CAP_TOOL_CALL: usize = 4000;
+        const CAP_TOOL_RESULT: usize = 4000;
+        const CAP_DEFAULT: usize = 2000;
+        fn truncate_for_snapshot(s: &str, max: usize) -> String {
+            let count = s.chars().count();
+            if count <= max {
+                return s.to_string();
+            }
+            let head: String = s.chars().take(max).collect();
+            format!("{head}\n…[{count} chars total, truncated for snapshot]")
+        }
+
         let snapshot_items: Vec<serde_json::Value> = context
             .iter()
             .map(|item| {
                 let (item_type, content) = match item {
-                    ContextItem::User { content, .. } => ("user", content.clone()),
-                    ContextItem::Assistant { content, .. } => ("assistant", content.clone()),
-                    ContextItem::ToolResult { content, .. } => {
-                        ("tool_result", content.clone())
+                    ContextItem::User { content, .. } => {
+                        ("user", truncate_for_snapshot(content, CAP_USER))
                     }
-                    ContextItem::System { content, .. } => ("system", content.clone()),
-                    ContextItem::Developer { content, .. } => ("developer", content.clone()),
+                    ContextItem::Assistant { content, .. } => {
+                        ("assistant", truncate_for_snapshot(content, CAP_ASSISTANT))
+                    }
+                    ContextItem::ToolResult { content, .. } => {
+                        ("tool_result", truncate_for_snapshot(content, CAP_TOOL_RESULT))
+                    }
+                    ContextItem::System { content, .. } => {
+                        ("system", truncate_for_snapshot(content, CAP_DEFAULT))
+                    }
+                    ContextItem::Developer { content, .. } => {
+                        ("developer", truncate_for_snapshot(content, CAP_DEFAULT))
+                    }
                     ContextItem::ToolCall { name, arguments, .. } => {
-                        ("tool_call", format!("{name}: {arguments}"))
+                        let joined = format!("{name}: {arguments}");
+                        ("tool_call", truncate_for_snapshot(&joined, CAP_TOOL_CALL))
                     }
                     ContextItem::CompactionSummary { summary, .. } => {
-                        ("compaction", summary.clone())
+                        ("compaction", truncate_for_snapshot(summary, CAP_DEFAULT))
                     }
                     ContextItem::ReasoningSummary { content, .. } => {
-                        ("reasoning", content.clone())
+                        ("reasoning", truncate_for_snapshot(content, CAP_REASONING))
                     }
                     ContextItem::ImagePlaceholder { mime_type, artifact_ref } => {
                         ("image", format!("{mime_type}:{artifact_ref}"))
@@ -1135,47 +1168,6 @@ impl SessionSupervisor {
             "invariant #1: a new Turn started while another was still running"
         );
 
-        // ── W4 Global UserPreference 快速通道 ────────────────────────
-        // 「记住我叫 X / 以后叫我 X / 我是 X / 请记住我喜欢 Y / 请记住 X」
-        // 这类用户显式表达偏好的输入，直接写 scope=Global kind=Preference
-        // 的 MemoryUnit，无需等 consolidation（W3 的 MIN_OCCURRENCES 阀门）。
-        // 命中失败（DB 错 / 正则不匹配）不阻塞本轮 turn，fail-open。
-        if let Some(db) = self.memory.clone() {
-            if let Some(unit) = extract_user_preference_fast_path(&user_input) {
-                // 提前把 tracing 用的字段 clone 出来，避免 unit 被 move
-                // 进 spawn_blocking 之后再访问（E0382）。
-                let trace_id = unit.id.clone();
-                let trace_scope = unit.scope.as_str().to_string();
-                let trace_preview: String = unit.content.chars().take(80).collect();
-                let task = tokio::task::spawn_blocking(move || db.upsert_memory_unit(&unit));
-                match task.await {
-                    Ok(Ok(())) => {
-                        tracing::info!(
-                            target: "grodex_session",
-                            id = %trace_id,
-                            scope = %trace_scope,
-                            content_preview = %trace_preview,
-                            "w4 global preference written (fast path)"
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            target: "grodex_session",
-                            error = %e,
-                            "w4 global preference fast path DB write failed (ignored)"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "grodex_session",
-                            error = %e,
-                            "w4 global preference fast path task panicked (ignored)"
-                        );
-                    }
-                }
-            }
-        }
-
         // Admit turn in session state machine.
         let turn_id = match self.session.admit_turn(user_input.clone()) {
             Ok(id) => id,
@@ -1282,11 +1274,18 @@ impl SessionSupervisor {
             self.cached_discovered_nodes = Some(tmp.discovered_nodes().to_vec());
         }
 
+        let static_memory = std::env::var("HOME")
+            .map(|h| grodex_memory::StaticContextLoader::load(
+                std::path::Path::new(&h), &self.cwd,
+            ))
+            .unwrap_or_default()
+            .content;
         let mut builder = grodex_prompt::PromptBuilder::new()
             .with_skills(self.skill_catalog.clone().unwrap_or_default())
             .with_discovered_nodes(
                 self.cached_discovered_nodes.clone().unwrap_or_default(),
-            );
+            )
+            .with_static_context(static_memory);
         // Memory RAG results are VOLATILE (depend on the current user
         // input). They must NOT be baked into the system prompt — that
         // would change the request prefix every turn and defeat provider
@@ -1704,8 +1703,275 @@ impl SessionSupervisor {
                     .await;
             }
         }
+
+        // ── W4 memory extraction + proposal commit (post-turn) ──────
+        //
+        // Fail-open everywhere:
+        //   * No memory DB → skip.
+        //   * No extractor configured → skip.
+        //   * Conversation scan yields no usable turn slice → skip.
+        //   * Extractor returns Err → CompositeExtractor already fell back
+        //     to rule tier; a second Err is rare and we log it silently.
+        //   * propose_and_commit rejects claims → they're captured in the
+        //     report for diagnostics, not propagated.
+        //
+        // Spawned as a detached task so extraction never blocks the next
+        // user turn being admitted. This matches the design note: W2/W3
+        // run on a background schedule; W4 follows the same pattern with
+        // per-turn triggering.
+        // NOTE: bind owned values to locals BEFORE the if-let to avoid
+        // borrowing into temporaries (cloned tuples drop immediately).
+        let memory_db = self.memory.clone();
+        let memory_extractor_opt = self.memory_extractor.clone();
+        if let (Some(db), Some(extractor)) = (memory_db, memory_extractor_opt) {
+            let chat_state = self.chat_state.clone();
+            let session_id = self.session.id.to_string();
+            // Prefer the rollout writer's session id (bound to the on-disk
+            // journal) as the rollout provenance key. Fall back to the
+            // supervisor-level session id when the writer isn't attached
+            // (this only happens in tests / no-disk configs).
+            let rollout_id = self
+                .writer
+                .as_ref()
+                .map(|w| w.session_id().to_string())
+                .unwrap_or(session_id);
+            let turn_id_str = completion.turn_id.to_string();
+            let outcome = completion.outcome.clone();
+            let event_tx = self.event_tx.clone();
+
+            tokio::spawn(async move {
+                // 1) Slice conversation to the last turn's window.
+                let conversation = chat_state.get_conversation().await;
+                let Some(ctx) = assemble_extraction_context(
+                    &conversation,
+                    &rollout_id,
+                    &turn_id_str,
+                    &outcome,
+                ) else {
+                    return;
+                };
+
+                // 2) Run extractor.
+                let result = match extractor.extract(&ctx).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            turn_id = %turn_id_str,
+                            "memory extraction failed (all tiers exhausted)"
+                        );
+                        return;
+                    }
+                };
+
+                if result.claims.is_empty() {
+                    return;
+                }
+
+                // 3) propose_and_commit on a blocking pool (SQLite CRUD).
+                let extractor_model = extractor_label(extractor.as_ref());
+                let db_cloned = db.clone();
+                // Make clones BEFORE the spawn_blocking `move` closure so
+                // the outer task can still reuse `turn_id_str` below.
+                let turn_id_for_blocking = turn_id_str.clone();
+                let turn_id_for_join = turn_id_str.clone();
+                let committed_ids: Vec<String> = match tokio::task::spawn_blocking(move || {
+                    let turn_id_str = turn_id_for_blocking;
+                    let report = grodex_memory::propose_and_commit(&db_cloned, &result, &extractor_model);
+                    if report.proposed > 0 || report.committed > 0 || !report.rejected.is_empty() {
+                        tracing::debug!(
+                            proposed = report.proposed,
+                            committed = report.committed,
+                            rejected = report.rejected.len(),
+                            turn_id = %turn_id_str,
+                            "memory proposal report"
+                        );
+                    }
+                    if !report.rejected.is_empty() {
+                        for rej in &report.rejected {
+                            tracing::debug!(
+                                reason = %rej.reason,
+                                fact = %truncate_for_log(&rej.fact, 120),
+                                turn_id = %turn_id_str,
+                                "memory proposal rejected"
+                            );
+                        }
+                    }
+                    report.committed_ids
+                })
+                .await
+                {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            turn_id = %turn_id_for_join,
+                            "propose_and_commit background task panicked"
+                        );
+                        return;
+                    }
+                };
+
+                // 4) Surface a non-intrusive info banner only when we
+                // actually wrote a new explicit preference/fact — users
+                // expect "remember my name" to visibly succeed.
+                if !committed_ids.is_empty() {
+                    let summary = format!(
+                        "🧠 已记住 {} 条长期记忆。",
+                        committed_ids.len()
+                    );
+                    let _ = event_tx.send(SessionEvent::Info { message: summary }).await;
+                }
+            });
+        }
+    }
+}
+
+// ───────────────────────── Private W4 helpers ─────────────────────
+
+/// Walk the conversation transcript and carve out the slice
+/// corresponding to the **most recent user turn** (the last
+/// `ContextItem::User` → EOF). This gives us exactly the turn window
+/// the extractor is allowed to see.
+///
+/// Returns `None` when there is no User tail (shouldn't happen for a
+/// TurnCompleted event, but guards against empty transcripts).
+fn assemble_extraction_context(
+    conversation: &[grodex_core::context::ContextItem],
+    rollout_id: &str,
+    turn_id: &str,
+    outcome: &crate::step::TurnOutcome,
+) -> Option<grodex_memory::ExtractionContext> {
+    use grodex_core::context::ContextItem;
+    use grodex_memory::{SourceRef, ToolCallSummary, ToolResultSummary};
+
+    // Find the last User-item starting boundary; everything after it
+    // belongs to the turn we just finished.
+    let start = conversation.iter().rposition(|c| matches!(c, ContextItem::User { .. }))?;
+    let tail = &conversation[start..];
+
+    let mut user_input = String::new();
+    let mut assistant_content: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<ToolCallSummary> = Vec::new();
+    let mut tool_results: Vec<ToolResultSummary> = Vec::new();
+
+    for item in tail {
+        match item {
+            ContextItem::User { content, .. } => {
+                if !user_input.is_empty() {
+                    user_input.push('\n');
+                }
+                user_input.push_str(content);
+            }
+            ContextItem::Assistant { content } => {
+                if !content.trim().is_empty() {
+                    assistant_content.push(content.clone());
+                }
+            }
+            ContextItem::ToolCall { name, arguments, .. } => {
+                // W4 filter: skip SubAgent / Delegate tool noise.
+                if is_subagent_tool_noise(name) {
+                    continue;
+                }
+                let args = match arguments {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                };
+                tool_calls.push(ToolCallSummary {
+                    name: name.clone(),
+                    arguments: truncate_for_context(&args, 2000),
+                });
+            }
+            ContextItem::ToolResult { call_id, content, is_error } => {
+                let name = tool_name_for_call_id(tail, call_id).unwrap_or_else(|| "unknown".into());
+                if is_subagent_tool_noise(&name) {
+                    continue;
+                }
+                tool_results.push(ToolResultSummary {
+                    name,
+                    is_error: *is_error,
+                    content: truncate_for_context(content, 2000),
+                });
+            }
+            _ => {}
+        }
     }
 
+    // Include TurnOutcome.final_text if the transcript didn't (it's
+    // produced by the coordinator post-tool loop so sometimes it's
+    // present only there).
+    if !outcome.final_text.trim().is_empty() {
+        let ft = outcome.final_text.trim();
+        if assistant_content.iter().all(|a| a.trim() != ft) {
+            assistant_content.push(ft.to_string());
+        }
+    }
+
+    let source = SourceRef {
+        rollout_id: rollout_id.to_string(),
+        seq_start: 0,
+        seq_end: 0,
+        turn_id: turn_id.to_string(),
+        step_id: None,
+    };
+
+    Some(grodex_memory::ExtractionContext {
+        user_input,
+        assistant_content,
+        tool_calls,
+        tool_results,
+        adjacent_events: Vec::new(),
+        existing_memory: Vec::new(),
+        source,
+    })
+}
+
+fn is_subagent_tool_noise(name: &str) -> bool {
+    const NOISE_PREFIX: &[&str] = &[
+        "subagent",
+        "delegate",
+        "durable_subagent",
+        "internal_delegate",
+    ];
+    let lower = name.to_lowercase();
+    NOISE_PREFIX.iter().any(|p| lower.contains(p))
+}
+
+fn tool_name_for_call_id(
+    tail: &[grodex_core::context::ContextItem],
+    target: &grodex_core::id::ToolCallId,
+) -> Option<String> {
+    use grodex_core::context::ContextItem;
+    for item in tail {
+        if let ContextItem::ToolCall { call_id, name, .. } = item {
+            if call_id == target {
+                return Some(name.clone());
+            }
+        }
+    }
+    None
+}
+
+fn truncate_for_context(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let taken: String = s.chars().take(max_chars).collect();
+        format!("{taken}…")
+    }
+}
+
+fn truncate_for_log(s: &str, max_chars: usize) -> String {
+    truncate_for_context(s, max_chars).replace('\n', " ")
+}
+
+/// Best-effort label written to `memory_units.extractor_model` so
+/// future governance passes can tell which tier produced a claim.
+fn extractor_label(e: &dyn grodex_memory::EvidenceExtractor) -> String {
+    e.tier_label().to_string()
+}
+
+impl SessionSupervisor {
     /// Replay the rollout journal and rebuild the live transcript.
     ///
     /// Returns `Ok(Some(event_count))` if there were events to replay (the
@@ -1966,154 +2232,6 @@ impl SessionSupervisor {
     }
 }
 
-// ── W4 Global UserPreference fast path ────────────────────────────────
-// 用一次性懒加载的正则匹配常见的"请记住 X / 叫我 X / 我是 X"表达。
-// 匹配命中后直接生成 scope=Global kind=Preference 的 MemoryUnit，绕过
-// consolidation（W3 阈值）。所有 ID / content_hash 做确定性构造，确保
-// 同一偏好反复写也只保留一行（upsert 幂等）。
-
-fn extract_user_preference_fast_path(input: &str) -> Option<grodex_memory::MemoryUnit> {
-    use grodex_memory::{MemoryKind, MemoryScope, MemoryUnit, UnitStatus};
-    use sha2::{Digest, Sha256};
-    use chrono::Utc;
-
-    let text = input.trim();
-    if text.is_empty() {
-        return None;
-    }
-
-    // 按优先级匹配：更具体的（"叫我 X" → 身份）在前，通用（"请记住 X"）在后。
-    struct Rule {
-        re: &'static str,
-        /// 对命中组做格式化，产生 "用户希望被叫 XXX" 这类正文
-        fmt: fn(&str, &regex::Captures) -> Option<(String, String)>,
-    }
-
-    fn format_capture(name: &str, c: &regex::Captures) -> Option<(String, String)> {
-        let v = c.get(1)?.as_str().trim().trim_end_matches(|ch: char| ch.is_ascii_punctuation() || ch == '。' || ch == '，' || ch == '！' || ch == '？' || ch == '!').to_string();
-        if v.is_empty() {
-            return None;
-        }
-        let key = name;
-        let content = format!("用户明确要求记住：{key}为「{v}」。此偏好跨工作区全局有效。");
-        let id_slug = make_id_slug(&format!("{key}:{v}"));
-        Some((format!("mem_pref_global_{id_slug}"), content))
-    }
-
-    fn format_freetext(_name: &str, c: &regex::Captures) -> Option<(String, String)> {
-        let v = c.get(1)?.as_str().trim().trim_end_matches(|ch: char| ch.is_ascii_punctuation() || ch == '。' || ch == '，' || ch == '！' || ch == '？').to_string();
-        if v.is_empty() {
-            return None;
-        }
-        let content = format!("用户明确要求记住：{v}。此偏好跨工作区全局有效。");
-        let id_slug = make_id_slug(&v);
-        Some((format!("mem_pref_global_freetext_{id_slug}"), content))
-    }
-
-    fn make_id_slug(s: &str) -> String {
-        use std::fmt::Write as _;
-        let hash = Sha256::digest(s.as_bytes());
-        let mut out = String::with_capacity(16);
-        for b in &hash[..8] {
-            let _ = write!(out, "{:02x}", b);
-        }
-        out
-    }
-
-    use std::sync::OnceLock;
-    static RULES: OnceLock<Vec<(regex::Regex, fn(&regex::Captures) -> Option<(String, String)>)>> =
-        OnceLock::new();
-    let rules = RULES.get_or_init(|| {
-        let build = |pat: &'static str,
-                     f: fn(&regex::Captures) -> Option<(String, String)>|
-         -> Option<(regex::Regex, _)> {
-            Some((regex::Regex::new(pat).ok()?, f))
-        };
-        vec![
-            // 注意：中英文的每条 regex 都用 (?im)（Unicode 默认开启），
-            // 不要写成 (?im-u)，含中文会 parse error 导致 runtime panic。
-            //
-            // 排序原则：更具体的 pattern 在前，避免"记住我叫X"被兜底的
-            // "记住 X" 自由文本提前吞掉导致捕获内容不对。
-
-            // ── 身份/称呼：最具体 ─────────────────────
-            build(r"(?im)^\s*(?:以后|之后)?\s*(?:请?把我|请?叫我|喊我|称呼我)\s*(?:做|为)?\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
-                |c| format_capture("用户希望被称呼", c)),
-            build(r"(?im)^\s*(?:我叫|我的名字是|我是)\s*(?:做|为)?\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
-                |c| format_capture("用户姓名/身份", c)),
-            // 记住我叫 / 记住我是
-            build(r"(?im)^\s*(?:请?|麻烦|劳烦)?\s*记住?我(?:叫|名字是|是)\s*(?:做|为)?\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
-                |c| format_capture("用户希望被称呼", c)),
-
-            // ── 我喜欢/讨厌：比较具体 ───────────────────
-            build(r"(?im)^\s*(?:请?记住|记得|要?记住)?我(?:喜欢|偏好|比较?喜欢|更爱|最爱)\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
-                |c| format_capture("用户偏好(喜欢)", c)),
-            build(r"(?im)^\s*(?:请?记住|记得|要?记住)?我(?:不喜欢|讨厌|反感)\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
-                |c| format_capture("用户偏好(不喜欢)", c)),
-
-            // ── 我的 XX 是 XX（邮箱/微信/QQ 等）──────────
-            build(r"(?im)^\s*(?:我)?\s*的\s*(名字|姓名|昵称|称呼|邮箱|邮件|email|手机|电话|微信|wechat|qq|tg|telegram|discord|github|用户名|id|工号|部门|职位|公司)\s*(?:是|为|=)\s*[:：]?\s*(.+?)\s*[.!?。！？]?\s*$",
-                |c| {
-                    let field = c.get(1)?.as_str().trim();
-                    let value = c.get(2)?.as_str().trim();
-                    if value.is_empty() { return None; }
-                    let content = format!("用户明确要求记住：用户的{field}为「{value}」。此偏好跨工作区全局有效。");
-                    let slug = {
-                        use sha2::{Digest, Sha256};
-                        use std::fmt::Write as _;
-                        let h = Sha256::digest(format!("{field}:{value}").as_bytes());
-                        let mut o = String::with_capacity(16);
-                        for b in &h[..8] { let _ = write!(o, "{:02x}", b); }
-                        o
-                    };
-                    Some((format!("mem_pref_global_{slug}"), content))
-                }),
-
-            // ── 自由记忆：请记住 <任意> / remember <任意> ──
-            // 必须放在最后，避免吞掉前面的具体 pattern。
-            // （前面有前缀的 "请记住 / 麻烦记住 XXX" 也走这里：匹配第 1 组。）
-            build(r"(?im)^\s*(?:请?|麻烦|劳烦)?\s*(?:记下来|记住|mark一下|mark 一下|存一下|记好)\s*[:：]?\s*(.+?)\s*$",
-                |c| format_freetext("", c)),
-            build(r"(?i)^\s*remember\s+(?:that\s+)?(.+?)\s*$",
-                |c| format_freetext("", c)),
-            build(r"(?i)^\s*call\s+me\s+(.+?)\s*[.!?]?\s*$",
-                |c| format_capture("用户希望被称呼(英文)", c)),
-            build(r"(?i)^\s*my\s+name\s+is\s+(.+?)\s*[.!?]?\s*$",
-                |c| format_capture("用户姓名(英文)", c)),
-        ].into_iter().flatten().collect()
-    });
-
-    for (re, f) in rules.iter() {
-        if let Some(caps) = re.captures(text) {
-            if let Some((id, content)) = f(&caps) {
-                let content_hash = {
-                    let mut hasher = Sha256::new();
-                    hasher.update(content.as_bytes());
-                    let h = hasher.finalize();
-                    use std::fmt::Write as _;
-                    let mut s = String::with_capacity(16);
-                    for b in &h[..8] { let _ = write!(s, "{:02x}", b); }
-                    s
-                };
-                let now = Utc::now();
-                return Some(MemoryUnit {
-                    id,
-                    path: "grodex://runtime/global-user-preference".to_string(),
-                    section: "global-runtime".to_string(),
-                    kind: MemoryKind::Preference,
-                    scope: MemoryScope::Global,
-                    status: UnitStatus::Active,
-                    content,
-                    content_hash,
-                    updated_at: now,
-                    created_at: now,
-                });
-            }
-        }
-    }
-    None
-}
-
 /// The frontend's handle to the session.
 #[derive(Debug)]
 pub struct SessionHandle {
@@ -2198,63 +2316,5 @@ mod barrier_tests {
         b.reset();
         assert_eq!(b.completed_epoch(), 0);
         assert_eq!(b.consumed_epoch(), 0);
-    }
-}
-
-/// W4 fast path regex 防回归：
-/// - 确保含中文的每条 regex 能 parse（之前 (?im-u) Unicode 禁用会 panic）
-/// - 确保中英文各一条典型输入能生成 scope=Global kind=Preference 的 MemoryUnit
-#[cfg(test)]
-mod w4_preference_fast_path_tests {
-    use super::extract_user_preference_fast_path;
-    use grodex_memory::{MemoryKind, MemoryScope};
-
-    #[test]
-    fn regex_parses_and_matches_chinese_call_me() {
-        let cases = [
-            ("以后叫我 9527", "用户希望被称呼"),
-            ("请记住我叫9527!", "用户希望被称呼"),
-            ("我叫小明", "用户姓名"),
-            ("请记住我喜欢 Rust。", "用户偏好"),
-            ("记住我讨厌香菜", "用户偏好"),
-            ("我的邮箱是 dev@example.com", "邮箱"),
-            ("我的微信是 wx_abc", "微信"),
-            ("call me bob", "用户希望被称呼"),
-            ("My name is Charles.", "用户姓名"),
-            ("remember that I prefer dark mode", "明确要求记住"),
-            ("记下来 每周一 10:00 站会", "明确要求记住"),
-        ];
-        for (input, snippet) in cases {
-            let unit = extract_user_preference_fast_path(input)
-                .unwrap_or_else(|| panic!("W4 fast path failed to match: {input}"));
-            assert_eq!(unit.scope, MemoryScope::Global, "input: {input}");
-            assert_eq!(unit.kind, MemoryKind::Preference, "input: {input}");
-            assert!(
-                unit.content.contains(snippet),
-                "input={input}\nexpected snippet={snippet}\nactual={}",
-                unit.content
-            );
-            // 确定 id：同一句再次输入 → id 不变（幂等）
-            let unit2 = extract_user_preference_fast_path(input).unwrap();
-            assert_eq!(unit.id, unit2.id, "id must be stable: {input}");
-        }
-    }
-
-    #[test]
-    fn does_not_match_normal_questions() {
-        // 正常工作提问，不应该误触发
-        let negs = [
-            "帮我写个 rust hello world",
-            "explain memory consolidation",
-            "请问现在几点了",
-            "fix the build error",
-            "/help",
-        ];
-        for n in negs {
-            assert!(
-                extract_user_preference_fast_path(n).is_none(),
-                "W4 should NOT match ordinary question: {n}"
-            );
-        }
     }
 }

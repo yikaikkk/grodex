@@ -115,6 +115,10 @@ pub struct PromptBuilder {
     zone_c: Option<String>,
     /// Optional Zone D content (recent tail).
     zone_d: Option<String>,
+    /// Optional static memory context (hand-curated MEMORY.md files).
+    /// Injected into Zone A as a stable prompt prefix so it survives
+    /// provider prompt caching across turns.
+    static_context: Option<String>,
     /// Config prompt generation (for `discovered_at_generation`).
     config_prompt_generation: u64,
     /// Model binding id (for manifest binding).
@@ -152,6 +156,7 @@ impl PromptBuilder {
             discovered_nodes: Vec::new(),
             zone_c: None,
             zone_d: None,
+            static_context: None,
             config_prompt_generation: 1,
             model_binding_id: None,
             discovery_config: None,
@@ -252,6 +257,14 @@ impl PromptBuilder {
         self
     }
 
+    /// Set static memory context (hand-curated MEMORY.md). Injected into
+    /// Zone A as a stable prefix so it survives provider prompt caching.
+    pub fn with_static_context(mut self, content: impl Into<String>) -> Self {
+        let c = content.into();
+        self.static_context = if c.trim().is_empty() { None } else { Some(c) };
+        self
+    }
+
     /// Load project rules from a `.grodex/rules/` or `AGENTS.md` file.
     ///
     /// `trusted` determines the `TrustState`: trusted workspaces get
@@ -320,6 +333,22 @@ impl PromptBuilder {
             TrustState::Trusted,
             config_gen,
         ));
+
+        // 1b. Static memory context (MEMORY.md). Placed right after base
+        // instructions so it sits in the stable prompt prefix and survives
+        // provider prompt caching across turns (content only changes when
+        // the source file changes).
+        if let Some(ref ctx) = self.static_context {
+            nodes.push(InstructionNode::new(
+                "static_memory",
+                InstructionKind::Base,
+                InstructionScope::Session,
+                "builtin://static-memory",
+                ctx.clone(),
+                TrustState::Trusted,
+                config_gen,
+            ));
+        }
 
         // 2. Skills (Zone A, authority: SKILL=40, but placed as Base for now).
         let skills_content = self.skills.format_for_prompt();

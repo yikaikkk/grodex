@@ -49,6 +49,14 @@ pub struct ScannedFile {
 ///
 /// Skips hidden files/directories (starting with `.`) and common VCS
 /// directories (`.git`, `.svn`, `.hg`, `node_modules`, `target`).
+///
+/// **Deprecated**: the .md scan → reconcile → parse pipeline is no longer
+/// wired into `reindex_memory` (Phase 2 of the memory redesign). Hand-curated
+/// MEMORY.md files are now surfaced via [`StaticContextLoader`](crate::static_context::StaticContextLoader)
+/// and rollouts drive evidence extraction. Retained for offline eval /
+/// migration tooling only.
+#[deprecated(note = "use StaticContextLoader for MEMORY.md surfacing; rollout_extractor for evidence")]
+#[allow(deprecated)]
 pub fn scan_directory(root: &Path) -> Vec<ScannedFile> {
     let mut results = Vec::new();
     let root = match root.canonicalize() {

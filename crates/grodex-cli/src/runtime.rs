@@ -30,6 +30,7 @@ use grodex_core::tool::{Tool, ToolRuntime};
 use grodex_loop::chat_state::ChatStateActor;
 use grodex_loop::command::SessionEvent as LoopSessionEvent;
 use grodex_loop::delegate_tool::DelegateTool;
+use grodex_loop::memory_extractor::CompositeExtractor;
 use grodex_loop::rollout_writer::RolloutWriter;
 use grodex_loop::supervisor::{infer_context_window, ModelConfig};
 use grodex_loop::{Session, SessionHandle, SessionSupervisor, TurnCoordinator};
@@ -1154,6 +1155,38 @@ impl SessionRuntimeBuilder {
             coordinator
         };
 
+        // ── W4 Memory extractor (two-tier: LLM → rule fallback) ───
+        // Only build an extractor when memory DB is enabled; otherwise
+        // we pass None so the supervisor skips extraction entirely.
+        //
+        // * If the user has a live model route, we build a
+        //   SamplingBackedExtractor on top of the shared SamplingActor
+        //   and wrap it in CompositeExtractor (so extraction errors
+        //   degrade to rule-based, not to zero extraction).
+        // * Otherwise the supervisor gets a rule-only composite so
+        //   identity preferences ("叫我 ikkk") still enter Active memory
+        //   via the MockEvidenceExtractor regex path.
+        let memory_extractor: Option<
+            std::sync::Arc<dyn grodex_memory::EvidenceExtractor + Send + Sync>,
+        > = if memory.is_some() {
+            use std::sync::Arc;
+            let llm_tier: Option<Arc<dyn grodex_memory::EvidenceExtractor + Send + Sync>> = None;
+            // NOTE: LLM tier intentionally disabled by default here.
+            // Wiring it requires the shared SamplingActor to be moved
+            // into an Arc before the coordinator is built, and the
+            // provider model binding to be extracted from the same
+            // ModelConfig the coordinator uses. That rework is tracked
+            // under "W4-2 final integration" and will be enabled once
+            // the rule-tier path has been observed to be stable in real
+            // sessions. The rule tier alone already covers the high-
+            // value "remember my name / preference" scenario and is
+            // fail-safe (no network, no token cost, no JSON parsing
+            // failure modes).
+            Some(Arc::new(CompositeExtractor::new(llm_tier)))
+        } else {
+            None
+        };
+
         // ── Supervisor ─────────────────────────────────────────────
         let (mut supervisor, handle) = SessionSupervisor::new(
             session,
@@ -1163,6 +1196,7 @@ impl SessionRuntimeBuilder {
             self.recovered_context,
             memory,
             embedding,
+            memory_extractor,
             model_config.clone(),
             self.cwd.clone(),
             workspace_trusted,
@@ -1477,89 +1511,15 @@ fn build_sandbox(cfg: &toml::Value) -> grodex_sandbox::SandboxManager {
 ///
 /// Blocking (fs walk + parsing) — call from `spawn_blocking`. Fail-open by caller.
 fn reindex_memory(db: &Arc<grodex_memory::MemoryDatabase>, cwd: &std::path::Path) {
-    use grodex_memory::{MemoryScope, ParsedMemoryFile};
-
-    let scanned = grodex_memory::scan_directory(cwd);
-    let diff = grodex_memory::reconcile(db, &scanned);
-    if diff.is_empty() {
-        return;
-    }
-    // Apply deletions (orphan units, bump generation).
-    let _ = grodex_memory::apply_deletions(db, &diff);
-
-    let current_gen = db.read_generation().unwrap_or(1);
-    let mut total_units: usize = 0;
-    let mut files_with_rewrite: usize = 0;
-
-    for file in diff.new_files.iter().chain(diff.changed_files.iter()) {
-        let file_path = cwd.join(&file.key);
-        let scope = if file.key.contains("MEMORY.md")
-            || file.key.contains(".grodex/")
-            || file.key.contains("docs/")
-        {
-            MemoryScope::Global
-        } else {
-            MemoryScope::Workspace
-        };
-
-        // Step A: read + parse
-        let parsed_units = match std::fs::read_to_string(&file_path) {
-            Ok(raw) => {
-                let parsed = ParsedMemoryFile::parse(&file.key, &raw);
-                // Step B: inject stable IDs, rewrite to disk when at least one chunk lacked one.
-                let with_ids = parsed.with_stable_ids();
-                if let Some(rewritten) = &with_ids.rewritten_content {
-                    // Atomic write via temp + rename so a crash doesn't corrupt the MD.
-                    let tmp = file_path.with_extension("md.tmp");
-                    if std::fs::write(&tmp, rewritten).is_ok() {
-                        let _ = std::fs::rename(&tmp, &file_path);
-                        files_with_rewrite += 1;
-                    } else {
-                        let _ = std::fs::remove_file(&tmp);
-                    }
-                }
-                with_ids.into_memory_units(scope)
-            }
-            Err(_) => Vec::new(),
-        };
-
-        // Step C: upsert IndexedFile row (do this BEFORE replace_file_memory_units
-        // so foreign keys referencing indexed_files.path are happy).
-        let indexed = grodex_memory::IndexedFile {
-            path: file.key.clone(),
-            source_kind: grodex_memory::types::SourceKind::Memory,
-            mtime: file.mtime,
-            size: file.size as i64,
-            content_hash: file.content_hash.clone(),
-            index_generation: current_gen,
-            last_indexed_at: chrono::Utc::now(),
-        };
-        if db.upsert_indexed_file(&indexed).is_err() {
-            continue;
-        }
-
-        // Step D: atomically replace memory units for this file.
-        match db.replace_file_memory_units(&file.key, &parsed_units, Some(&indexed)) {
-            Ok(n) => total_units += n,
-            Err(e) => eprintln!(
-                "[warn] memory parse {} failed: {e}",
-                file.key
-            ),
-        }
-    }
-
-    // Bump generation after inserts so the snapshot invalidates.
-    let _ = db.bump_generation();
-    eprintln!(
-        "[memory] reindex: +{} new, ~{} changed, -{} removed; {} units indexed{}",
-        diff.new_files.len(),
-        diff.changed_files.len(),
-        diff.deleted_files.len(),
-        total_units,
-        if files_with_rewrite > 0 {
-            format!("; {} md files got stable IDs", files_with_rewrite)
-        } else {
-            String::new()
-        }
-    );
+    // Phase 2: the .md scan_directory → reconcile → parse pipeline is
+    // disconnected. Hand-curated MEMORY.md files are now surfaced via
+    // StaticContextLoader (injected into the system prompt), and rollouts
+    // drive evidence extraction (extract_evidence_from_rollouts, launched
+    // as a background task alongside this call) + consolidation
+    // (run_consolidation_pass, on a schedule).
+    //
+    // Retained as a no-op so callers (startup + periodic rescan) don't
+    // break; the real work happens in those background tasks. The scan
+    // code itself is kept (deprecated) in indexer.rs for offline eval.
+    let _ = (db, cwd);
 }

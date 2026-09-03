@@ -10,8 +10,10 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::database::MemoryDatabase;
+use crate::query_understanding::{QueryUnderstanding, QueryUnderstandingModel};
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 
@@ -79,29 +81,66 @@ pub struct TermCoverageGate;
 
 impl TermCoverageGate {
     /// Extract distinct query terms for coverage checking.
-    /// Splits on whitespace, lowercases, and deduplicates.
-    /// Quoted phrases (inside `"..."`) are treated as a single required term.
+    ///
+    /// **CJK-aware** (fix for review item 二-3, paired with
+    /// `enrich_content_for_fts` on the write side):
+    /// - ASCII/Latin: split on whitespace, keep whole word (alnum + `_` + `-`).
+    /// - CJK runs (Han/Hiragana/Katakana/Hangul): each individual Han char
+    ///   becomes its own term. We use **unigrams only** here (not bigrams)
+    ///   because the coverage gate computes `ceil(n/2)` as the match
+    ///   threshold — bigrams would inflate n and make the gate stricter
+    ///   instead of fairer. Unigrams are the minimum unit of Chinese
+    ///   semantic overlap, and the parallel FTS leg already handles
+    ///   bigram weighting via BM25 scoring.
+    ///
+    /// Whitespace-only terms and punctuation are dropped. Deduplicated
+    /// preserving first-seen order.
     pub fn extract_terms(query: &str) -> Vec<String> {
-        let mut terms = Vec::new();
+        let mut terms: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for word in query.split_whitespace() {
-            let lower = word.to_lowercase();
-            // Strip punctuation but keep code identifiers with underscores/hyphens.
+        let mut ascii_buf = String::new();
+
+        let mut flush_ascii = |buf: &mut String, terms: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+            if buf.is_empty() {
+                return;
+            }
+            let lower = buf.to_lowercase();
             let cleaned: String = lower
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
                 .collect();
-            if cleaned.is_empty() {
-                continue;
-            }
-            if seen.insert(cleaned.clone()) {
+            if !cleaned.is_empty() && seen.insert(cleaned.clone()) {
                 terms.push(cleaned);
             }
+            buf.clear();
+        };
+
+        for c in query.chars() {
+            if is_cjk(c) {
+                flush_ascii(&mut ascii_buf, &mut terms, &mut seen);
+                // Per-CJK-char term. Chinese Han chars are already
+                // lowercased (no case in CJK).
+                let s = c.to_string();
+                if seen.insert(s.clone()) {
+                    terms.push(s);
+                }
+            } else if c.is_whitespace() {
+                flush_ascii(&mut ascii_buf, &mut terms, &mut seen);
+            } else {
+                ascii_buf.push(c);
+            }
         }
+        flush_ascii(&mut ascii_buf, &mut terms, &mut seen);
         terms
     }
 
     /// Check if a candidate qualifies based on term coverage.
+    ///
+    /// For CJK, we do char-for-char containment on the **verbatim** content
+    /// — this parallels the write-side enrichment: if `enrich_content_for_fts`
+    /// wrote unigrams "我" "叫" into the FTS index, then checking verbatim
+    /// content.contains("我") is equivalent to an FTS match, but keeps the
+    /// coverage gate independent of FTS row enrichment side-effects.
     ///
     /// Returns the number of matching terms if qualified, or 0 if not.
     pub fn check(content: &str, query_terms: &[String]) -> usize {
@@ -134,23 +173,124 @@ impl TermCoverageGate {
 
 /// Build an FTS5 query string from user input.
 ///
-/// V1 uses a simple OR of terms (no synonym expansion, no query rewriting).
-/// Each term is quoted to handle special characters.
+/// Unicode61 tokenizer behaviour:
+/// - Whitespace-separated words are individually tokenized.
+/// - Long unspaced CJK runs (> 5 chars?) become ONE token — a "I call what"
+///   query has zero overlap with "The user wants to be called ikkk" because
+///   the whole CJK sentence is one token, making recall zero even when
+///   human semantics clearly overlap.
+///
+/// Fix (review item 二-3): we split every CJK run into per-char tokens so
+/// BM25 term matching is meaningful. Then we also emit bi-grams (2-char
+/// windows) as separate OR-joined terms so longer sentences still have
+/// structured locality, while keeping per-char ORs for single-character
+/// overlap with any hit. The OR operator makes this lenient: any match on
+/// any bigram or unigram contributes to the candidate set.
+///
+/// Example: "我叫什么" →
+///   "我" OR "叫" OR "什" OR "么" OR "我叫" OR "叫什" OR "什么"
+///
+/// Now content "用户希望被称呼为 ikkk" contains "叫" AND "呼" (unigram hit)
+/// even though the whole CJK phrase token won't overlap.
 pub fn build_fts_query(user_input: &str) -> String {
-    let terms: Vec<String> = user_input
-        .split_whitespace()
-        .map(|w| {
-            // Escape FTS5 special characters by wrapping in double quotes.
-            let cleaned: String = w
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                .collect();
-            cleaned
-        })
-        .filter(|s| !s.is_empty())
-        .map(|s| format!("\"{s}\""))
-        .collect();
+    let mut terms: Vec<String> = Vec::new();
+
+    // Split the query into segments: a segment is either a CJK run (every
+    // char is CJK) or a whitespace-delimited non-CJK word.
+    let segments = split_cjk_segments(user_input);
+    for seg in segments {
+        match seg {
+            Segment::Cjk(s) => {
+                // Bigrams first (stronger locality signal, higher score).
+                // Then unigrams (fallback for partial overlap).
+                let chars: Vec<char> = s.chars().collect();
+                if chars.len() >= 2 {
+                    for w in chars.windows(2) {
+                        let bigram: String = w.iter().collect();
+                        terms.push(format!("\"{bigram}\""));
+                    }
+                }
+                for c in &chars {
+                    terms.push(format!("\"{c}\""));
+                }
+            }
+            Segment::Ascii(w) => {
+                let cleaned: String = w
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if !cleaned.is_empty() {
+                    terms.push(format!("\"{cleaned}\""));
+                }
+            }
+        }
+    }
     terms.join(" OR ")
+}
+
+enum Segment<'a> {
+    /// Contiguous CJK characters (Han / Hiragana / Katakana / Hangul).
+    Cjk(&'a str),
+    /// A whitespace-delimited word that does not consist primarily of CJK.
+    Ascii(&'a str),
+}
+
+fn split_cjk_segments<'a>(input: &'a str) -> Vec<Segment<'a>> {
+    let mut out: Vec<Segment<'a>> = Vec::new();
+
+    // Use char-wise boundaries; build byte ranges that map to runs of CJK.
+    let mut char_spans: Vec<(usize, usize, char)> = Vec::new();
+    for (i, c) in input.char_indices() {
+        let end = i + c.len_utf8();
+        char_spans.push((i, end, c));
+    }
+
+    let mut i = 0;
+    while i < char_spans.len() {
+        let (byte_start, _, c) = char_spans[i];
+        if is_cjk(c) {
+            // Find end of the CJK run.
+            let mut j = i;
+            while j < char_spans.len() && is_cjk(char_spans[j].2) {
+                j += 1;
+            }
+            let byte_end = char_spans[j - 1].1;
+            out.push(Segment::Cjk(&input[byte_start..byte_end]));
+            i = j;
+        } else {
+            // Skip whitespace; accumulate ASCII/Latin word.
+            if c.is_whitespace() {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j < char_spans.len()
+                && !char_spans[j].2.is_whitespace()
+                && !is_cjk(char_spans[j].2)
+            {
+                j += 1;
+            }
+            let byte_end = char_spans[j - 1].1;
+            out.push(Segment::Ascii(&input[byte_start..byte_end]));
+            i = j;
+        }
+    }
+    out
+}
+
+/// CJK classifier (shared with router.rs; duplicated here to keep retrievers
+/// a self-contained dep and avoid a cross-public coupling on an internal
+/// helper).
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x309F | // Hiragana
+        0x30A0..=0x30FF | // Katakana
+        0x3400..=0x4DBF | // CJK Ext A
+        0x4E00..=0x9FFF | // CJK Unified Ideographs
+        0xAC00..=0xD7A3 | // Hangul Syllables
+        0xF900..=0xFAFF | // CJK Compatibility Ideographs
+        0x20000..=0x2A6DF // CJK Ext B
+    )
 }
 
 // ───────────────────── Skill Retriever ─────────────────────
@@ -242,18 +382,134 @@ impl SkillRetriever {
 ///
 /// Uses FTS5 + term coverage gate. Only `active` units participate.
 /// Global UserPreference gets an independent conditional floor slot.
+///
+/// Optional integration: attach a `QueryUnderstandingModel` via
+/// `with_query_understanding` to (1) run an FTS rewrite on the query
+/// before building the BM25 query, and (2) down-filter the returned
+/// result set to `scope_hint` / `kind_hint` when the intent is
+/// confident. Both steps are fail-open (default QU → none), so tests
+/// and non-LLM deployments are unaffected.
 pub struct MemoryRetriever {
     db: MemoryDatabase,
     config: RetrievalConfig,
+    query_understanding: Option<Arc<dyn QueryUnderstandingModel>>,
 }
 
 impl MemoryRetriever {
     pub fn new(db: MemoryDatabase, config: RetrievalConfig) -> Self {
-        Self { db, config }
+        Self { db, config, query_understanding: None }
+    }
+
+    /// Attach a QueryUnderstandingModel. When present, the async
+    /// `retrieve_enhanced` entrypoint uses it for (a) query rewrite
+    /// against FTS and (b) post-retrieval scope/kind filtering to
+    /// reduce spurious cross-intent hits.
+    pub fn with_query_understanding<M>(mut self, model: M) -> Self
+    where
+        M: QueryUnderstandingModel + 'static,
+    {
+        self.query_understanding = Some(Arc::new(model));
+        self
     }
 
     /// Retrieve up to `memory_quota` long-term memory results.
+    ///
+    /// NOTE: sync, no QU involvement. Kept for tests / callers that
+    /// just want raw FTS + term coverage behavior. For the W4 QU
+    /// wired path, use `retrieve_enhanced`.
     pub fn retrieve(&self, user_input: &str) -> (Vec<RetrievalResult>, RetrievalDiagnostics) {
+        self.retrieve_inner(user_input, None)
+    }
+
+    /// Retrieve with optional QueryUnderstanding. When a model is
+    /// attached:
+    ///   1. Run QU (fail-open to sync retrieve on error).
+    ///   2. Prefer `rewritten_query` over the raw input for FTS
+    ///      indexing (e.g. "我叫什么" → "用户 称呼 名字").
+    ///   3. Pass scope/kind hints so `retrieve_inner` can narrow
+    ///      the candidate set.
+    pub async fn retrieve_enhanced(
+        &self,
+        user_input: &str,
+    ) -> (Vec<RetrievalResult>, RetrievalDiagnostics) {
+        let qu = match self.query_understanding.as_ref() {
+            Some(q) => q,
+            None => return self.retrieve(user_input),
+        };
+        let understanding: QueryUnderstanding = match qu.understand(user_input).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "query_understanding failed, falling back to sync retrieve"
+                );
+                return self.retrieve(user_input);
+            }
+        };
+        let fts_input = understanding
+            .rewritten_query
+            .as_deref()
+            .unwrap_or(user_input);
+        let mut scope_filter = understanding.intent.scope_hint();
+        let mut kind_filter = understanding.intent.kind_hint();
+        // Safety valve: if QU wrote a rewrite that doesn't share any
+        // tokens with the original query, we'd drop results that
+        // would otherwise pass on the raw input. Fall back to raw
+        // when the rewrite yields empty.
+        let (mut results, diagnostics) = self.retrieve_inner(fts_input, Some((scope_filter, kind_filter)));
+        if results.is_empty() && understanding.rewritten_query.is_some() {
+            // Strip QU filters for the fallback so a narrow intent
+            // can't suppress the last chance match.
+            scope_filter = None;
+            kind_filter = None;
+            let (raw_results, raw_diag) = self.retrieve_inner(user_input, None);
+            results = raw_results;
+            return (
+                results,
+                RetrievalDiagnostics {
+                    reason_codes: {
+                        let mut rc = raw_diag.reason_codes;
+                        rc.push("qu_rewrite_fell_back_to_raw".into());
+                        rc
+                    },
+                    ..raw_diag
+                },
+            );
+        }
+        let mut codes = diagnostics.reason_codes;
+        codes.push(format!(
+            "qu_intent:{}",
+            understanding.intent.as_str()
+        ));
+        if understanding.rewritten_query.is_some() {
+            codes.push("qu_rewrite_applied".into());
+        }
+        if scope_filter.is_some() {
+            codes.push("qu_scope_filtered".into());
+        }
+        if kind_filter.is_some() {
+            codes.push("qu_kind_filtered".into());
+        }
+        (
+            results,
+            RetrievalDiagnostics {
+                reason_codes: codes,
+                ..diagnostics
+            },
+        )
+    }
+
+    /// Internal: FTS candidates → term coverage gate → ranking → quota.
+    ///
+    /// When `(scope_hint, kind_hint)` is provided, results that fail
+    /// either filter are dropped after term coverage (we apply hints
+    /// after BM25 rather than to SQL so the FTS index shape stays
+    /// uniform and the db crate doesn't depend on QU types).
+    fn retrieve_inner(
+        &self,
+        user_input: &str,
+        filters: Option<(Option<MemoryScope>, Option<MemoryKind>)>,
+    ) -> (Vec<RetrievalResult>, RetrievalDiagnostics) {
         let fts_query = build_fts_query(user_input);
         let candidate_limit = self.config.memory_quota * self.config.candidate_multiplier;
         let index_gen = self.db.index_generation().unwrap_or(0);
@@ -266,9 +522,22 @@ impl MemoryRetriever {
         let candidate_count = candidates.len();
         let query_terms = TermCoverageGate::extract_terms(user_input);
 
+        let (scope_hint, kind_hint) = filters.unwrap_or((None, None));
+
         let mut results: Vec<RetrievalResult> = candidates
             .into_iter()
             .filter_map(|(unit_id, content, path, score)| {
+                // Apply QU scope/kind hints from the unit metadata.
+                if let (Some(want_scope), Some(unit)) = (scope_hint, self.db.get_memory_unit(&unit_id).ok().flatten()) {
+                    if unit.scope != want_scope {
+                        return None;
+                    }
+                    if let Some(want_kind) = kind_hint {
+                        if unit.kind != want_kind {
+                            return None;
+                        }
+                    }
+                }
                 let coverage = TermCoverageGate::check(&content, &query_terms);
                 if coverage == 0 && !query_terms.is_empty() {
                     return None;
@@ -959,6 +1228,117 @@ mod tests {
         assert!(query.contains("OR"));
     }
 
+    // ── P0: CJK query expansion (review item 二-3) ──
+
+    #[test]
+    fn build_fts_query_cjk_single_sentence_bigrams_and_unigrams() {
+        // 我叫什么 → 3 bigrams + 4 unigrams OR-joined.
+        let q = build_fts_query("我叫什么");
+        assert!(q.contains("\"我叫\""), "bigram missing: {q}");
+        assert!(q.contains("\"叫什\""), "bigram missing: {q}");
+        assert!(q.contains("\"什么\""), "bigram missing: {q}");
+        assert!(q.contains("\"我\""), "unigram missing: {q}");
+        assert!(q.contains("\"叫\""), "unigram missing: {q}");
+        assert!(q.contains("\"什\""), "unigram missing: {q}");
+        assert!(q.contains("\"么\""), "unigram missing: {q}");
+    }
+
+    #[test]
+    fn build_fts_query_mixed_cjk_ascii() {
+        let q = build_fts_query("rust 我叫什么 go");
+        assert!(q.contains("\"rust\""));
+        assert!(q.contains("\"go\""));
+        assert!(q.contains("\"我叫\""));
+        assert!(q.contains("\"什么\""));
+    }
+
+    #[test]
+    fn build_fts_query_single_cjk_char() {
+        let q = build_fts_query("好");
+        assert_eq!(q, "\"好\"");
+    }
+
+    #[test]
+    fn build_fts_query_two_cjk_bigrams_exist() {
+        // 2 CJK chars → one bigram + two unigrams.
+        let q = build_fts_query("名称");
+        assert!(q.contains("\"名称\""));
+        assert!(q.contains("\"名\""));
+        assert!(q.contains("\"称\""));
+    }
+
+    #[test]
+    fn build_fts_query_empty_or_pure_whitespace() {
+        assert_eq!(build_fts_query(""), "");
+        assert_eq!(build_fts_query("   \t\n"), "");
+    }
+
+    // ── End-to-end: CJK query hits CJK memory via bigram expansion ──
+
+    #[test]
+    fn cjk_query_hits_memory_via_unigram_overlap() {
+        use crate::retrievers::{MemoryRetriever, RetrievalConfig};
+        use crate::types::{MemoryKind, MemoryScope, MemoryUnit, UnitStatus};
+        use chrono::Utc;
+        use sha2::{Digest, Sha256};
+
+        let db = crate::MemoryDatabase::open_in_memory().unwrap();
+        let now = Utc::now();
+        // NOTE: content intentionally contains both "叫" and "我" so the
+        // identity query "我叫什么" shares unigrams {我, 叫} and the bigram
+        // {我叫} with the indexed _CJKTOKENS_ block. Without enrichment
+        // unicode61 would tokenize the entire unspaced CJK run as a single
+        // token, yielding zero candidate overlap even though semantically
+        // this is exactly a "my name is" preference memory.
+        let content = "用户说：叫我 ikkk，记住我的名字。".to_string();
+        let hash = {
+            let mut h = Sha256::new();
+            h.update(content.as_bytes());
+            format!("{:x}", h.finalize())[..16].to_string()
+        };
+        db.upsert_memory_unit(&MemoryUnit {
+            id: "mem_pref_ikkk".into(),
+            path: "proposal".into(),
+            section: "".into(),
+            kind: MemoryKind::Preference,
+            scope: MemoryScope::Global,
+            status: UnitStatus::Active,
+            content,
+            content_hash: hash,
+            updated_at: now,
+            created_at: now,
+        })
+        .unwrap();
+
+        let retriever = MemoryRetriever::new(db.clone(), RetrievalConfig::default());
+        let (results, _) = retriever.retrieve("我叫什么");
+        // Previously 0 results (unicode61: whole CJK sentence = 1 token,
+        // no term overlap with the query even though they share Han chars).
+        // With the dual fix:
+        //   (a) write side enriches FTS rows with _CJKTOKENS_ bigrams+unigrams
+        //   (b) query side splits CJK runs into bigrams+unigrams via OR
+        // we are guaranteed unigram overlap on 我/叫 and bigram overlap on
+        // 我叫, so BM25 surfaces the candidate.
+        let fts_q = build_fts_query("我叫什么");
+        let candidates = db.fts5_memory_candidates(&fts_q, 20).unwrap();
+        assert!(
+            !candidates.is_empty(),
+            "CJK query should produce at least one FTS candidate via unigram/bigram overlap.\n\
+             Query: {fts_q}\n\
+             Candidates: {candidates:?}"
+        );
+        // End-to-end: retriever (which applies term-coverage post-gate)
+        // should also surface the preference memory for this query.
+        assert!(
+            !results.is_empty(),
+            "End-to-end retriever should surface the preference memory for '我叫什么'.\n\
+             Results: {results:?}\n\
+             FTS query: {fts_q}\n\
+             FTS candidates: {candidates:?}"
+        );
+        let _ = db;
+    }
+
     // ── RRF tests ──
 
     #[test]
@@ -993,5 +1373,167 @@ mod tests {
         let vector = vec!["y1".to_string(), "y2".to_string()];
         let fused = reciprocal_rank_fusion(&fts, &vector, 10, 60.0);
         assert_eq!(fused.len(), 4);
+    }
+
+    // ─── W4-3: QueryUnderstanding integration tests ────
+
+    /// Retrieval `with_query_understanding(MockQueryUnderstanding)` for
+    /// identity query must:
+    ///   (a) invoke Mock's rewrite "我叫什么" → "… 用户 称呼 名字 name"
+    ///   (b) classify intent=user_identity and apply scope=Global,
+    ///       kind=Preference filter.
+    ///   (c) tag reason_codes as `qu_intent:user_identity`,
+    ///       `qu_rewrite_applied`, `qu_scope_filtered`, `qu_kind_filtered`.
+    ///   (d) surface the name-preference memory via the rewritten query.
+    #[tokio::test]
+    async fn retrieve_enhanced_runs_identity_through_mock_qu_pipeline() {
+        use crate::llm_extractor::{
+            EvidenceExtractor, ExtractionContext, MockEvidenceExtractor, SourceRef,
+        };
+        use crate::proposal::propose_and_commit;
+        use crate::query_understanding::{
+            MockQueryUnderstanding, QueryUnderstandingModel, QueryIntent,
+        };
+        use crate::types::MemoryScope;
+
+        let db = crate::database::MemoryDatabase::open_in_memory().unwrap();
+        let extractor = MockEvidenceExtractor::default();
+        let extraction_ctx = ExtractionContext {
+            user_input: "记住我叫 ikkk。".into(),
+            assistant_content: vec!["好的，以后我会叫你 ikkk。".into()],
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            adjacent_events: Vec::new(),
+            existing_memory: Vec::new(),
+            source: SourceRef {
+                rollout_id: "test_session_1".into(),
+                seq_start: 1,
+                seq_end: 5,
+                turn_id: "turn_remember".into(),
+                step_id: None,
+            },
+        };
+        let extraction = extractor.extract(&extraction_ctx).await.unwrap();
+        let report = propose_and_commit(&db, &extraction, "mock:rule");
+        assert_eq!(report.committed, 1);
+
+        let qu = MockQueryUnderstanding;
+        // Sanity — the mock must classify this as identity and produce a
+        // rewrite (that's the contract this integration test relies on).
+        let qu_check = qu.understand("我叫什么").await.unwrap();
+        assert_eq!(qu_check.intent, QueryIntent::UserIdentity);
+        assert_eq!(qu_check.intent.scope_hint(), Some(MemoryScope::Global));
+        assert!(qu_check.rewritten_query.is_some());
+
+        let retriever = MemoryRetriever::new(db.clone(), RetrievalConfig::default())
+            .with_query_understanding(qu);
+        let (results, diag) = retriever.retrieve_enhanced("我叫什么").await;
+
+        assert!(
+            results.iter().any(|r| r.content.contains("ikkk")),
+            "retrieve_enhanced should surface the name memory via QU rewrite. Results: {results:#?}"
+        );
+        assert!(
+            diag.reason_codes
+                .iter()
+                .any(|c| c == "qu_intent:user_identity"),
+            "missing intent tag in reason_codes: {:?}",
+            diag.reason_codes
+        );
+        assert!(
+            diag.reason_codes.iter().any(|c| c == "qu_rewrite_applied"),
+            "missing rewrite tag in reason_codes: {:?}",
+            diag.reason_codes
+        );
+        assert!(
+            diag.reason_codes.iter().any(|c| c == "qu_scope_filtered"),
+            "missing scope filter tag in reason_codes: {:?}",
+            diag.reason_codes
+        );
+        assert!(
+            diag.reason_codes.iter().any(|c| c == "qu_kind_filtered"),
+            "missing kind filter tag in reason_codes: {:?}",
+            diag.reason_codes
+        );
+    }
+
+    /// Fail-open: when QU model returns an error, `retrieve_enhanced`
+    /// should degrade cleanly to the raw sync retrieve instead of
+    /// bubbling the error. This is enforced via an
+    /// "always-error" mock.
+    #[tokio::test]
+    async fn retrieve_enhanced_falls_back_to_raw_when_qu_errors() {
+        use chrono::Utc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::database::MemoryDatabase;
+        use crate::llm_extractor::{
+            EvidenceExtractor, ExtractionContext, MockEvidenceExtractor, SourceRef,
+        };
+        use crate::proposal::propose_and_commit;
+        use crate::query_understanding::{
+            QueryUnderstanding, QueryUnderstandingError, QueryUnderstandingModel,
+        };
+
+        struct ErrorQU(AtomicU64);
+        #[async_trait::async_trait]
+        impl QueryUnderstandingModel for ErrorQU {
+            async fn understand(&self, _q: &str) -> Result<QueryUnderstanding, QueryUnderstandingError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(QueryUnderstandingError::Provider("boom".into()))
+            }
+        }
+
+        // Use the propose_and_commit + Mock extractor flow so the memory
+        // unit is written with FTS enrichment (same code path as
+        // production), and the raw retrieve FTS leg can find it.
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let extractor = MockEvidenceExtractor::default();
+        let extraction_ctx = ExtractionContext {
+            user_input: "记住我喜欢测试偏好。".into(),
+            assistant_content: vec!["好的，已记录偏好。".into()],
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            adjacent_events: Vec::new(),
+            existing_memory: Vec::new(),
+            source: SourceRef {
+                rollout_id: "test_session_qu_err".into(),
+                seq_start: 1,
+                seq_end: 2,
+                turn_id: "t1".into(),
+                step_id: None,
+            },
+        };
+        let extraction = extractor.extract(&extraction_ctx).await.unwrap();
+        let report = propose_and_commit(&db, &extraction, "mock:rule");
+        assert!(
+            report.committed >= 1,
+            "fallback needs at least one memory unit to retrieve: {report:?}"
+        );
+        drop(extractor);
+
+        let err_qu = ErrorQU(AtomicU64::new(0));
+        let retriever = MemoryRetriever::new(db.clone(), RetrievalConfig::default())
+            .with_query_understanding(err_qu);
+        let (results, diag) = retriever.retrieve_enhanced("测试偏好").await;
+
+        // Retrieve succeeded via the fail-open path: ErrorQU is an
+        // always-error model so `retrieve_enhanced` must have taken the
+        // `match qu.understand` Err branch → sync retrieve. The sync
+        // retrieve has access to the FTS-enriched DB and returns the
+        // "我喜欢测试偏好" preference memory.
+        assert!(
+            !results.is_empty(),
+            "QU error must fall back to raw retrieval. Diag: {diag:?}"
+        );
+        // No QU_* tags when we took the error shortcut.
+        assert!(
+            !diag.reason_codes.iter().any(|c| c.starts_with("qu_intent")),
+            "QU error must not pretend QU pipeline tags ran. reasons: {:?}",
+            diag.reason_codes
+        );
+        // Silence unused import warning for types still needed for
+        // fallthrough safety of the `ErrorQU` definition above.
+        let _dt = Utc::now();
     }
 }

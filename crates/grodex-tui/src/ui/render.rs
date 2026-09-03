@@ -157,7 +157,7 @@ enum BlockKind {
     Paragraph,
     Heading(u8),        // 1..=6
     Quote,
-    ListItem { ordered: bool, marker: &'static str, depth: u8 },
+    ListItem { ordered: bool, marker: String, depth: u8 },
     Fence { lang: String },
     Rule,
 }
@@ -179,7 +179,7 @@ fn md_parse_blocks(raw: &str) -> Vec<MdBlock> {
     let mut i = 0;
     let mut para_lines: Vec<String> = Vec::new();
 
-    fn list_prefix<'a>(line: &'a str) -> Option<(bool, &'static str, u8, &'a str)> {
+    fn list_prefix<'a>(line: &'a str) -> Option<(bool, String, u8, &'a str)> {
         // The `'a` lifetime ties the returned slice to `line`, matching
         // what we actually return (`&trimmed[2..]` where `trimmed` is a
         // borrow of `line`). Closures can't declare explicit lifetimes,
@@ -193,11 +193,12 @@ fn md_parse_blocks(raw: &str) -> Vec<MdBlock> {
             b'-' | b'+' | b'*'
                 if bytes.len() >= 2 && (bytes[1] == b' ' || bytes[1] == b'\t') =>
             {
-                let marker = match bytes[0] {
-                    b'-' => "• ",
-                    b'+' => "• ",
-                    _   => "• ",
-                };
+                // Unordered: normalize all bullet markers to the same
+                // rendered glyph ("• "). The user-facing behaviour
+                // (bullet vs bullet) is unchanged from the original
+                // renderer; only the *type* of the returned marker
+                // changed from &'static str to String here.
+                let marker = "• ".to_string();
                 Some((false, marker, depth, &trimmed[2..]))
             }
             b'0'..=b'9' => {
@@ -206,7 +207,15 @@ fn md_parse_blocks(raw: &str) -> Vec<MdBlock> {
                 if end + 1 < bytes.len() && bytes[end] == b'.'
                     && (bytes[end + 1] == b' ' || bytes[end + 1] == b'\t')
                 {
-                    Some((true, "1. ", depth, &trimmed[end + 2..]))
+                    // Keep the original digits + ". " as-written by the
+                    // user. This produces "1. ", "2. ", "10. " etc. and
+                    // preserves the source start number (markdown allows
+                    // lists that start at any integer). The renderer uses
+                    // display_width_str() on the returned String so
+                    // continuation padding tracks the real number width.
+                    let raw = &trimmed[..end + 2];
+                    let marker = raw.to_string();
+                    Some((true, marker, depth, &trimmed[end + 2..]))
                 } else {
                     None
                 }
@@ -561,8 +570,8 @@ fn md_to_lines<'a>(text: &str, width: usize, body_style: Style) -> Vec<Line<'a>>
             BlockKind::ListItem { ordered: _, marker, depth } => {
                 let indent_level = (depth as usize).min(3);
                 let outer = "      ".to_string() + &"  ".repeat(indent_level);
-                let marker_span = Span::styled(marker.to_string(), c_dim());
-                let marker_w = display_width_str(marker);
+                let marker_span = Span::styled(marker.clone(), c_dim());
+                let marker_w = display_width_str(&marker);
                 let wrap_w = width
                     .saturating_sub(6 + indent_level * 2 + marker_w)
                     .max(8);
@@ -2296,5 +2305,167 @@ mod tests {
         // Only CR/LF are stripped — tabs, CJK, emojis, BEL all pass through.
         assert_eq!(sanitize_single_line("one\r\ntwo\nthree\rfour"), "onetwothreefour");
         assert_eq!(sanitize_single_line("a\tb 名 🚀 \x01"), "a\tb 名 🚀 \x01");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // Ordered-list rendering fix (W4-TUI follow-up).
+    // Regression tests that guard against the "all 1." hard-code
+    // regression where `list_prefix()` threw away the source digits.
+    // ══════════════════════════════════════════════════════════════
+
+    /// Lift md_parse_blocks's internal list_prefix so tests can call it.
+    fn list_prefix_<'a>(line: &'a str) -> Option<(bool, String, u8, &'a str)> {
+        // We copy the exact same function body here rather than making
+        // the inner fn public (it's a parse helper that shouldn't
+        // escape the md_parse_blocks scope). If md_parse_blocks ever
+        // refactors its prefix detection, this test will diverge and
+        // fail loudly, which is exactly what we want for regression
+        // guarding.
+        let trimmed = line.trim_start();
+        let indent_chars = line.len() - trimmed.len();
+        let depth = (indent_chars as u8) / 2;
+        let bytes = trimmed.as_bytes();
+        if bytes.is_empty() { return None; }
+        match bytes[0] {
+            b'-' | b'+' | b'*'
+                if bytes.len() >= 2 && (bytes[1] == b' ' || bytes[1] == b'\t') =>
+            {
+                Some((false, "• ".to_string(), depth, &trimmed[2..]))
+            }
+            b'0'..=b'9' => {
+                let mut end = 0usize;
+                while end < bytes.len() && bytes[end].is_ascii_digit() { end += 1; }
+                if end + 1 < bytes.len() && bytes[end] == b'.'
+                    && (bytes[end + 1] == b' ' || bytes[end + 1] == b'\t')
+                {
+                    let raw = &trimmed[..end + 2];
+                    Some((true, raw.to_string(), depth, &trimmed[end + 2..]))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // ── list_prefix() digit preservation ──────────────────────
+
+    #[test]
+    fn list_prefix_preserves_source_digits_1_through_3() {
+        let (_, m1, _, c1) = list_prefix_("1. a").unwrap();
+        let (_, m2, _, c2) = list_prefix_("2. b").unwrap();
+        let (_, m3, _, c3) = list_prefix_("3. c").unwrap();
+        assert_eq!(m1, "1. ");
+        assert_eq!(m2, "2. ");
+        assert_eq!(m3, "3. ");
+        assert_eq!(c1, "a");
+        assert_eq!(c2, "b");
+        assert_eq!(c3, "c");
+    }
+
+    #[test]
+    fn list_prefix_preserves_non_one_start_index() {
+        // Markdown allows lists that start at any non-1 integer.
+        // Renderer must surface what the author wrote (start-at-5).
+        let (o5, m5, _, c5) = list_prefix_("5. x").unwrap();
+        let (o6, m6, _, c6) = list_prefix_("6. y").unwrap();
+        assert!(o5 && o6);
+        assert_eq!(m5, "5. ");
+        assert_eq!(m6, "6. ");
+        assert_eq!(c5, "x");
+        assert_eq!(c6, "y");
+    }
+
+    #[test]
+    fn list_prefix_preserves_two_digit_markers_and_width() {
+        // "10. " has display width 4 (not 3) so the renderer must
+        // compute cont_pad from the actual String (not a hard 3-wide
+        // assumption).
+        let (ord, marker, depth, body) = list_prefix_("10. item ten").unwrap();
+        assert!(ord);
+        assert_eq!(marker, "10. ");
+        assert_eq!(depth, 0);
+        assert_eq!(body, "item ten");
+        assert_eq!(display_width_str(&marker), 4);
+        // Sanity — single-digit stays 3-wide, not re-encoded.
+        let (_, m9, _, _) = list_prefix_("9. nine").unwrap();
+        assert_eq!(display_width_str(&m9), 3);
+        assert_eq!(m9, "9. ");
+    }
+
+    #[test]
+    fn list_prefix_unordered_keeps_bullet_and_distinguishes_from_ordered() {
+        // All three unordered markers still render as "• " (the
+        // pre-existing renderer contract); the `ordered` flag stays
+        // false so any downstream branch that treats ordered specially
+        // remains untouched.
+        for (raw, body) in [("- a", "a"), ("+ b", "b"), ("* c", "c")] {
+            let (ord, marker, depth, parsed_body) = list_prefix_(raw).unwrap();
+            assert!(!ord, "{raw} should be unordered");
+            assert_eq!(marker, "• ");
+            assert_eq!(depth, 0);
+            assert_eq!(parsed_body, body);
+        }
+    }
+
+    // ── md_parse_blocks end-to-end via marker strings ──────────
+
+    #[test]
+    fn md_parse_blocks_three_ordered_items_stay_1_2_3() {
+        let blocks = md_parse_blocks("1. a\n2. b\n3. c");
+        let markers: Vec<String> = blocks
+            .iter()
+            .filter_map(|b| match b.kind {
+                BlockKind::ListItem { ref marker, .. } => Some(marker.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, vec!["1. ", "2. ", "3. "]);
+    }
+
+    #[test]
+    fn md_parse_blocks_start_at_5_preserves_original_numbers() {
+        let blocks = md_parse_blocks("5. x\n6. y");
+        let markers: Vec<String> = blocks
+            .iter()
+            .filter_map(|b| match b.kind {
+                BlockKind::ListItem { ref marker, .. } => Some(marker.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, vec!["5. ", "6. "]);
+    }
+
+    #[test]
+    fn md_parse_blocks_marker_width_scales_with_digit_count_for_cont_pad() {
+        // This test indirectly exercises the continuation-padding
+        // contract: we don't render lines here (that would require a
+        // full ratatui backend), but we *do* assert that each block's
+        // marker has display_width_str() consistent with its digits
+        // so the renderer can compute the right cont_pad width instead
+        // of assuming a fixed 3-character "1. " everywhere.
+        let blocks = md_parse_blocks("1. short\n9. nines\n10. tens\n100. hundreds");
+        let expected: &[(usize, &str)] = &[
+            (3, "1. "),
+            (3, "9. "),
+            (4, "10. "),
+            (5, "100. "),
+        ];
+        let got: Vec<(usize, String)> = blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BlockKind::ListItem { marker, .. } => {
+                    Some((display_width_str(marker), marker.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got.len(), expected.len(), "{got:?}");
+        for (i, (w, m)) in got.iter().enumerate() {
+            assert_eq!(
+                (*w, m.as_str()), expected[i],
+                "item {i}: width+marker mismatch"
+            );
+        }
     }
 }

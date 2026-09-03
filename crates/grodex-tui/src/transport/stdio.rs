@@ -175,9 +175,15 @@ impl StdioClient {
             if line.is_empty() {
                 continue;
             }
-            if line.len() > 1024 * 1024 {
+            // Single-line payload cap. Snapshot frames for a mid-sized
+            // session can easily exceed the old 1MB hard limit: e.g. 1k
+            // events with a few KB of reasoning each → 1-5MB JSON.
+            // 16 MB is a generous ceiling that still protects us against
+            // genuinely malformed/runaway lines (memory fail-closed).
+            const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+            if line.len() > MAX_LINE_BYTES {
                 self.pending_logs
-                    .push(format!("[tui transport] line too long: {} bytes", line.len()));
+                    .push(format!("[tui transport] line too long: {} bytes (max {MAX_LINE_BYTES})", line.len()));
                 continue;
             }
             match serde_json::from_str::<ServerFrame>(line) {
@@ -260,8 +266,27 @@ impl StdioClient {
                 Some(env)
             }
             ServerFrame::Snapshot(payload) => {
+                // Advance last_consumed_seq to payload.last_seq so service
+                // side doesn't think the snapshot-covered events are still
+                // pending. Previously Snapshot frames never entered
+                // event_queue and their seq range (which can be huge on
+                // /resume from a long history) was never ACKed, causing
+                //   inflight = next_seq - 0 > cap (128)
+                // on the very next Event after resume, triggering the
+                // "[transport] FlowControl: 暂停 10ms" log every 10ms.
+                if payload.last_seq > self.last_consumed_seq {
+                    self.last_consumed_seq = payload.last_seq;
+                    self.ack_dirty = true;
+                }
                 self.last_snapshot = Some(payload.clone());
                 self.pending_snapshots.push(payload);
+                // Ack immediately: the snapshot is a durable
+                // representation of consumed events up to last_seq; the
+                // server's backpressure window should be released the
+                // moment we store the snapshot.
+                if self.ack_dirty {
+                    let _ = self.send_ack();
+                }
                 None
             }
             ServerFrame::FlowControl {

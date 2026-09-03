@@ -170,10 +170,23 @@ impl IntentRouter {
         }
 
         // ── Memory signals (workspace, module, path, preference, etc.) ──
+        // Identity/preference queries are the canonical "very short CJK
+        // queries" that the old whitespace-based gate missed (e.g. "我叫什么"
+        // = 4 CJK chars, 1 whitespace token). Adding these lexical signals
+        // guarantees the retrieval legs are opened for exactly the class of
+        // queries that produce global-scoped memory.
         let memory_signals = [
             "workspace", "module", "path", "file", "project", "config",
             "preference", "convention", "architecture", "dependency", "crate",
             "工作区", "模块", "路径", "文件", "项目", "配置", "偏好", "约定", "架构", "依赖",
+            // Identity / address-me queries
+            "我叫什么", "我叫啥", "我是谁", "我的名字", "怎么称呼我", "你记得我叫", "叫我", "我叫",
+            "what's my name", "what is my name", "who am i", "my name", "call me", "i am called",
+            // Memory / fact lookup queries
+            "我喜欢", "我讨厌", "记住我", "记得我", "我偏好",
+            "what do i prefer", "what i like", "my preference", "do you remember",
+            // Project decisions / conventions (common CJK queries)
+            "我们决定", "决定了什么", "规则是什么", "怎么做", "怎么搞",
         ];
         for signal in &memory_signals {
             if lower.contains(signal) {
@@ -186,9 +199,11 @@ impl IntentRouter {
         // ── Conservative default: when unsure, enable Memory ──
         // (miss cost > empty retrieval cost)
         if !memory && !evidence && !skill {
-            // If the request is non-trivial (more than a few words), enable memory.
-            let word_count = user_input.split_whitespace().count();
-            if word_count > 3 {
+            // Word count is CJK-aware: each CJK run of N chars counts as N
+            // tokens (CJK is tokenized as one unit per char), each ASCII
+            // whitespace-separated word counts as 1 token.
+            let term_count = cjk_aware_term_count(user_input);
+            if term_count > 3 {
                 memory = true;
                 reasons.push("conservative_default_non_trivial".to_string());
             }
@@ -209,7 +224,59 @@ impl IntentRouter {
             hard_skip_reason: None,
         }
     }
+}
 
+/// Count query terms in a CJK-aware way so short Chinese queries don't
+/// look like "1 word" just because there's no whitespace between them.
+///
+/// Rules:
+/// - Whitespace-separated runs of non-CJK characters → 1 term each.
+/// - Each CJK character (\p{Han}, Hiragana, Katakana, Hangul) → 1 term each
+///   (matches SQLite FTS5's unicode61 tokenizer behaviour which *also*
+///   treats CJK individually for sequences < 6 chars long — or, for
+///   longer unspaced runs, treats the entire run as a single token; but
+///   in the router context being conservative = enabling memory, so per
+///   char counting is fail-safe).
+/// - Arabic numerals + punctuation = 0 terms.
+fn cjk_aware_term_count(s: &str) -> usize {
+    let mut count = 0;
+    let mut in_ascii_word = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            in_ascii_word = false;
+            continue;
+        }
+        if is_cjk(c) {
+            count += 1;
+            in_ascii_word = false;
+            continue;
+        }
+        // ASCII / Latin alphanumeric → count whole whitespace-separated word once
+        if c.is_alphanumeric() && !in_ascii_word {
+            count += 1;
+            in_ascii_word = true;
+        }
+    }
+    count
+}
+
+/// Return true if c is a CJK ideograph / Hiragana / Katakana / Hangul syllable.
+/// This is an exact subset of what FTS5's unicode61 tokenizer treats as a
+/// single-character-token for short runs (and entire-run token for long runs
+/// without spaces).
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x309F | // Hiragana
+        0x30A0..=0x30FF | // Katakana
+        0x3400..=0x4DBF | // CJK Ext A
+        0x4E00..=0x9FFF | // CJK Unified Ideographs
+        0xAC00..=0xD7A3 | // Hangul Syllables
+        0xF900..=0xFAFF | // CJK Compatibility Ideographs
+        0x20000..=0x2A6DF // CJK Ext B (rare, handle anyway)
+    )
+}
+
+impl IntentRouter {
     /// Check if a request is clearly self-contained (no retrieval needed).
     ///
     /// Only time queries, simple translations, single-sentence rewrites,
@@ -346,5 +413,45 @@ mod tests {
         let decision = IntentRouter::route("上次发布为什么失败");
         assert!(decision.evidence_enabled);
         assert!(decision.memory_enabled);
+    }
+
+    // ── P0: CJK short-query regressions (review item 二-2) ──
+
+    #[test]
+    fn cjk_identity_short_query_enables_memory() {
+        for q in ["我叫什么", "我叫啥", "我是谁", "我的名字", "你记得我叫什么"] {
+            let d = IntentRouter::route(q);
+            assert!(d.memory_enabled, "{q} must enable memory: {d:?}");
+        }
+    }
+
+    #[test]
+    fn english_identity_short_query_enables_memory() {
+        for q in ["what's my name", "what is my name", "who am i"] {
+            let d = IntentRouter::route(q);
+            assert!(d.memory_enabled, "{q} must enable memory: {d:?}");
+        }
+    }
+
+    #[test]
+    fn cjk_term_count_correctness() {
+        // 4 CJK chars → 4 terms (≥4 triggers memory gate)
+        assert_eq!(cjk_aware_term_count("我叫什么"), 4);
+        // Mixed CJK + English word
+        assert_eq!(cjk_aware_term_count("My name"), 2);
+        // CJK + English mixed
+        assert_eq!(cjk_aware_term_count("我叫什么名 what's"), 6);
+        // Pure space-delimited English
+        assert_eq!(cjk_aware_term_count("help me understand the db"), 5);
+        // Trivial 1 word stays under gate
+        assert_eq!(cjk_aware_term_count("hello"), 1);
+        // CJK single char
+        assert_eq!(cjk_aware_term_count("好"), 1);
+    }
+
+    #[test]
+    fn cjk_short_query_pref_signal() {
+        let d = IntentRouter::route("我喜欢什么");
+        assert!(d.memory_enabled, "我喜欢什么 must enable memory");
     }
 }

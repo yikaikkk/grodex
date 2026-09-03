@@ -16,6 +16,7 @@ pub mod command;
 pub mod context;
 pub mod context_projection;
 pub mod durable_subagent;
+pub mod memory_extractor;
 pub mod memory_snapshot;
 pub mod reducer;
 pub mod rollout_writer;
