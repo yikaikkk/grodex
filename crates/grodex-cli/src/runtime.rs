@@ -99,6 +99,16 @@ pub struct SessionRuntimeBuilder {
     telemetry: Option<Arc<dyn grodex_telemetry::TelemetrySink>>,
     /// Process-level run id attached to every telemetry record.
     run_id: String,
+    /// (P0-1) Whether the SamplingBackedExtractor LLM tier is enabled.
+    /// Default `true`. Disabling it keeps only the rule-tier regex
+    /// extractor, useful for offline smoke runs without a live key.
+    memory_llm_enabled: bool,
+    /// (P0-1/P0-2) Controls how much the rule fallback is allowed to
+    /// promote claims into Active memory. `AllowCandidate` (default)
+    /// is the P0-2 fail-closed sweet spot: rule claims never reach
+    /// Active unless they are identity-user-explicit (preserves the
+    /// "remember my name" back-compat).
+    memory_rule_mode: grodex_memory::MemoryRuleMode,
 }
 
 impl SessionRuntimeBuilder {
@@ -111,6 +121,8 @@ impl SessionRuntimeBuilder {
             model_route: None,
             telemetry: None,
             run_id: uuid::Uuid::new_v4().to_string(),
+            memory_llm_enabled: true,
+            memory_rule_mode: grodex_memory::MemoryRuleMode::default(),
         }
     }
 
@@ -154,6 +166,22 @@ impl SessionRuntimeBuilder {
     /// candidate on `RetryDecision::FailoverToNextCandidate`.
     pub fn with_model_route(mut self, route: Option<ModelRoute>) -> Self {
         self.model_route = route;
+        self
+    }
+
+    /// (P0-1) Toggle the LLM tier of the memory extractor. Default `true`.
+    pub fn with_memory_llm_enabled(mut self, enabled: bool) -> Self {
+        self.memory_llm_enabled = enabled;
+        self
+    }
+
+    /// (P0-1/P0-2) Control how much the rule-tier extractor is allowed
+    /// to promote claims into Active memory.
+    pub fn with_memory_rule_mode(
+        mut self,
+        mode: grodex_memory::MemoryRuleMode,
+    ) -> Self {
+        self.memory_rule_mode = mode;
         self
     }
 
@@ -387,8 +415,10 @@ impl SessionRuntimeBuilder {
             .map_err(|e| anyhow!("failed to create sampling client: {e}"))?;
         // Clone the client for the sub-agent (DelegateTool) so it can run
         // its own sampling turns. reqwest::Client::clone shares the
-        // connection pool — cheap.
+        // connection pool — cheap. Also keep a 2nd clone for the memory
+        // LLM extractor's SamplingActor (P0-1).
         let sub_client = client.clone();
+        let memory_client = client.clone();
         let mut actor = SamplingActor::new(client);
         if let Some(route) = model_route.clone() {
             actor = actor.with_route(route);
@@ -398,6 +428,22 @@ impl SessionRuntimeBuilder {
             sub_actor = sub_actor.with_route(route);
         }
         let sub_actor = Arc::new(sub_actor);
+        // (P0-1) Build an Arc'd SamplingActor *copy* for the memory LLM
+        // extractor path. SamplingActor isn't Clone, but the underlying
+        // SamplingClient is (shares connection pool), so we build a
+        // second actor with the same route and client clone — all the
+        // per-request state (budget/breaker) is local to the actor,
+        // which is fine because memory extraction runs on a different
+        // call site than TurnCoordinator.
+        let memory_sampling: Option<Arc<SamplingActor>> = if self.memory_llm_enabled {
+            let mut mem_actor = SamplingActor::new(memory_client);
+            if let Some(route) = model_route.clone() {
+                mem_actor = mem_actor.with_route(route);
+            }
+            Some(Arc::new(mem_actor))
+        } else {
+            None
+        };
         let chat_state = ChatStateActor::spawn();
 
         // ── 4. PermissionManager (policy from config `[rules]`) ────
@@ -949,6 +995,22 @@ impl SessionRuntimeBuilder {
                 Ok(_) => {}
                 Err(e) => eprintln!("[warn] memory crash recovery failed: {e}"),
             }
+            // (P0-11) Durable memory-task crash recovery. Anything stuck
+            // in `running` or unclaimed `requested` for more than 2
+            // minutes is assumed to be orphan (crashed worker / panic)
+            // and re-enqueued with a retry bump. If it keeps failing
+            // after `max_retries`, it parks in `deferred` so operators
+            // can examine the poison payload without live churn.
+            const STALE_MEMORY_TASK_SECS: i64 = 120;
+            match db.recover_stale_memory_tasks(STALE_MEMORY_TASK_SECS) {
+                Ok(n) if n > 0 => {
+                    eprintln!(
+                        "[memory] recovered {n} stale memory extraction tasks (enqueued for retry)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[warn] memory-task crash recovery failed: {e}"),
+            }
             // P0-2: extract EvidenceUnits from historical rollouts in the
             // background so old sessions can feed the consolidation pass.
             let db_extract = db.clone();
@@ -1159,30 +1221,40 @@ impl SessionRuntimeBuilder {
         // Only build an extractor when memory DB is enabled; otherwise
         // we pass None so the supervisor skips extraction entirely.
         //
-        // * If the user has a live model route, we build a
-        //   SamplingBackedExtractor on top of the shared SamplingActor
-        //   and wrap it in CompositeExtractor (so extraction errors
-        //   degrade to rule-based, not to zero extraction).
-        // * Otherwise the supervisor gets a rule-only composite so
-        //   identity preferences ("叫我 ikkk") still enter Active memory
-        //   via the MockEvidenceExtractor regex path.
+        // (P0-1-runtime) The LLM tier (`SamplingBackedExtractor`) is now
+        // enabled by default when the runtime has a SamplingActor. It
+        // produces authority-tagged ExtractionClaims so the downstream
+        // write gate can enforce Candidate vs Active semantics correctly
+        // (see P0-3/6/7 fixes). `rule_mode` controls rule-tier fallback
+        // after LLM errors (P0-2 fail-closed).
         let memory_extractor: Option<
             std::sync::Arc<dyn grodex_memory::EvidenceExtractor + Send + Sync>,
         > = if memory.is_some() {
             use std::sync::Arc;
-            let llm_tier: Option<Arc<dyn grodex_memory::EvidenceExtractor + Send + Sync>> = None;
-            // NOTE: LLM tier intentionally disabled by default here.
-            // Wiring it requires the shared SamplingActor to be moved
-            // into an Arc before the coordinator is built, and the
-            // provider model binding to be extracted from the same
-            // ModelConfig the coordinator uses. That rework is tracked
-            // under "W4-2 final integration" and will be enabled once
-            // the rule-tier path has been observed to be stable in real
-            // sessions. The rule tier alone already covers the high-
-            // value "remember my name / preference" scenario and is
-            // fail-safe (no network, no token cost, no JSON parsing
-            // failure modes).
-            Some(Arc::new(CompositeExtractor::new(llm_tier)))
+            use grodex_provider::binding::ModelBinding;
+            use grodex_loop::memory_extractor::SamplingBackedExtractor;
+            let llm_tier: Option<Arc<dyn grodex_memory::EvidenceExtractor + Send + Sync>> =
+                memory_sampling.map(|actor| {
+                    // Build a best-effort ModelBinding mirroring the
+                    // running model config. The SamplingActor internally
+                    // uses the same model routes so the binding is just
+                    // provenance metadata; but provider/model/protocol are
+                    // echoed so audit trails can distinguish LLM vs rule
+                    // claims.
+                    let binding = ModelBinding::new(
+                        model_config.provider.clone(),
+                        1,
+                        model_config.model.clone(),
+                        1,
+                        model_config.wire_protocol,
+                    );
+                    Arc::new(SamplingBackedExtractor::new(actor, binding))
+                        as Arc<dyn grodex_memory::EvidenceExtractor + Send + Sync>
+                });
+            let extractor = CompositeExtractor::new(llm_tier)
+                .with_rule_mode(self.memory_rule_mode.clone())
+                .with_llm_enabled(self.memory_llm_enabled);
+            Some(Arc::new(extractor))
         } else {
             None
         };

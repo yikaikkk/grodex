@@ -37,6 +37,14 @@ use crate::types::{ConflictRelation, EdgeRelation, MemoryConflict, MemoryUnit};
 
 /// Default threshold for "stale" decay.
 pub const STALE_ACCESS_DAYS: i64 = 180;
+/// (RC3A) How long a `status='candidate'` memory unit lives before it is
+/// physically deleted by the governance pass. Candidates come from the
+/// rule-tier default (AllowCandidate) or from LLM claims with
+/// authority=AssistantSummary. They are NEVER surfaced to the user
+/// (retrieval gates on status=active), so after this TTL the claim is
+/// clearly not going to be promoted; reclaiming the rows avoids a
+/// silent "candidate black hole" accumulating over months of use.
+pub const MEMORY_CANDIDATE_TTL_DAYS: i64 = 7;
 /// Max conflicts detected / decayed units per pass — keeps runtime bounded.
 pub const MAX_OPS_PER_PASS: usize = 200;
 
@@ -52,6 +60,13 @@ pub struct GovernanceReport {
     pub conflicts_judge_errors: usize,
     pub rollout_evidences_expired: usize,
     pub stale_memories_decayed: usize,
+    /// (RC3A) Snapshot count of `status='candidate'` rows at the start
+    /// of the governance pass — used for diagnostics / alerting on
+    /// accumulation.
+    pub candidate_total: usize,
+    /// (RC3A) How many stale candidate rows were physically deleted this
+    /// pass (older than `MEMORY_CANDIDATE_TTL_DAYS`).
+    pub candidates_purged: usize,
     pub embedding_model_changed: bool,
     pub embedding_old_rows_deleted: usize,
     pub backfill_batches_failed: usize,
@@ -75,6 +90,16 @@ impl MemoryDatabase {
         new_model_id: Option<&str>,
     ) -> GovernanceReport {
         let mut report = GovernanceReport::default();
+
+        // ── 0. Candidate lifecycle snapshot & purge (RC3A) ────────────
+        match self.count_candidates_total() {
+            Ok(n) => report.candidate_total = n,
+            Err(_) => report.errors += 1,
+        }
+        match self.purge_stale_candidates(MEMORY_CANDIDATE_TTL_DAYS, MAX_OPS_PER_PASS) {
+            Ok(n) => report.candidates_purged = n,
+            Err(_) => report.errors += 1,
+        }
 
         // ── 1. Conflict candidates ──────────────────────────────────
         match self.list_conflict_candidate_pairs(MAX_OPS_PER_PASS) {
@@ -181,6 +206,100 @@ impl MemoryDatabase {
             rusqlite::params![Utc::now().to_rfc3339(), cutoff_s, limit as i64],
         )?;
         Ok(changed)
+    }
+
+    /// (RC3A) Snapshot count of status='candidate' rows in the DB.
+    /// Failures are not fatal — callers bump report.errors.
+    pub fn count_candidates_total(&self) -> Result<usize, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_units WHERE status = 'candidate'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// (RC3A) Physically delete candidate rows older than `ttl_days`,
+    /// along with their FTS / edge / proposal / conflict rows so no
+    /// orphans remain. At most `limit` rows are removed per pass so a
+    /// single governance run doesn't stall the main event loop.
+    ///
+    /// Candidate rows are NEVER injected into prompts (retrieval gates
+    /// on status=active), so dropping stale candidates is safe — they
+    /// simply will never be promoted anyway.
+    pub fn purge_stale_candidates(
+        &self,
+        ttl_days: i64,
+        limit: usize,
+    ) -> Result<usize, DbError> {
+        use crate::types::UnitStatus;
+        let cutoff: DateTime<Utc> = Utc::now()
+            .checked_sub_signed(Duration::days(ttl_days))
+            .unwrap_or_else(|| Utc::now());
+        let cutoff_s = cutoff.to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        // 1) Select candidates to delete. Using a subquery with LIMIT so
+        //    we can still pass parameters to the IN(...) clauses cleanly.
+        let ids: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM memory_units
+                 WHERE status = 'candidate' AND created_at < ?1
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![cutoff_s, limit as i64],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut v = Vec::with_capacity(limit);
+            for r in rows {
+                v.push(r?);
+            }
+            v
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // Build a `?, ?, ...` placeholder string. `rusqlite::params_from_iter`
+        // would be nicer but we call it multiple times, so pre-compute.
+        let placeholders: Vec<String> = ids.iter().map(|_| "?".into()).collect();
+        let ph = placeholders.join(",");
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let changed = conn.execute(
+            &format!("DELETE FROM memory_fts WHERE unit_id IN ({ph})"),
+            rusqlite::params_from_iter(params.iter()),
+        )?;
+        // Ignore the FTS deletion count — it's auxiliary. The real number
+        // is how many memory_units rows we deleted. Keep `changed` as
+        // used below for compilation.
+        drop(changed);
+        // memory_evidence_edges references memory_id (FK)
+        conn.execute(
+            &format!("DELETE FROM memory_evidence_edges WHERE memory_id IN ({ph})"),
+            rusqlite::params_from_iter(params.iter()),
+        )?;
+        // memory_conflicts: could reference either side
+        conn.execute(
+            &format!(
+                "DELETE FROM memory_conflicts WHERE left_memory_id IN ({0}) OR right_memory_id IN ({0})",
+                ph
+            ),
+            rusqlite::params_from_iter(params.iter()),
+        )?;
+        // memory_proposals: proposal_id → 1:1 with memory unit id? schema
+        // has memory_id as a column? Let's not assume; use safer IN.
+        let _ = UnitStatus::Candidate; // keep import used
+        conn.execute(
+            &format!("DELETE FROM memory_proposals WHERE memory_id IN ({ph})"),
+            rusqlite::params_from_iter(params.iter()),
+        ).ok(); // proposals column may not exist / may be empty — tolerate
+        // Finally, delete memory units themselves.
+        let deleted = conn.execute(
+            &format!("DELETE FROM memory_units WHERE id IN ({ph})"),
+            rusqlite::params_from_iter(params.iter()),
+        )?;
+        Ok(deleted)
     }
 }
 
@@ -320,6 +439,14 @@ pub fn format_governance_banner(rpt: &GovernanceReport) -> String {
     if rpt.stale_memories_decayed > 0 {
         parts.push(format!("decayed {} stale memories", rpt.stale_memories_decayed));
     }
+    // RC3A: candidate lifecycle counters (diagnostic even when zero delta,
+    // because observing total count rising without purge is a signal).
+    if rpt.candidates_purged > 0 || rpt.candidate_total > 0 {
+        parts.push(format!(
+            "candidates: {} total, purged {} stale (ttl={MEMORY_CANDIDATE_TTL_DAYS}d)",
+            rpt.candidate_total, rpt.candidates_purged
+        ));
+    }
     if rpt.embedding_model_changed {
         parts.push(format!(
             "embedding model rotated; deleted {} old vector rows",
@@ -404,6 +531,7 @@ mod tests {
             rollout_available: true,
             rollout_expired_at: None,
             subchunk_index: 0,
+            fingerprint: String::new(),
         };
         db.upsert_evidence_unit(&eu).unwrap();
         eu

@@ -206,10 +206,82 @@ impl SamplingClient {
         }
 
         // Map context items.
-        for item in &request.context_items {
-            let mapped = self.map_context_item(item);
-            if let Some(m) = mapped {
-                input.push(m);
+        //
+        // DeepSeek/Qwen/Doubao thinking-mode (models ≥ seed-1.8 / 250615):
+        // the Responses API also requires prior `reasoning_content` to be
+        // echoed back on its paired assistant message, otherwise the API
+        // rejects with 400 "reasoning_content must be passed back".
+        //
+        // Strategy mirrors build_chat_body: accumulate reasoning into a
+        // pending buffer, attach it to the NEXT assistant message (not a
+        // standalone ReasoningSummary-as-developer message), and flush any
+        // remaining buffer before a non-assistant/non-reasoning item or at
+        // the very end (trailing guard).
+        let mut resp_iter = request.context_items.iter().peekable();
+        let mut resp_pending_reasoning: Option<String> = None;
+        while let Some(item) = resp_iter.next() {
+            use grodex_core::context::ContextItem;
+            match item {
+                ContextItem::ReasoningSummary { content } => {
+                    if !content.is_empty() {
+                        resp_pending_reasoning = Some(match resp_pending_reasoning.take() {
+                            Some(existing) => format!("{existing}\n{content}"),
+                            None => content.clone(),
+                        });
+                    }
+                }
+                ContextItem::Assistant { content } => {
+                    let mut msg = serde_json::json!({
+                        "role": "assistant",
+                        "content": content,
+                    });
+                    if let Some(r) = resp_pending_reasoning.take() {
+                        if !r.is_empty() {
+                            msg["reasoning_content"] = serde_json::json!(r);
+                        }
+                    }
+                    input.push(msg);
+                    // Emit following consecutive ToolCalls as flat
+                    // `function_call` items. Responses uses a flat list so
+                    // no nested tool_calls array is required; each call's
+                    // function_call sits immediately after its assistant.
+                    while let Some(ContextItem::ToolCall { call_id, name, arguments }) = resp_iter.peek() {
+                        input.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": call_id.to_string(),
+                            "name": name,
+                            "arguments": arguments.to_string(),
+                        }));
+                        resp_iter.next();
+                    }
+                }
+                other => {
+                    // Flush pending reasoning before a non-assistant item so
+                    // it's never silently dropped even if no following
+                    // assistant appears (mid-tool-call interrupt case).
+                    if let Some(r) = resp_pending_reasoning.take() {
+                        if !r.is_empty() {
+                            input.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": r,
+                            }));
+                        }
+                    }
+                    if let Some(m) = self.map_context_item(other) {
+                        input.push(m);
+                    }
+                }
+            }
+        }
+        // Trailing flush: avoid dropping a terminal ReasoningSummary.
+        if let Some(r) = resp_pending_reasoning.take() {
+            if !r.is_empty() {
+                input.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": r,
+                }));
             }
         }
 
@@ -360,7 +432,14 @@ impl SamplingClient {
             }
             ContextItem::ReasoningSummary { content } => {
                 // Set reasoning_content FIELD for thinking-mode providers.
-                Some(serde_json::json!({"role": "assistant", "content": "", "reasoning_content": content}))
+                // Never emit an empty-string reasoning_content: some
+                // providers (including older Doubao revisions) reject the
+                // field outright if present-but-empty.
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::json!({"role": "assistant", "content": "", "reasoning_content": content}))
+                }
             }
             ContextItem::ImagePlaceholder { mime_type, artifact_ref } => {
                 Some(serde_json::json!({"role": "user", "content": format!("[Image: {mime_type}, ref: {artifact_ref}]")}))
@@ -397,7 +476,9 @@ impl SamplingClient {
         while let Some(item) = iter.next() {
             match item {
                 ContextItem::ReasoningSummary { content } => {
-                    pending_reasoning = Some(content.clone());
+                    if !content.is_empty() {
+                        pending_reasoning = Some(content.clone());
+                    }
                 }
                 ContextItem::Assistant { content } => {
                     // Look ahead: merge consecutive ToolCall items into this
@@ -416,7 +497,10 @@ impl SamplingClient {
                         msg["tool_calls"] = serde_json::Value::Array(tool_calls);
                     }
                     if let Some(r) = pending_reasoning.take() {
-                        msg["reasoning_content"] = serde_json::json!(r);
+                        // Some thinking-mode APIs reject empty-string reasoning.
+                        if !r.is_empty() {
+                            msg["reasoning_content"] = serde_json::json!(r);
+                        }
                     }
                     messages.push(msg);
                 }
@@ -443,7 +527,9 @@ impl SamplingClient {
                         "tool_calls": tool_calls,
                     });
                     if let Some(r) = pending_reasoning.take() {
-                        msg["reasoning_content"] = serde_json::json!(r);
+                        if !r.is_empty() {
+                            msg["reasoning_content"] = serde_json::json!(r);
+                        }
                     }
                     messages.push(msg);
                 }
@@ -462,16 +548,35 @@ impl SamplingClient {
                     // the message text does NOT satisfy the requirement and
                     // triggers a 400 "reasoning_content must be passed back".
                     if let Some(r) = pending_reasoning.take() {
-                        messages.push(serde_json::json!({
-                            "role": "assistant",
-                            "content": "",
-                            "reasoning_content": r,
-                        }));
+                        if !r.is_empty() {
+                            messages.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": r,
+                            }));
+                        }
                     }
                     if let Some(m) = self.map_chat_item(other) {
                         messages.push(m);
                     }
                 }
+            }
+        }
+        // --- END of main iteration ---
+        //
+        // Flush any still-pending reasoning if the last context item was a
+        // ReasoningSummary with no following Assistant/ToolCall/other to
+        // consume it. The main loop's "other" branch only flushes when a
+        // following item exists, so a trailing ReasoningSummary would be
+        // dropped without this guard — which causes thinking-mode APIs
+        // (Doubao/DeepSeek/Qwen) to return a 400 on the NEXT API call.
+        if let Some(r) = pending_reasoning.take() {
+            if !r.is_empty() {
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": r,
+                }));
             }
         }
         // Trailing volatile instruction blocks (e.g. per-turn memory RAG)
@@ -559,10 +664,16 @@ impl SamplingClient {
                     }));
                 }
                 ContextItem::ReasoningSummary { content } => {
-                    messages.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": format!("[Previous reasoning]:\n{content}"),
-                    }));
+                    if content.is_empty() {
+                        // Don't emit a spurious empty "assistant" message
+                        // with no reasoning — it confuses the role alternation
+                        // check in some providers.
+                    } else {
+                        messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": format!("[Previous reasoning]:\n{content}"),
+                        }));
+                    }
                 }
                 ContextItem::ImagePlaceholder { mime_type, artifact_ref } => {
                     messages.push(serde_json::json!({

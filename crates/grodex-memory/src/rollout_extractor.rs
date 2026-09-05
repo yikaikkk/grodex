@@ -24,7 +24,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::database::{DbError, MemoryDatabase};
@@ -51,8 +51,19 @@ pub struct ExtractionReport {
 impl MemoryDatabase {
     /// 扫描 ~/.grodex/sessions/ 下所有 rollout.jsonl, 提取 EvidenceUnits。
     ///
-    /// 幂等: 同一条 (rollout_id + content_hash) 不会重复写入。
-    /// 建议在启动时的后台任务中调用,不要阻塞主线程。
+    /// (P0-12) Incremental cursor: per rollout, we remember how many
+    /// journal lines were *successfully* processed as the
+    /// `rollout_last_processed_seq` value (stored in memory_tasks as
+    /// the highest `rollout_until_seq` row with status=succeeded).
+    /// This means subsequent scans on a still-growing session only
+    /// re-read from line (cursor + 1) onwards, so new turns appended
+    /// after the first extraction pass are no longer silently skipped.
+    ///
+    /// For sessions first scanned under the old coarse dedup
+    /// (DISTINCT rollout_id jump), we treat max_processed_seq=None as
+    /// "re-scan from the top" — because the fingerprint UNIQUE
+    /// constraint in `upsert_evidence_unit` already collapses
+    /// identical rows, no duplicate evidence is produced.
     pub fn extract_evidence_from_rollouts(
         &self,
         sessions_root: &Path,
@@ -75,19 +86,19 @@ impl MemoryDatabase {
         };
         report.sessions_scanned = session_dirs.len();
 
-        // 查询已提取过的 rollout_id, 避免重复扫描
-        let extracted: HashSet<String> = {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT rollout_id FROM evidence_units"
-            )?;
-            let ids: HashSet<String> = stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            drop(stmt);
-            drop(conn);
-            ids
+        // P0-12: Read the current cursor for every session we might
+        // touch. Prefetch into a HashMap so the inner loop avoids a
+        // round-trip per session dir.
+        let cursors: std::collections::HashMap<String, i64> = {
+            let mut hm = std::collections::HashMap::new();
+            for dir in &session_dirs {
+                if let Some(name) = dir.file_name().map(|n| n.to_string_lossy().to_string()) {
+                    if let Ok(Some(seq)) = self.rollout_last_processed_seq(&name) {
+                        hm.insert(name, seq);
+                    }
+                }
+            }
+            hm
         };
 
         for sdir in session_dirs {
@@ -99,19 +110,59 @@ impl MemoryDatabase {
                 continue;
             }
             report.sessions_new += 1;
-            if extracted.contains(&sdir_name) {
-                report.sessions_skipped += 1;
-                continue;
-            }
 
             let journal = sdir.join("rollout.jsonl");
             if !journal.exists() {
                 report.sessions_skipped += 1;
                 continue;
             }
-            match extract_single_session(self, &sdir_name, &journal, MAX_EVIDENCE_PER_SESSION) {
-                Ok(n) => {
-                    report.evidence_created += n;
+            // P0-12: skip the first N lines we already processed.
+            let skip = cursors.get(&sdir_name).copied().unwrap_or(0).max(0) as usize;
+            match extract_single_session(
+                self,
+                &sdir_name,
+                &journal,
+                MAX_EVIDENCE_PER_SESSION,
+                skip,
+            ) {
+                Ok((evidence_count, lines_consumed)) => {
+                    report.evidence_created += evidence_count;
+                    // Durably record the new inclusive upper line for
+                    // this rollout, idempotently (the UNIQUE key keeps
+                    // successive identical scans from stacking).
+                    let seq_end = (skip + lines_consumed) as i64;
+                    if seq_end > 0 {
+                        use crate::types::{MemoryTask, MemoryTaskStatus};
+                        let tid = format!(
+                            "memtask:rollout:{}:{}",
+                            sdir_name, seq_end
+                        );
+                        let mut task = MemoryTask::rollout_task(
+                            tid,
+                            sdir_name.clone(),
+                            seq_end,
+                        );
+                        task.status = MemoryTaskStatus::Succeeded;
+                        if let Err(e) = self.enqueue_memory_task(&task) {
+                            tracing::debug!(
+                                rollout_id = %sdir_name,
+                                seq_end,
+                                error = %e,
+                                "rollout cursor enqueue failed (extraction still committed)"
+                            );
+                        } else {
+                            let _ = self.update_memory_task_status(
+                                &format!(
+                                    "memtask:rollout:{}:{}",
+                                    sdir_name, seq_end
+                                ),
+                                MemoryTaskStatus::Succeeded,
+                                Some(&format!(
+                                    "evidence={evidence_count},lines={lines_consumed},skip={skip}"
+                                )),
+                            );
+                        }
+                    }
                 }
                 Err(_) => {
                     report.failed_sessions += 1;
@@ -119,7 +170,7 @@ impl MemoryDatabase {
             }
         }
 
-        report.evidence_dedup = 0; // TODO: count deduplications inside loop if need
+        report.evidence_dedup = 0; // fingerprint dedup happens inside upsert
         Ok(report)
     }
 
@@ -127,8 +178,9 @@ impl MemoryDatabase {
     ///
     /// 与 [Self::extract_evidence_from_rollouts] 的区别：
     /// - 只处理指定 session_id 的 rollout.jsonl，不枚举 sessions 根目录
-    /// - 不按 `evidence_units.rollout_id` 跳过会话（同一个会话的增量事件允许重复扫）；
-    ///   去重由 `(rollout_id, content_hash)` 的 DB UNIQUE 约束保证（INSERT OR IGNORE）。
+    /// - 不按 rollout 跳过会话（同一个会话的增量事件允许重复扫）；
+    ///   去重由 `fingerprint` UNIQUE 约束 + `upsert_evidence_unit` 内置
+    ///   fingerprint 预查找保证。
     ///
     /// 幂等、fail-safe：`rollout.jsonl` 不存在 / 不可读时返回 `0`，不报错。
     pub fn extract_evidence_from_session(
@@ -139,7 +191,8 @@ impl MemoryDatabase {
         if !rollout_jsonl.exists() {
             return Ok(0);
         }
-        extract_single_session(self, session_id, rollout_jsonl, MAX_EVIDENCE_PER_SESSION)
+        extract_single_session(self, session_id, rollout_jsonl, MAX_EVIDENCE_PER_SESSION, 0)
+            .map(|(ev, _)| ev)
     }
 }
 
@@ -148,16 +201,18 @@ fn extract_single_session(
     rollout_id: &str,
     journal: &Path,
     max_units: usize,
-) -> Result<usize, DbError> {
+    skip_first_n_lines: usize,
+) -> Result<(usize, usize), DbError> {
     let file = match std::fs::File::open(journal) {
         Ok(f) => f,
-        Err(_) => return Ok(0),
+        Err(_) => return Ok((0, 0)),
     };
     use std::io::{BufRead, BufReader};
     let reader = BufReader::new(file);
 
     let mut count = 0usize;
     let mut lines_read = 0usize;
+    let mut lines_consumed = 0usize;
 
     // ── 跨事件 state ──────────────────────────────────────────────
     // call_id -> tool 名 (从 ToolCallPrepared / ToolCallApproved / ToolExecutionStarted 回推)
@@ -172,10 +227,18 @@ fn extract_single_session(
             break;
         }
         lines_read += 1;
+        // P0-12: skip the lines the last successful scan already
+        // consumed. Still count them in lines_read so the line-number
+        // caps above behave uniformly regardless of cursor position.
+        if lines_read <= skip_first_n_lines {
+            lines_consumed += 1;
+            continue;
+        }
         let line = match line {
             Ok(l) => l,
             Err(_) => continue,
         };
+        lines_consumed += 1;
         let evt: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
@@ -325,7 +388,7 @@ fn extract_single_session(
             _ => {}
         }
     }
-    Ok(count)
+    Ok((count, lines_consumed))
 }
 
 fn build_evidence(
@@ -352,6 +415,13 @@ fn build_evidence(
     let id = format!("ev_{}", &id_hash[..16]);
     let path = journal_path.to_string_lossy().to_string();
     let now = Utc::now();
+    let fingerprint = EvidenceUnit::compute_fingerprint(
+        rollout_id,
+        &path,
+        section,
+        0,
+        &content_hash,
+    );
     Some(EvidenceUnit {
         id,
         rollout_id: rollout_id.to_string(),
@@ -361,6 +431,7 @@ fn build_evidence(
         status: EvidenceStatus::Active,
         content,
         content_hash,
+        fingerprint,
         occurred_at,
         created_at: now,
         superseded_by: None,

@@ -86,6 +86,28 @@ struct Cli {
     command: Command,
 }
 
+/// CLI-level shim for `MemoryRuleMode`. Maps directly to the library
+/// enum via `into()` so the runtime doesn't depend on clap traits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum RuleModeArg {
+    /// Rule tier never writes memory (LLM tier still active if enabled).
+    Disabled,
+    /// Rule claims become Candidate memory at best (P0 default).
+    AllowCandidate,
+    /// Rule tier writes straight to Active (pre-P0 behaviour; diagnostic).
+    AllowActive,
+}
+
+impl From<RuleModeArg> for grodex_memory::MemoryRuleMode {
+    fn from(v: RuleModeArg) -> Self {
+        match v {
+            RuleModeArg::Disabled => grodex_memory::MemoryRuleMode::Disabled,
+            RuleModeArg::AllowCandidate => grodex_memory::MemoryRuleMode::AllowCandidate,
+            RuleModeArg::AllowActive => grodex_memory::MemoryRuleMode::AllowActive,
+        }
+    }
+}
+
 #[derive(clap::Subcommand)]
 enum Command {
     /// Start a new interactive session.
@@ -100,6 +122,25 @@ enum Command {
         /// prompt (fail-closed).
         #[arg(long)]
         trusted: bool,
+        /// (P0-1) Enable the LLM-backed memory extractor tier
+        /// (SamplingBackedExtractor). On by default. Use
+        /// `--no-memory-llm` (equivalent to `--memory-llm=false`) to
+        /// force rule-tier-only extraction for offline / no-key runs.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        memory_llm: bool,
+        /// (P0-2) Controls how aggressive the rule-tier fallback is
+        /// when the LLM extractor is disabled, times out, or returns
+        /// malformed JSON.
+        ///
+        ///  - disabled:       rule tier never writes memory
+        ///  - allow_candidate: rule tier stores claims only as Candidate
+        ///                    memory (user-explicit identity claims still
+        ///                    promoted to Active via the legacy back-compat
+        ///                    path). **Default**.
+        ///  - allow_active:    rule tier writes straight to Active
+        ///                    (pre-P0 behaviour; use only for debugging).
+        #[arg(long, value_enum, default_value_t = RuleModeArg::AllowCandidate)]
+        memory_rule_mode: RuleModeArg,
     },
     /// Start as an ACP server over stdio.
     Serve,
@@ -113,6 +154,12 @@ enum Command {
         /// `[workspace] trusted = true` in config).
         #[arg(long)]
         trusted: bool,
+        /// Same semantic as in `Run`; documented above.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        memory_llm: bool,
+        /// Same semantic as in `Run`; documented above.
+        #[arg(long, value_enum, default_value_t = RuleModeArg::AllowCandidate)]
+        memory_rule_mode: RuleModeArg,
     },
     /// Replay a session from rollout journal.
     Replay { session_id: String },
@@ -304,14 +351,32 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run { cwd, trusted } => run_interactive_with(cwd, trusted, None).await,
+        Command::Run { cwd, trusted, memory_llm, memory_rule_mode } => {
+            run_interactive_with(
+                cwd,
+                trusted,
+                None,
+                memory_llm,
+                memory_rule_mode.into(),
+            )
+            .await
+        }
         Command::Serve => {
             if let Err(e) = serve_acp().await {
                 eprintln!("[serve_acp] fatal: {e}");
                 std::process::exit(1);
             }
         }
-        Command::Resume { session_id, cwd, trusted } => resume_session(&session_id, cwd, trusted).await,
+        Command::Resume { session_id, cwd, trusted, memory_llm, memory_rule_mode } => {
+            resume_session(
+                &session_id,
+                cwd,
+                trusted,
+                memory_llm,
+                memory_rule_mode.into(),
+            )
+            .await
+        }
         Command::Replay { session_id } => replay_session(&session_id).await,
         Command::Inspect { session_id } => inspect_session(&session_id).await,
         Command::Dump { session_id } => dump_session(&session_id).await,
@@ -1610,6 +1675,8 @@ async fn run_interactive_with(
     cwd_override: Option<PathBuf>,
     explicit_trusted: bool,
     recovered: Option<Vec<grodex_core::context::ContextItem>>,
+    memory_llm_enabled: bool,
+    memory_rule_mode: grodex_memory::MemoryRuleMode,
 ) {
     println!("═══ Grodex AI Coding Agent ═══");
 
@@ -1726,6 +1793,8 @@ async fn run_interactive_with(
         .with_recovered_context(recovered.unwrap_or_default())
         .with_model_route(model_route)
         .with_telemetry(telemetry_sink())
+        .with_memory_llm_enabled(memory_llm_enabled)
+        .with_memory_rule_mode(memory_rule_mode)
         .build()
         .await
         .expect("failed to build session runtime");
@@ -1903,7 +1972,13 @@ async fn run_interactive_with(
     let _ = supervisor_task.await;
 }
 
-async fn resume_session(session_id: &str, cwd: Option<PathBuf>, trusted: bool) {
+async fn resume_session(
+    session_id: &str,
+    cwd: Option<PathBuf>,
+    trusted: bool,
+    memory_llm_enabled: bool,
+    memory_rule_mode: grodex_memory::MemoryRuleMode,
+) {
     use grodex_core::id::SessionId;
     println!("═══ Grodex Session Resume ═══");
     let base_dir = FileRolloutStore::default_dir();
@@ -1926,7 +2001,7 @@ async fn resume_session(session_id: &str, cwd: Option<PathBuf>, trusted: bool) {
     // Inject the rebuilt transcript into a fresh session instead of
     // discarding it. (断链 #8: previously this only printed the count and
     // then started an empty session.)
-    run_interactive_with(cwd, trusted, Some(ctx)).await;
+    run_interactive_with(cwd, trusted, Some(ctx), memory_llm_enabled, memory_rule_mode).await;
 }
 
 async fn replay_session(session_id: &str) {

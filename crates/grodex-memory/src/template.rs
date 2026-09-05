@@ -160,16 +160,26 @@ impl EvidenceTemplate {
         let status = EvidenceStatus::from_str(&self.metadata.status)
             .unwrap_or(EvidenceStatus::Active);
         let now = chrono::Utc::now();
+        let path = String::new();
+        let section = format!("Evidence Unit: {}", self.title);
+        let fingerprint = EvidenceUnit::compute_fingerprint(
+            &self.metadata.rollout_id,
+            &path,
+            &section,
+            0,
+            &content_hash,
+        );
 
         EvidenceUnit {
             id: self.metadata.id.clone(),
             rollout_id: self.metadata.rollout_id.clone(),
-            path: String::new(),
-            section: format!("Evidence Unit: {}", self.title),
+            path,
+            section,
             scope,
             status,
             content,
             content_hash,
+            fingerprint,
             occurred_at,
             created_at: now,
             superseded_by: None,

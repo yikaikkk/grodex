@@ -35,34 +35,94 @@ use crate::types::*;
 ///
 /// Latin/ASCII content keeps the original verbatim (FTS works on it natively).
 fn enrich_content_for_fts(content: &str) -> String {
-    // Collect CJK tokens.
+    // Step 0: split the content into segments at every CJK↔non-CJK transition
+    // by inserting a SPACE between them. The unicode61 tokenizer treats
+    // adjacent Lo(CJK) and Ll/Lu(ascii) as a SINGLE token, e.g. "叫ikkk".
+    // This means MATCH 'ikkk' never matches "我叫 ikkk". Breaking the
+    // boundary with whitespace forces separate tokens for both sides
+    // (also means bigrams like "我叫" still appear since they're pure CJK).
+    //
+    // Also collect ASCII alphanumeric runs (length ≥ 2) so even if a
+    // future tokenizer change collapses them we have an explicit copy in
+    // the enrichment suffix.
+    let mut separated: String = String::with_capacity(content.len() + 8);
     let mut cjk_runs: Vec<String> = Vec::new();
-    let mut cur_run = String::new();
+    let mut ascii_tokens: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cur_cjk = String::new();
+    let mut cur_ascii = String::new();
+    let mut prev_was_cjk: Option<bool> = None;
     for c in content.chars() {
-        if is_cjk_char(c) {
-            cur_run.push(c);
-        } else {
-            if !cur_run.is_empty() {
-                cjk_runs.push(std::mem::take(&mut cur_run));
+        let is_cjk = is_cjk_char(c);
+        let is_alnum = c.is_ascii_alphanumeric();
+        // Emit boundary break when crossing CJK ↔ non-CJK (where non-CJK
+        // side is at least one printable char, not whitespace).
+        if let Some(prev) = prev_was_cjk {
+            let need_sep = match (prev, is_cjk) {
+                (true, false) | (false, true) => {
+                    // Don't split around pure whitespace separators (they
+                    // already tokenize).
+                    !(c.is_whitespace())
+                }
+                _ => false,
+            };
+            if need_sep {
+                // Flush pending runs.
+                if !cur_cjk.is_empty() {
+                    cjk_runs.push(std::mem::take(&mut cur_cjk));
+                }
+                if cur_ascii.len() >= 2 {
+                    ascii_tokens.insert(std::mem::take(&mut cur_ascii).to_lowercase());
+                } else {
+                    cur_ascii.clear();
+                }
+                separated.push(' ');
             }
         }
+        separated.push(c);
+        if is_cjk {
+            cur_cjk.push(c);
+            if cur_ascii.len() >= 2 {
+                ascii_tokens.insert(std::mem::take(&mut cur_ascii).to_lowercase());
+            } else {
+                cur_ascii.clear();
+            }
+        } else if is_alnum {
+            cur_ascii.push(c);
+            if !cur_cjk.is_empty() {
+                cjk_runs.push(std::mem::take(&mut cur_cjk));
+            }
+        } else {
+            // Punctuation/whitespace ends ascii runs.
+            if cur_ascii.len() >= 2 {
+                ascii_tokens.insert(std::mem::take(&mut cur_ascii).to_lowercase());
+            } else {
+                cur_ascii.clear();
+            }
+            // CJK run is NOT ended by punctuation alone (keeps compound
+            // spans adjacent to comma/period safe).
+        }
+        prev_was_cjk = Some(is_cjk);
     }
-    if !cur_run.is_empty() {
-        cjk_runs.push(cur_run);
+    // Flush final runs.
+    if !cur_cjk.is_empty() {
+        cjk_runs.push(cur_cjk);
+    }
+    if cur_ascii.len() >= 2 {
+        ascii_tokens.insert(cur_ascii.to_lowercase());
     }
 
-    if cjk_runs.is_empty() {
-        // No CJK — no enrichment needed.
+    if cjk_runs.is_empty() && ascii_tokens.is_empty() {
+        // No CJK and no ascii tokens → no enrichment needed.
         return content.to_string();
     }
 
-    let mut enriched = String::with_capacity(content.len() + cjk_runs.len() * 8);
-    enriched.push_str(content);
+    let mut enriched = String::with_capacity(separated.len() + cjk_runs.len() * 8 + ascii_tokens.len() * 10);
+    enriched.push_str(&separated);
     enriched.push_str("\n\n_CJKTOKENS_ ");
     let mut first = true;
+    // Emit CJK bigrams/unigrams (existing behavior)
     for run in &cjk_runs {
         let chars: Vec<char> = run.chars().collect();
-        // Bigrams first, then unigrams (same order as build_fts_query).
         if chars.len() >= 2 {
             for w in chars.windows(2) {
                 if !first {
@@ -81,6 +141,15 @@ fn enrich_content_for_fts(content: &str) -> String {
             enriched.push(*c);
             first = false;
         }
+    }
+    // Emit ASCII alphanumeric tokens as lowercase space-separated items
+    // so MATCH 'ikkk' reliably hits regardless of tokenizer run boundaries.
+    for tok in &ascii_tokens {
+        if !first {
+            enriched.push(' ');
+        }
+        enriched.push_str(tok);
+        first = false;
     }
     enriched
 }
@@ -273,24 +342,69 @@ impl MemoryDatabase {
     // ─────────────── Evidence Units ───────────────
 
     /// Upsert an evidence unit. Bumps index_generation.
+    /// Upsert an evidence unit.
+    ///
+    /// P0-10 (double-write prevention): the deduplication key is
+    /// `fingerprint`, a deterministic hash of (rollout_id, path,
+    /// section, subchunk_index, content_hash). New DBs have a UNIQUE
+    /// constraint on that column; legacy DBs are protected by a
+    /// pre-lookup that skips the INSERT when a fingerprint match
+    /// exists with a different `id`. `ON CONFLICT(id) DO UPDATE` is
+    /// preserved as the primary idempotency key for in-place refresh
+    /// of already-committed rows (e.g. setting rollout_expired_at).
     pub fn upsert_evidence_unit(&self, unit: &EvidenceUnit) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
+
+        // Compute fingerprint if caller left it empty — keeps old
+        // constructors compiling without manual patching.
+        let fingerprint = if unit.fingerprint.is_empty() {
+            EvidenceUnit::compute_fingerprint(
+                &unit.rollout_id,
+                &unit.path,
+                &unit.section,
+                unit.subchunk_index,
+                &unit.content_hash,
+            )
+        } else {
+            unit.fingerprint.clone()
+        };
+
+        // (Legacy DB safeguard) — only necessary on pre-v5 DBs that
+        // could not enforce UNIQUE(fingerprint) via DDL. On newer DBs
+        // this returns `unit.id` or an existing id we reuse below.
+        let existing: Option<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM evidence_units WHERE fingerprint = ?1 LIMIT 1",
+            )?;
+            stmt.query_row(params![fingerprint], |r| r.get::<_, String>(0))
+                .optional()?
+        };
+        // If another row already owns this fingerprint, accept the
+        // older id as canonical and redirect to an update of *that*
+        // row instead of inserting a duplicate.
+        let effective_id = match &existing {
+            Some(existing_id) if existing_id != &unit.id => existing_id.clone(),
+            _ => unit.id.clone(),
+        };
+
         tx.execute(
             r#"INSERT INTO evidence_units (id, rollout_id, path, section, scope, status,
-               content, content_hash, occurred_at, created_at, superseded_by, superseded_at,
+               content, content_hash, fingerprint, occurred_at, created_at,
+               superseded_by, superseded_at,
                rollout_available, rollout_expired_at, subchunk_index)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                ON CONFLICT(id) DO UPDATE SET
                rollout_id=excluded.rollout_id, path=excluded.path, section=excluded.section,
                scope=excluded.scope, status=excluded.status, content=excluded.content,
-               content_hash=excluded.content_hash, occurred_at=excluded.occurred_at,
+               content_hash=excluded.content_hash, fingerprint=excluded.fingerprint,
+               occurred_at=excluded.occurred_at,
                superseded_by=excluded.superseded_by, superseded_at=excluded.superseded_at,
                rollout_available=excluded.rollout_available,
                rollout_expired_at=excluded.rollout_expired_at,
                subchunk_index=excluded.subchunk_index"#,
             params![
-                unit.id,
+                effective_id,
                 unit.rollout_id,
                 unit.path,
                 unit.section,
@@ -298,6 +412,7 @@ impl MemoryDatabase {
                 unit.status.as_str(),
                 unit.content,
                 unit.content_hash,
+                fingerprint,
                 unit.occurred_at.to_rfc3339(),
                 unit.created_at.to_rfc3339(),
                 unit.superseded_by,
@@ -310,10 +425,10 @@ impl MemoryDatabase {
         // Sync standalone FTS: delete old row, insert new.
         // CJK enrichment: evidence content is often CJK-heavy user dialogues.
         let fts_content = enrich_content_for_fts(&unit.content);
-        tx.execute("DELETE FROM evidence_fts WHERE unit_id = ?1", params![unit.id])?;
+        tx.execute("DELETE FROM evidence_fts WHERE unit_id = ?1", params![effective_id])?;
         tx.execute(
             "INSERT INTO evidence_fts (unit_id, content, path) VALUES (?1, ?2, ?3)",
-            params![unit.id, fts_content, unit.path],
+            params![effective_id, fts_content, unit.path],
         )?;
         schema::bump_index_generation(&tx)?;
         tx.commit()?;
@@ -360,12 +475,12 @@ impl MemoryDatabase {
         let unit = conn
             .query_row(
                 "SELECT id, rollout_id, path, section, scope, status, content, content_hash,
-                 occurred_at, created_at, superseded_by, superseded_at,
+                 fingerprint, occurred_at, created_at, superseded_by, superseded_at,
                  rollout_available, rollout_expired_at, subchunk_index
                  FROM evidence_units WHERE id = ?1",
                 params![id],
                 |row| {
-                    let rollout_avail: i64 = row.get(12)?;
+                    let rollout_avail: i64 = row.get(13)?;
                     Ok(EvidenceUnit {
                         id: row.get(0)?,
                         rollout_id: row.get(1)?,
@@ -377,13 +492,14 @@ impl MemoryDatabase {
                             .unwrap_or(EvidenceStatus::Active),
                         content: row.get(6)?,
                         content_hash: row.get(7)?,
-                        occurred_at: parse_ts(&row.get::<_, String>(8)?),
-                        created_at: parse_ts(&row.get::<_, String>(9)?),
-                        superseded_by: row.get(10)?,
-                        superseded_at: row.get::<_, Option<String>>(11)?.map(|s| parse_ts(&s)),
+                        fingerprint: row.get::<_, String>(8)?,
+                        occurred_at: parse_ts(&row.get::<_, String>(9)?),
+                        created_at: parse_ts(&row.get::<_, String>(10)?),
+                        superseded_by: row.get(11)?,
+                        superseded_at: row.get::<_, Option<String>>(12)?.map(|s| parse_ts(&s)),
                         rollout_available: rollout_avail != 0,
-                        rollout_expired_at: row.get::<_, Option<String>>(13)?.map(|s| parse_ts(&s)),
-                        subchunk_index: row.get(14)?,
+                        rollout_expired_at: row.get::<_, Option<String>>(14)?.map(|s| parse_ts(&s)),
+                        subchunk_index: row.get(15)?,
                     })
                 },
             )
@@ -1455,13 +1571,13 @@ impl MemoryDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, rollout_id, path, section, scope, status, content, content_hash,
-                    occurred_at, created_at, superseded_by, superseded_at,
+                    fingerprint, occurred_at, created_at, superseded_by, superseded_at,
                     rollout_available, rollout_expired_at, subchunk_index
              FROM evidence_units WHERE status = 'active'
              ORDER BY substr(content_hash, 1, 16), occurred_at"
         )?;
         let rows = stmt.query_map([], |row| {
-            let rollout_avail: i64 = row.get(12)?;
+            let rollout_avail: i64 = row.get(13)?;
             Ok(EvidenceUnit {
                 id: row.get(0)?,
                 rollout_id: row.get(1)?,
@@ -1473,13 +1589,14 @@ impl MemoryDatabase {
                     .unwrap_or(EvidenceStatus::Active),
                 content: row.get(6)?,
                 content_hash: row.get(7)?,
-                occurred_at: parse_ts(&row.get::<_, String>(8)?),
-                created_at: parse_ts(&row.get::<_, String>(9)?),
-                superseded_by: row.get(10)?,
-                superseded_at: row.get::<_, Option<String>>(11)?.as_deref().map(parse_ts),
+                fingerprint: row.get::<_, String>(8)?,
+                occurred_at: parse_ts(&row.get::<_, String>(9)?),
+                created_at: parse_ts(&row.get::<_, String>(10)?),
+                superseded_by: row.get(11)?,
+                superseded_at: row.get::<_, Option<String>>(12)?.as_deref().map(parse_ts),
                 rollout_available: rollout_avail != 0,
-                rollout_expired_at: row.get::<_, Option<String>>(13)?.as_deref().map(parse_ts),
-                subchunk_index: row.get(14)?,
+                rollout_expired_at: row.get::<_, Option<String>>(14)?.as_deref().map(parse_ts),
+                subchunk_index: row.get(15)?,
             })
         })?;
         let mut groups: HashMap<String, Vec<EvidenceUnit>> = HashMap::new();
@@ -1499,13 +1616,13 @@ impl MemoryDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, rollout_id, path, section, scope, status, content, content_hash,
-                    occurred_at, created_at, superseded_by, superseded_at,
+                    fingerprint, occurred_at, created_at, superseded_by, superseded_at,
                     rollout_available, rollout_expired_at, subchunk_index
              FROM evidence_units WHERE status = 'active'
              ORDER BY occurred_at"
         )?;
         let rows = stmt.query_map([], |row| {
-            let rollout_avail: i64 = row.get(12)?;
+            let rollout_avail: i64 = row.get(13)?;
             Ok(EvidenceUnit {
                 id: row.get(0)?,
                 rollout_id: row.get(1)?,
@@ -1517,13 +1634,14 @@ impl MemoryDatabase {
                     .unwrap_or(EvidenceStatus::Active),
                 content: row.get(6)?,
                 content_hash: row.get(7)?,
-                occurred_at: parse_ts(&row.get::<_, String>(8)?),
-                created_at: parse_ts(&row.get::<_, String>(9)?),
-                superseded_by: row.get(10)?,
-                superseded_at: row.get::<_, Option<String>>(11)?.as_deref().map(parse_ts),
+                fingerprint: row.get::<_, String>(8)?,
+                occurred_at: parse_ts(&row.get::<_, String>(9)?),
+                created_at: parse_ts(&row.get::<_, String>(10)?),
+                superseded_by: row.get(11)?,
+                superseded_at: row.get::<_, Option<String>>(12)?.as_deref().map(parse_ts),
                 rollout_available: rollout_avail != 0,
-                rollout_expired_at: row.get::<_, Option<String>>(13)?.as_deref().map(parse_ts),
-                subchunk_index: row.get(14)?,
+                rollout_expired_at: row.get::<_, Option<String>>(14)?.as_deref().map(parse_ts),
+                subchunk_index: row.get(15)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1750,7 +1868,7 @@ impl MemoryDatabase {
 }
 
 /// Parse an RFC3339 timestamp, falling back to epoch on failure.
-fn parse_ts(s: &str) -> chrono::DateTime<Utc> {
+pub(crate) fn parse_ts(s: &str) -> chrono::DateTime<Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| chrono::DateTime::from_timestamp(0, 0).unwrap_or_else(|| Utc::now()))
@@ -1826,13 +1944,34 @@ impl MemoryDatabase {
         Ok(())
     }
 
-    /// Commit a proposal: create a memory_unit (status=candidate) from the proposal,
+    /// Commit a proposal: create a memory_unit (status=active) from the proposal,
     /// link evidence edges, then mark proposal as committed.
     /// Returns the new memory unit ID.
+    ///
+    /// Back-compat wrapper: equivalent to `commit_proposal_with_status`
+    /// with `status='active'`. Kept so existing callers outside the
+    /// extraction pipeline (e.g. consolidator) continue to compile.
     pub fn commit_proposal(
         &self,
         proposal_id: &str,
         memory_id: &str,
+    ) -> Result<String, DbError> {
+        self.commit_proposal_with_status(proposal_id, memory_id, UnitStatus::Active)
+    }
+
+    /// Commit a proposal with explicit target status.
+    ///
+    /// This is the primary entry point after the P0-3 write gate fix:
+    /// validated proposals are committed with either `status='active'`
+    /// (authority=UserExplicitStatement / AssistantAcknowledged) or
+    /// `status='candidate'` (AssistantSummary / rule-tier non-identity
+    /// claims). ToolObservation proposals never reach this helper
+    /// because the write gate drops them earlier.
+    pub fn commit_proposal_with_status(
+        &self,
+        proposal_id: &str,
+        memory_id: &str,
+        target_status: UnitStatus,
     ) -> Result<String, DbError> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
@@ -1860,25 +1999,21 @@ impl MemoryDatabase {
 
         // Insert memory unit with v4 provenance columns.
         //
-        // NOTE: We write status='active' here rather than 'candidate'.
-        // Review (2026-09-03) flagged a hard block: the FTS retrieval gate
-        // (`fts5_memory_candidates`) filters `WHERE m.status='active'`, and
-        // *no production code* was ever wired to promote candidate→active.
-        // This meant proposal-wrote memory was permanently invisible even
-        // after successful commit. The 'candidate' status remains useful as
-        // a lifecycle state in the schema (for future LLM conflict-judge
-        // pre-approval), but the default commit path for validated +
-        // human-explicit claims must go straight to active so retrieval
-        // can surface them. This mirrors how W3 consolidator also writes
-        // directly to Active status.
+        // P0-3/P0-4: status is now chosen by the caller via the P0 write
+        // gate. `target_status` maps directly into the column so the
+        // retrieval pipeline's `WHERE status='active'` filter correctly
+        // excludes Candidate memories until they are explicitly promoted
+        // by a future governance pass (or for rule-tier non-identity
+        // claims forever).
         tx.execute(
             r#"INSERT INTO memory_units
                (id, path, section, kind, scope, status, content, content_hash,
                 updated_at, created_at, confidence, certainty, source_evidence_ids,
                 source_rollout_id, source_seq_start, source_seq_end, source_turn_id,
                 extractor_model, extractor_version, prompt_version)
-               VALUES (?1, ?2, '', ?3, ?4, 'active', ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, '', '')
+               VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, '', '')
                ON CONFLICT(id) DO UPDATE SET
+               status=excluded.status,
                content=excluded.content, content_hash=excluded.content_hash,
                kind=excluded.kind, scope=excluded.scope, confidence=excluded.confidence,
                certainty=excluded.certainty, source_evidence_ids=excluded.source_evidence_ids,
@@ -1893,6 +2028,7 @@ impl MemoryDatabase {
                 source_rollout_id, // path = rollout_id for traceability
                 kind.as_str(),
                 scope.as_str(),
+                target_status.as_str(),
                 content,
                 content_hash,
                 now.to_rfc3339(),
@@ -2000,6 +2136,135 @@ impl MemoryDatabase {
         Ok(())
     }
 
+    // ── RC3B: Repetition-promotion helpers ──────────────────────────────
+
+    /// (RC3B) Find a `status='candidate'` memory unit whose
+    /// (scope, kind, normalized-fact) matches `norm_key`. The candidate
+    /// row was written because a rule-tier / untrusted claim couldn't be
+    /// promoted to Active; now a later claim is being written with
+    /// Active status — we reuse the same row to avoid a dual
+    /// candidate+active pair for the same underlying fact.
+    ///
+    /// Returns `(memory_id, original_proposal_id)` so the caller can
+    /// UPDATE status and resolve both the original and new proposal.
+    ///
+    /// Matching logic is cheap & bounded: pull up to 200 candidate rows
+    /// with matching scope+kind (same filters) and compare in Rust.
+    /// The number of candidates is bounded by the TTL purge (RC3A: 7d
+    /// default), so the scan is always small.
+    pub fn find_candidate_for_promotion(
+        &self,
+        norm_key: &str,
+        kind: MemoryKind,
+        scope: MemoryScope,
+    ) -> Result<Option<(String, String)>, DbError> {
+        use crate::proposal::normalize_fact_for_promotion;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mu.id, mu.content, COALESCE(p.proposal_id, '')
+             FROM memory_units mu
+             LEFT JOIN memory_proposals p ON p.memory_id = mu.id
+             WHERE mu.status = 'candidate'
+               AND mu.kind = ?1
+               AND mu.scope = ?2
+             ORDER BY mu.created_at DESC
+             LIMIT 200",
+        )?;
+        let rows = stmt.query_map(
+            params![kind.as_str(), scope.as_str()],
+            |row| {
+                let id: String = row.get(0)?;
+                let content: String = row.get(1)?;
+                let proposal_id: String = row.get(2)?;
+                Ok((id, content, proposal_id))
+            },
+        )?;
+        for r in rows {
+            let (id, content, proposal_id) = r?;
+            let k = normalize_fact_for_promotion(&content);
+            if k == norm_key {
+                if proposal_id.is_empty() {
+                    // Fallback: infer old-style proposal id from memory id.
+                    let fallback = format!("prop_{}", &id[4..]);
+                    return Ok(Some((id, fallback)));
+                }
+                return Ok(Some((id, proposal_id)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// (RC3B) Upgrade a candidate memory unit to `status='active'` and
+    /// resolve its pending proposal row. Used when a later Active claim
+    /// matches a previously clamped candidate. Returns the number of
+    /// rows changed.
+    ///
+    /// Also accepts an optional `new_proposal_id` (from the more
+    /// recent Active claim) so both proposals are marked resolved and
+    /// the audit trail links them via `promoted_from_proposal_id` /
+    /// rejection_reason metadata.
+    pub fn promote_candidate_to_active(
+        &self,
+        memory_id: &str,
+        old_proposal_id: &str,
+        new_proposal_id: Option<&str>,
+        promotion_reason: &str,
+    ) -> Result<usize, DbError> {
+        use crate::types::ProposalStatus;
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let now = Utc::now().to_rfc3339();
+
+        let rows = tx.execute(
+            "UPDATE memory_units
+             SET status = 'active', updated_at = ?1
+             WHERE id = ?2 AND status = 'candidate'",
+            params![now, memory_id],
+        )?;
+
+        // Update original proposal: status→committed, rejection_reason
+        // carries promotion metadata.
+        let promoted_meta = if let Some(new) = new_proposal_id {
+            format!(
+                "RC3B promoted via proposal={new}; {promotion_reason}"
+            )
+        } else {
+            format!("RC3B promoted; {promotion_reason}")
+        };
+        tx.execute(
+            "UPDATE memory_proposals
+             SET status = ?1, resolved_at = ?2, rejection_reason = ?3
+             WHERE proposal_id = ?4 AND status IN ('pending', 'applied')",
+            params![
+                ProposalStatus::Committed.as_str(),
+                now,
+                promoted_meta,
+                old_proposal_id
+            ],
+        )
+        .ok();
+
+        // Also resolve the new proposal if present.
+        if let Some(new) = new_proposal_id {
+            tx.execute(
+                "UPDATE memory_proposals
+                 SET status = ?1, resolved_at = ?2, rejection_reason = ?3
+                 WHERE proposal_id = ?4 AND status IN ('pending', 'applied')",
+                params![
+                    ProposalStatus::Committed.as_str(),
+                    now,
+                    format!("RC3B merged into candidate memory_id={memory_id}"),
+                    new
+                ],
+            )
+            .ok();
+        }
+
+        schema::bump_index_generation(&tx)?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
     /// Resolve a conflict and update memory unit statuses accordingly.
     /// If relation=supersedes: left (old) → superseded, right (new) → active.
     /// If relation=conflicts: both → conflicted.
@@ -2082,10 +2347,190 @@ impl MemoryDatabase {
         )?;
         Ok(())
     }
+
+    // ─────────────── memory_tasks durable queue (P0-11/14) ───────────
+
+    /// Atomically enqueue an extraction task. Idempotent via the
+    /// UNIQUE(kind, rollout_id, turn_id, seq_end) constraint: a
+    /// duplicate `(turn, turn_id)` is simply ignored so the caller
+    /// doesn't need to check existence before queueing.
+    pub fn enqueue_memory_task(&self, task: &MemoryTask) -> Result<String, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"INSERT OR IGNORE INTO memory_tasks
+               (task_id, kind, rollout_id, turn_id, seq_end, status,
+                retry_count, max_retries, request_payload, error_message,
+                enqueued_at, started_at, finished_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL)"#,
+            params![
+                task.task_id,
+                task.kind,
+                task.rollout_id,
+                task.turn_id,
+                task.seq_end,
+                task.status.as_str(),
+                task.retry_count,
+                task.max_retries,
+                task.request_payload,
+                task.error_message,
+                now,
+            ],
+        )?;
+        // Return the canonical task_id stored for this unique key.
+        let mut stmt = conn.prepare(
+            "SELECT task_id FROM memory_tasks
+             WHERE kind=?1 AND rollout_id=?2 AND turn_id=?3 AND seq_end=?4 LIMIT 1",
+        )?;
+        let id = stmt.query_row(
+            params![task.kind, task.rollout_id, task.turn_id, task.seq_end],
+            |r| r.get::<_, String>(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Transition a task to a new lifecycle state. The transition
+    /// updates `started_at`/`finished_at` appropriately based on the
+    /// target state, allowing simple runtime diagnostics without a
+    /// heavier column mapping.
+    pub fn update_memory_task_status(
+        &self,
+        task_id: &str,
+        next: MemoryTaskStatus,
+        error: Option<&str>,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let status_str = next.as_str();
+        match next {
+            MemoryTaskStatus::Requested => conn.execute(
+                "UPDATE memory_tasks SET status=?1, error_message=?2, enqueued_at=COALESCE(enqueued_at,?3) WHERE task_id=?4",
+                params![status_str, error.unwrap_or(""), now, task_id],
+            )?,
+            MemoryTaskStatus::Running => conn.execute(
+                "UPDATE memory_tasks SET status=?1, started_at=?2, error_message=COALESCE(NULLIF(?3,''), error_message) WHERE task_id=?4",
+                params![status_str, now, error.unwrap_or(""), task_id],
+            )?,
+            MemoryTaskStatus::Succeeded | MemoryTaskStatus::Failed | MemoryTaskStatus::Deferred => conn.execute(
+                "UPDATE memory_tasks SET status=?1, finished_at=?2, error_message=?3 WHERE task_id=?4",
+                params![status_str, now, error.unwrap_or(""), task_id],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Increment retry_count after a failed attempt. When the task is
+    /// already at max_retries, flip to `deferred` so workers skip it
+    /// until an operator explicitly reschedules.
+    pub fn bump_memory_task_retry(&self, task_id: &str, error: &str) -> Result<MemoryTaskStatus, DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE memory_tasks SET retry_count = retry_count + 1, error_message=?1 WHERE task_id=?2",
+            params![error, task_id],
+        )?;
+        let row: (i64, i64) = conn.query_row(
+            "SELECT retry_count, max_retries FROM memory_tasks WHERE task_id=?1",
+            params![task_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        let next = if row.0 >= row.1 {
+            MemoryTaskStatus::Deferred
+        } else {
+            MemoryTaskStatus::Requested
+        };
+        drop(conn);
+        self.update_memory_task_status(task_id, next.clone(), Some(error))?;
+        Ok(next)
+    }
+
+    /// Recover orphan `running` rows that haven't finished after
+    /// `stale_after_secs` elapsed since `started_at` (or since
+    /// enqueued_at when started_at is NULL). Used on startup and by
+    /// periodic GC workers. Returns the number of rows reset to
+    /// `requested` with an incremented retry counter.
+    pub fn recover_stale_memory_tasks(&self, stale_after_secs: i64) -> Result<usize, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        let stale = (now - chrono::Duration::seconds(stale_after_secs)).to_rfc3339();
+        // Reset both running-with-old-started_at and
+        // requested-with-never-started-but-old-enqueued_at.
+        let affected = conn.execute(
+            r#"UPDATE memory_tasks
+               SET status='requested', started_at=NULL, finished_at=NULL,
+                   retry_count = CASE
+                       WHEN retry_count < max_retries THEN retry_count + 1
+                       ELSE max_retries
+                   END,
+                   error_message = 'recovered from stale task'
+               WHERE status IN ('running','requested')
+                 AND retry_count < max_retries
+                 AND COALESCE(started_at, enqueued_at) < ?1"#,
+            params![stale],
+        )?;
+        // Anything that went over max_retries during the bump should
+        // be parked in deferred so workers don't starve on poison.
+        conn.execute(
+            "UPDATE memory_tasks SET status='deferred' WHERE retry_count >= max_retries AND status='requested'",
+            [],
+        )?;
+        Ok(affected)
+    }
+
+    /// Return the highest `seq_end` successfully processed for a given
+    /// rollout via `rollout_until_seq` tasks. (P0-12 cursor.) A rollout
+    /// that has never been scanned returns `None`; callers treat it as
+    /// "process from seq=0".
+    pub fn rollout_last_processed_seq(&self, rollout_id: &str) -> Result<Option<i64>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(MAX(seq_end), -1) FROM memory_tasks
+             WHERE kind='rollout_until_seq' AND status='succeeded' AND rollout_id=?1",
+        )?;
+        let v: i64 = stmt.query_row(params![rollout_id], |r| r.get::<_, i64>(0))?;
+        if v < 0 {
+            Ok(None)
+        } else {
+            Ok(Some(v))
+        }
+    }
+
+    /// Fetch up to N workable tasks and atomically transition them to
+    /// `running` so no two workers claim the same row. Claims are
+    /// filtered by `retry_count < max_retries`; deferred rows are
+    /// skipped. Returns the claimed rows plus the newly bumped state.
+    pub fn claim_memory_tasks(&self, limit: usize) -> Result<Vec<MemoryTask>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT task_id, kind, rollout_id, turn_id, seq_end, status,
+                    retry_count, max_retries, request_payload, error_message,
+                    enqueued_at, started_at, finished_at
+             FROM memory_tasks
+             WHERE status='requested' AND retry_count < max_retries
+             ORDER BY enqueued_at ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], MemoryTask::from_row)?;
+        let mut out = Vec::with_capacity(limit);
+        for r in rows {
+            out.push(r?);
+        }
+        drop(stmt);
+        let now = Utc::now().to_rfc3339();
+        let mut upd = tx.prepare(
+            "UPDATE memory_tasks SET status='running', started_at=?1 WHERE task_id=?2 AND status='requested'",
+        )?;
+        for t in &out {
+            upd.execute(params![now, t.task_id])?;
+        }
+        drop(upd);
+        tx.commit()?;
+        Ok(out)
+    }
 }
 
 /// Compute SHA-256 hex digest of a string.
-fn sha256_hex(s: &str) -> String {
+pub(crate) fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let h = Sha256::digest(s.as_bytes());
     let mut o = String::with_capacity(64);
@@ -2134,6 +2579,7 @@ mod tests {
             rollout_available: true,
             rollout_expired_at: None,
             subchunk_index: 0,
+            fingerprint: String::new(),
         }
     }
 
@@ -2307,6 +2753,76 @@ mod tests {
         let candidates = db.fts5_memory_candidates("rust", 10).unwrap();
         assert!(!candidates.is_empty());
         assert_eq!(candidates[0].0, "mem_rust");
+    }
+
+    /// Fix F: unicode61 treats adjacent CJK+ASCII as a single token
+    /// ("叫ikkk"), so `MATCH 'ikkk'` used to miss the row. The new
+    /// `enrich_content_for_fts` inserts spaces at CJK↔ASCII boundaries
+    /// and copies ASCII tokens into the `_CJKTOKENS_` suffix so both
+    /// sides remain independently retrievable.
+    #[test]
+    fn fts5_cjk_ascii_boundary_splits_tokens_rcf() {
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        // Two real-world identity memory phrasings.
+        db.upsert_memory_unit(&make_memory_unit(
+            "mem_cjk_name_ikkk",
+            "用户希望被称呼为 ikkk",
+        ))
+        .unwrap();
+        db.upsert_memory_unit(&make_memory_unit(
+            "mem_en_name_ikkk",
+            "The user's name is ikkk.",
+        ))
+        .unwrap();
+
+        // ASCII-only query for the mixed-CJK name memory MUST hit.
+        let cjk_name = db.fts5_memory_candidates("ikkk", 10).unwrap();
+        assert!(
+            cjk_name.iter().any(|(id, _, _, _)| id == "mem_cjk_name_ikkk"),
+            "MATCH 'ikkk' should hit mixed CJK/ASCII memory. Results: {cjk_name:?}"
+        );
+        // Same for pure-English phrasing (this was already true, but keep
+        // the assertion so regressions in enrichment are loud).
+        let en_name = db.fts5_memory_candidates("ikkk", 10).unwrap();
+        assert!(
+            en_name.iter().any(|(id, _, _, _)| id == "mem_en_name_ikkk"),
+            "MATCH 'ikkk' should hit pure-English memory. Results: {en_name:?}"
+        );
+        // And CJK tokens still work: `称` is a unigram in the enrichment.
+        let cjk_query = db.fts5_memory_candidates("称", 10).unwrap();
+        assert!(
+            cjk_query.iter().any(|(id, _, _, _)| id == "mem_cjk_name_ikkk"),
+            "MATCH '称' should hit CJK memory. Results: {cjk_query:?}"
+        );
+    }
+
+    /// Fix F (no-space variant): unicode61 treats adjacent Lo(CJK) and
+    /// Ll(ascii) as a SINGLE token, so "我叫ikkk" (no space) used to index
+    /// "叫ikkk" as one token → MATCH 'ikkk' missed. The new
+    /// `enrich_content_for_fts` inserts a space at the CJK↔ASCII boundary
+    /// and copies the ASCII run into `_CJKTOKENS_`, so "ikkk" becomes an
+    /// independently retrievable token even without a source-space gap.
+    #[test]
+    fn fts5_cjk_ascii_no_space_boundary_splits_tokens_rcf() {
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        // No space between CJK and ASCII — the exact pathological case.
+        db.upsert_memory_unit(&make_memory_unit(
+            "mem_nospace_ikkk",
+            "我叫ikkk",
+        ))
+        .unwrap();
+
+        let hits = db.fts5_memory_candidates("ikkk", 10).unwrap();
+        assert!(
+            hits.iter().any(|(id, _, _, _)| id == "mem_nospace_ikkk"),
+            "MATCH 'ikkk' should hit no-space CJK+ASCII memory. Results: {hits:?}"
+        );
+        // CJK unigram still works after boundary split.
+        let cjk_hits = db.fts5_memory_candidates("叫", 10).unwrap();
+        assert!(
+            cjk_hits.iter().any(|(id, _, _, _)| id == "mem_nospace_ikkk"),
+            "MATCH '叫' should hit no-space CJK+ASCII memory. Results: {cjk_hits:?}"
+        );
     }
 
     #[test]

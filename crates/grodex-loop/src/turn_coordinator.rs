@@ -1399,15 +1399,26 @@ impl TurnCoordinator {
                                 let mut hasher = sha2::Sha256::new();
                                 hasher.update(content.as_bytes());
                                 let content_hash = format!("{:x}", hasher.finalize());
+                                let rollout_id = turn_ctx.turn_id.to_string();
+                                let path = format!("tool:{}", tr.name);
+                                let section = tr.call_id.to_string();
+                                let fingerprint = EvidenceUnit::compute_fingerprint(
+                                    &rollout_id,
+                                    &path,
+                                    &section,
+                                    0,
+                                    &content_hash,
+                                );
                                 let unit = EvidenceUnit {
                                     id: format!("ev_{}_{}", tr.name, tr.call_id),
-                                    rollout_id: turn_ctx.turn_id.to_string(),
-                                    path: format!("tool:{}", tr.name),
-                                    section: tr.call_id.to_string(),
+                                    rollout_id,
+                                    path,
+                                    section,
                                     scope: MemoryScope::Workspace,
                                     status: EvidenceStatus::Active,
                                     content: content.clone(),
                                     content_hash,
+                                    fingerprint,
                                     occurred_at: chrono::Utc::now(),
                                     created_at: chrono::Utc::now(),
                                     superseded_by: None,

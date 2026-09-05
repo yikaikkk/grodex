@@ -453,6 +453,14 @@ mod tests {
             ("remember that I prefer dark mode", "用户问题 summary"),
         ];
         for (text, sec) in samples {
+            let content_hash = "x".to_string();
+            let fingerprint = EvidenceUnit::compute_fingerprint(
+                "s1",
+                "/tmp/x",
+                sec,
+                0,
+                &content_hash,
+            );
             let eu = EvidenceUnit {
                 id: format!("ev_{}", text.len()),
                 rollout_id: "s1".into(),
@@ -461,7 +469,8 @@ mod tests {
                 scope: MemoryScope::Workspace,
                 status: EvidenceStatus::Active,
                 content: text.into(),
-                content_hash: "x".into(),
+                content_hash,
+                fingerprint,
                 occurred_at: chrono::Utc::now(),
                 created_at: chrono::Utc::now(),
                 superseded_by: None,
@@ -525,15 +534,20 @@ mod tests {
             "ev_test_{}",
             &id_digest[..8]
         );
+        let path: &str = "__test__";
+        let fingerprint = EvidenceUnit::compute_fingerprint(
+            rollout, path, section, 0, &content_hash,
+        );
         let eu = EvidenceUnit {
             id,
             rollout_id: rollout.into(),
-            path: "__test__".into(),
+            path: path.into(),
             section: section.into(),
             scope: MemoryScope::Workspace,
             status: EvidenceStatus::Active,
             content: content.into(),
             content_hash,
+            fingerprint,
             occurred_at: Utc::now(),
             created_at: Utc::now(),
             superseded_by: None,

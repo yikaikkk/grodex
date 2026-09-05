@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use grodex_core::id::{SessionId, StepId, TurnId};
 use grodex_memory::{
-    EvidenceExtractor, ExtractionContext, ExtractionError, ExtractionResult,
+    EvidenceAuthority, EvidenceExtractor, ExtractionContext, ExtractionError, ExtractionResult,
     MockEvidenceExtractor, SourceRef, EXTRACTOR_SYSTEM_PROMPT, render_context_for_llm,
 };
 use grodex_provider::binding::ModelBinding;
@@ -146,7 +146,7 @@ impl SamplingBackedExtractor {
         // Try strict parse first; if that fails try to recover by
         // stripping a ```json … ``` code fence (common failure mode).
         let parsed = parse_extraction_payload(&response_text)?;
-        Ok(parsed.with_source(ctx.source.clone()))
+        Ok(parsed.with_source(ctx.source.clone(), ctx.strongest_user_authority.clone()))
     }
 }
 
@@ -169,6 +169,16 @@ pub struct CompositeExtractor {
     /// If `None`, only the rule tier runs.
     llm_tier: Option<Arc<dyn EvidenceExtractor + Send + Sync>>,
     rule_tier: Arc<MockEvidenceExtractor>,
+    /// (P0-1/P0-2) Controls how much the rule tier is allowed to
+    /// produce durable long-term memory. The supervisor reads this
+    /// value before calling `propose_and_commit` so the write gate
+    /// matches the composite's effective tier.
+    pub rule_mode: grodex_memory::MemoryRuleMode,
+    /// (P0-1) Toggle whether the LLM tier is used at runtime. When
+    /// false, behaviour is identical to a None `llm_tier`. The
+    /// split exists so tests can inject a mock extractor without
+    /// accidentally enabling the LLM path.
+    pub llm_tier_enabled: bool,
 }
 
 impl CompositeExtractor {
@@ -176,7 +186,23 @@ impl CompositeExtractor {
         Self {
             llm_tier,
             rule_tier: Arc::new(MockEvidenceExtractor::default()),
+            rule_mode: grodex_memory::MemoryRuleMode::default(),
+            llm_tier_enabled: true,
         }
+    }
+
+    /// Builder-style override of the rule-tier promotion policy.
+    /// Exposed by `--memory-rule-mode` on the CLI (P0-1-runtime).
+    pub fn with_rule_mode(mut self, mode: grodex_memory::MemoryRuleMode) -> Self {
+        self.rule_mode = mode;
+        self
+    }
+
+    /// Builder-style toggle for the LLM tier. `false` means only the
+    /// rule tier will run (good for offline smoke tests).
+    pub fn with_llm_enabled(mut self, enabled: bool) -> Self {
+        self.llm_tier_enabled = enabled;
+        self
     }
 
     /// No LLM tier, rule tier only. Used by tests and when the user
@@ -191,6 +217,8 @@ impl Default for CompositeExtractor {
         Self {
             llm_tier: None,
             rule_tier: Arc::new(MockEvidenceExtractor::default()),
+            rule_mode: grodex_memory::MemoryRuleMode::default(),
+            llm_tier_enabled: false,
         }
     }
 }
@@ -198,29 +226,125 @@ impl Default for CompositeExtractor {
 #[async_trait::async_trait]
 impl EvidenceExtractor for CompositeExtractor {
     fn tier_label(&self) -> &'static str {
-        match self.llm_tier {
-            Some(_) => "composite:llm+rule",
-            None => "composite:rule-only",
+        match (self.llm_tier_enabled, &self.llm_tier) {
+            (true, Some(_)) => "composite:llm+rule",
+            _ => "composite:rule-only",
         }
     }
+    fn rule_mode(&self) -> grodex_memory::MemoryRuleMode {
+        self.rule_mode.clone()
+    }
     async fn extract(&self, ctx: &ExtractionContext) -> Result<ExtractionResult, ExtractionError> {
-        // Tier 1: LLM (if configured).
-        if let Some(ref llm) = self.llm_tier {
-            match llm.extract(ctx).await {
-                Ok(r) => return Ok(r),
-                Err(e) => {
-                    // Fail-open: do not propagate LLM errors. Fall through
-                    // to rule tier; the error is only surfaced in logs.
-                    tracing::debug!(
-                        error = %e,
-                        turn_id = %ctx.source.turn_id,
-                        "memory extractor LLM tier failed, falling back to rule tier"
-                    );
+        let mut llm_succeeded = false;
+        // Tier 1: LLM (if configured + enabled).
+        if self.llm_tier_enabled {
+            if let Some(ref llm) = self.llm_tier {
+                match llm.extract(ctx).await {
+                    Ok(mut r) => {
+                        llm_succeeded = true;
+
+                        // ── RC2b: identity-preference safety net ──────────
+                        //
+                        // P0-2 states: "LLM success does NOT fall back to
+                        // rule tier for arbitrary claims". However, the
+                        // "remember my name" end-to-end flow MUST remain
+                        // functional even if the LLM omitted a
+                        // source_hint=user_explicit claim (the user's
+                        // identity-preference is the ONE contract we can't
+                        // break — see P0-2 comment's own note about
+                        // back-compat). We therefore inject ONLY the
+                        // identity claim produced by `extract_name` (not any
+                        // other regex fallback) if:
+                        //   1. rule_mode != Disabled
+                        //   2. ctx.user_input matches `extract_name`
+                        //   3. the LLM result does NOT already contain a
+                        //      UserExplicitStatement claim whose fact text
+                        //      mentions the captured name.
+                        //
+                        // The injected claim carries authority
+                        // UserExplicitStatement; downstream `gate_extraction_output`
+                        // will promote it under `force_user_explicit_active`
+                        // path regardless of LLM's own clamping.
+                        if !matches!(
+                            self.rule_mode,
+                            grodex_memory::MemoryRuleMode::Disabled
+                        ) {
+                            if let Some(name) = grodex_memory::extract_name(&ctx.user_input) {
+                                let name_needle = name.trim().to_lowercase();
+                                let already_covered = r.claims.iter().any(|c| {
+                                    matches!(
+                                        c.authority,
+                                        grodex_memory::EvidenceAuthority::UserExplicitStatement
+                                    ) && c.fact.to_lowercase().contains(&name_needle)
+                                });
+                                if !already_covered {
+                                    // Run rule tier and take only identity
+                                    // claims (Pattern 1 from Mock extractor
+                                    // matches extract_name's input).
+                                    if let Ok(rule_res) =
+                                        self.rule_tier.extract(ctx).await
+                                    {
+                                        for claim in rule_res.claims {
+                                            let fact_lc = claim.fact.to_lowercase();
+                                            let is_identity = matches!(
+                                                claim.authority,
+                                                grodex_memory::EvidenceAuthority::UserExplicitStatement
+                                            ) && fact_lc.contains(&name_needle);
+                                            if is_identity {
+                                                tracing::debug!(
+                                                    %name,
+                                                    "LLM extraction succeeded but missed identity claim; injecting rule-tier identity claim"
+                                                );
+                                                r.claims.push(claim);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(r);
+                    }
+                    Err(e) => {
+                        // P0-2: LLM failures do NOT silently fall back to the
+                        // rule tier for arbitrary claims. When the rule_mode
+                        // is AllowCandidate-or-stricter we do still run the
+                        // rule tier as a Candidate-only net so identity
+                        // preferences ("remember my name" etc.) survive
+                        // transient model errors — this is OK because
+                        // AllowCandidate only promotes UserExplicitStatement
+                        // claims under `force_user_explicit_active`, which is
+                        // exactly the identity-flow back-compat path. When
+                        // rule_mode == Disabled, we skip the fallback and
+                        // surface the failure.
+                        if matches!(
+                            self.rule_mode,
+                            grodex_memory::MemoryRuleMode::Disabled
+                        ) {
+                            return Err(e);
+                        }
+                        tracing::debug!(
+                            error = %e,
+                            rule_mode = ?self.rule_mode,
+                            "memory LLM tier failed → falling back to rule tier (Candidate-only)"
+                        );
+                    }
                 }
             }
         }
+        // Also use the RC2b identity net if we fell through because
+        // llm_tier_enabled=false or llm_tier=None, but ONLY when we are
+        // about to run the rule tier (i.e., not returning LLM). Otherwise
+        // the rule tier already handles it.
+        //
         // Tier 2: rule-based fallback (deterministic, no network).
-        self.rule_tier.extract(ctx).await
+        let rule_res = self.rule_tier.extract(ctx).await?;
+        // If LLM didn't run at all, we still want to ensure identity claims
+        // are present. (If llm_succeeded=true we already injected above.)
+        if !llm_succeeded {
+            // Rule tier already produces the Pattern 1 identity claim via
+            // extract_name internally, so nothing to add. Fall through.
+        }
+        Ok(rule_res)
     }
 }
 
@@ -575,6 +699,18 @@ struct ClaimRaw {
     confidence: Option<f64>,
     #[serde(default = "default_true")]
     should_persist: bool,
+    /// Optional authority class returned by the LLM extractor.
+    /// Known values: user_explicit, assistant_acknowledged,
+    /// assistant_summary, assistant_inference, tool_observation.
+    /// Anything unknown is mapped to the conservative
+    /// `AssistantSummary` so the write-gate does not accidentally
+    /// promote an unlabelled claim.
+    #[serde(default)]
+    source_hint: Option<String>,
+    /// Optional provenance detail returned by the extractor (e.g.
+    /// "user_at_seq_3 + assistant_ack_at_seq_5").
+    #[serde(default)]
+    provenance: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -612,34 +748,74 @@ impl ExtractionResultViaMirror {
     fn with_source(
         self,
         source: SourceRef,
+        strongest_user_authority: EvidenceAuthority,
     ) -> ExtractionResult {
-        use grodex_memory::{Certainty, ExtractedClaim, MemoryKind, MemoryScope};
+        use grodex_memory::{Certainty, EvidenceAuthority, ExtractedClaim, MemoryKind, MemoryScope};
         let claims = self
             .0
             .claims
             .into_iter()
-            .map(|c| ExtractedClaim {
-                fact: c.fact,
-                kind: c
-                    .kind
-                    .as_deref()
-                    .and_then(|s| MemoryKind::from_str(s))
-                    .unwrap_or(MemoryKind::Fact),
-                scope: c
-                    .scope
-                    .as_deref()
-                    .and_then(|s| MemoryScope::from_str(s))
-                    .unwrap_or(MemoryScope::Workspace),
-                certainty: c
-                    .certainty
-                    .as_deref()
-                    .and_then(|s| Certainty::from_str(s))
-                    .unwrap_or(Certainty::Inferred),
-                confidence: c.confidence.unwrap_or(0.7).clamp(0.0, 1.0),
-                should_persist: c.should_persist,
+            .map(|c| {
+                let authority = match c.source_hint.as_deref() {
+                    Some("user_explicit") | Some("user_statement") => {
+                        // (P0-5) Only trust `user_explicit` if the context
+                        // itself actually contains user input; otherwise
+                        // a tool-only turn couldn't possibly have a
+                        // user-explicit claim, so clamp it.
+                        if matches!(
+                            strongest_user_authority,
+                            EvidenceAuthority::UserExplicitStatement
+                                | EvidenceAuthority::AssistantAcknowledged
+                        ) {
+                            EvidenceAuthority::UserExplicitStatement
+                        } else {
+                            EvidenceAuthority::AssistantSummary
+                        }
+                    }
+                    Some("assistant_acknowledged") => EvidenceAuthority::AssistantAcknowledged,
+                    Some("assistant_inference") | Some("assistant_guess") => {
+                        EvidenceAuthority::AssistantInference
+                    }
+                    Some("tool_observation") | Some("tool_result") => {
+                        EvidenceAuthority::ToolObservation
+                    }
+                    // unknown / assistant_summary / empty → conservative
+                    // default: AssistantSummary (candidate only).
+                    _ => EvidenceAuthority::AssistantSummary,
+                };
+                let provenance_hint = c
+                    .provenance
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| format!("llm_extractor:json:{}", authority.as_tag()));
+                ExtractedClaim {
+                    fact: c.fact,
+                    kind: c
+                        .kind
+                        .as_deref()
+                        .and_then(|s| MemoryKind::from_str(s))
+                        .unwrap_or(MemoryKind::Fact),
+                    scope: c
+                        .scope
+                        .as_deref()
+                        .and_then(|s| MemoryScope::from_str(s))
+                        .unwrap_or(MemoryScope::Workspace),
+                    certainty: c
+                        .certainty
+                        .as_deref()
+                        .and_then(|s| Certainty::from_str(s))
+                        .unwrap_or(Certainty::Inferred),
+                    confidence: c.confidence.unwrap_or(0.7).clamp(0.0, 1.0),
+                    should_persist: c.should_persist,
+                    authority,
+                    provenance_hint,
+                }
             })
             .collect();
-        ExtractionResult { claims, source }
+        ExtractionResult {
+            claims,
+            source,
+            strongest_authority_in_context: strongest_user_authority,
+        }
     }
 }
 
@@ -692,7 +868,13 @@ fn extraction_result_json_schema() -> serde_json::Value {
                             "scope": {"type": "string", "enum": ["global", "workspace"]},
                             "certainty": {"type": "string", "enum": ["explicit", "inferred", "hypothesis"]},
                             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                            "should_persist": {"type": "boolean"}
+                            "should_persist": {"type": "boolean"},
+                            "source_hint": {
+                                "type": "string",
+                                "enum": ["user_explicit", "assistant_acknowledged", "assistant_summary", "assistant_inference", "tool_observation"],
+                                "description": "Source attribution for provenance gating. user_explicit = user FIRST STATED this fact in their own input this turn; assistant_summary = only the assistant paraphrased it (user NEVER uttered it); assistant_acknowledged = assistant said \"好的/记住了/noted\" in direct response to a user request; assistant_inference = the assistant guessed/speculated; tool_observation = fact came from a tool result. Conservative default: assistant_summary. Do NOT mark a claim as user_explicit unless the EXACT statement or the core fact appeared verbatim in the User Input section."
+                            },
+                            "provenance": {"type": "string", "description": "Optional free-form provenance tag, e.g. \"user_at_seq_3 + assistant_ack_at_seq_5\"."}
                         },
                         "required": ["fact"]
                     }
@@ -744,7 +926,7 @@ mod tests {
         // certainty=inferred, confidence=0.7, should_persist=true).
         let body = r#"{"claims":[{"fact":"partial"}]}"#;
         let parsed = parse_extraction_payload(body).unwrap();
-        let r = parsed.with_source(SourceRef::default());
+        let r = parsed.with_source(SourceRef::default(), grodex_memory::EvidenceAuthority::default());
         assert_eq!(r.claims[0].kind, grodex_memory::MemoryKind::Fact);
         assert_eq!(r.claims[0].scope, grodex_memory::MemoryScope::Workspace);
         assert_eq!(r.claims[0].certainty, grodex_memory::Certainty::Inferred);

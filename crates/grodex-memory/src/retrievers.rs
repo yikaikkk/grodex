@@ -1020,6 +1020,7 @@ mod tests {
             rollout_available: true,
             rollout_expired_at: None,
             subchunk_index: 0,
+            fingerprint: String::new(),
         })
         .unwrap();
 
@@ -1273,6 +1274,23 @@ mod tests {
         assert_eq!(build_fts_query("   \t\n"), "");
     }
 
+    // Fix F query side: "我叫 ikkk" must yield both CJK unigram `叫` and
+    // ASCII token `ikkk` as separate OR terms, so the query can hit a row
+    // indexed with either side of a CJK↔ASCII boundary.
+    #[test]
+    fn build_fts_query_cjk_ascii_boundary_yields_both_terms() {
+        let q = build_fts_query("我叫 ikkk");
+        assert!(q.contains("\"叫\""), "query must include CJK unigram 叫: {q}");
+        assert!(q.contains("\"ikkk\""), "query must include ASCII token ikkk: {q}");
+    }
+
+    #[test]
+    fn build_fts_query_cjk_ascii_no_space_boundary_yields_both_terms() {
+        let q = build_fts_query("我叫ikkk");
+        assert!(q.contains("\"叫\""), "no-space query must include CJK unigram 叫: {q}");
+        assert!(q.contains("\"ikkk\""), "no-space query must include ASCII token ikkk: {q}");
+    }
+
     // ── End-to-end: CJK query hits CJK memory via bigram expansion ──
 
     #[test]
@@ -1388,9 +1406,10 @@ mod tests {
     #[tokio::test]
     async fn retrieve_enhanced_runs_identity_through_mock_qu_pipeline() {
         use crate::llm_extractor::{
-            EvidenceExtractor, ExtractionContext, MockEvidenceExtractor, SourceRef,
+            EvidenceAuthority, EvidenceExtractor, ExtractionContext, MemoryRuleMode,
+            MockEvidenceExtractor, SourceRef,
         };
-        use crate::proposal::propose_and_commit;
+        use crate::proposal::{propose_and_commit, ProposalGateOptions};
         use crate::query_understanding::{
             MockQueryUnderstanding, QueryUnderstandingModel, QueryIntent,
         };
@@ -1412,9 +1431,16 @@ mod tests {
                 turn_id: "turn_remember".into(),
                 step_id: None,
             },
+            assistant_segments: Vec::new(),
+            strongest_user_authority: EvidenceAuthority::default(),
         };
         let extraction = extractor.extract(&extraction_ctx).await.unwrap();
-        let report = propose_and_commit(&db, &extraction, "mock:rule");
+        let gate = ProposalGateOptions {
+            rule_mode: MemoryRuleMode::AllowActive,
+            force_user_explicit_active: true,
+            tier_label: "test".into(),
+        };
+        let report = propose_and_commit(&db, &extraction, "mock:rule", &gate);
         assert_eq!(report.committed, 1);
 
         let qu = MockQueryUnderstanding;
@@ -1468,9 +1494,10 @@ mod tests {
 
         use crate::database::MemoryDatabase;
         use crate::llm_extractor::{
-            EvidenceExtractor, ExtractionContext, MockEvidenceExtractor, SourceRef,
+            EvidenceAuthority, EvidenceExtractor, ExtractionContext, MemoryRuleMode,
+            MockEvidenceExtractor, SourceRef,
         };
-        use crate::proposal::propose_and_commit;
+        use crate::proposal::{propose_and_commit, ProposalGateOptions};
         use crate::query_understanding::{
             QueryUnderstanding, QueryUnderstandingError, QueryUnderstandingModel,
         };
@@ -1503,9 +1530,16 @@ mod tests {
                 turn_id: "t1".into(),
                 step_id: None,
             },
+            assistant_segments: Vec::new(),
+            strongest_user_authority: EvidenceAuthority::default(),
         };
         let extraction = extractor.extract(&extraction_ctx).await.unwrap();
-        let report = propose_and_commit(&db, &extraction, "mock:rule");
+        let gate = ProposalGateOptions {
+            rule_mode: MemoryRuleMode::AllowActive,
+            force_user_explicit_active: true,
+            tier_label: "test".into(),
+        };
+        let report = propose_and_commit(&db, &extraction, "mock:rule", &gate);
         assert!(
             report.committed >= 1,
             "fallback needs at least one memory unit to retrieve: {report:?}"

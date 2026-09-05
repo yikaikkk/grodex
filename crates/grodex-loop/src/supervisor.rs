@@ -1740,6 +1740,48 @@ impl SessionSupervisor {
             let event_tx = self.event_tx.clone();
 
             tokio::spawn(async move {
+                // ── P0-11: durable task envelope ─────────────────────
+                // Enqueue a `turn` task row *before* we start work, so a
+                // crash mid-way leaves behind a Requested row. We then
+                // transition to Running → Succeeded/Failed inside the
+                // block; the recovery pass (called periodically by the
+                // runtime) resets stale rows back to Requested with
+                // retry_count bump.
+                use grodex_memory::{MemoryTask, MemoryTaskStatus};
+                let task_id = format!("memtask:turn:{}:{}", rollout_id, turn_id_str);
+                let mut task = MemoryTask::turn_task(
+                    task_id.clone(),
+                    rollout_id.clone(),
+                    turn_id_str.clone(),
+                );
+                // Snapshot the conversation length as a durable
+                // `processed_seq` for later audit (matches the
+                // positional seq semantics of assemble_extraction_context).
+                let snapshot_seq = {
+                    let c = chat_state.get_conversation().await;
+                    c.len() as i64
+                };
+                task.request_payload =
+                    format!(r#"{{"snapshot_seq":{snapshot_seq}}}"#);
+                let canonical_id = match db.enqueue_memory_task(&task) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            turn_id = %turn_id_str,
+                            "failed to enqueue memory extraction task (continuing without persistence)"
+                        );
+                        // Continue anyway; at-least-once delivery is
+                        // still worth preserving the transient result.
+                        task_id.clone()
+                    }
+                };
+                let _ = db.update_memory_task_status(
+                    &canonical_id,
+                    MemoryTaskStatus::Running,
+                    None,
+                );
+
                 // 1) Slice conversation to the last turn's window.
                 let conversation = chat_state.get_conversation().await;
                 let Some(ctx) = assemble_extraction_context(
@@ -1748,6 +1790,14 @@ impl SessionSupervisor {
                     &turn_id_str,
                     &outcome,
                 ) else {
+                    // Turn without user tail → nothing to extract;
+                    // short-circuit straight to Succeeded so retry
+                    // doesn't churn on empty conversation forever.
+                    let _ = db.update_memory_task_status(
+                        &canonical_id,
+                        MemoryTaskStatus::Succeeded,
+                        Some("no user tail in conversation"),
+                    );
                     return;
                 };
 
@@ -1755,21 +1805,54 @@ impl SessionSupervisor {
                 let result = match extractor.extract(&ctx).await {
                     Ok(r) => r,
                     Err(e) => {
+                        let err = truncate_for_log(&e.to_string(), 500);
                         tracing::warn!(
                             error = %e,
                             turn_id = %turn_id_str,
                             "memory extraction failed (all tiers exhausted)"
                         );
+                        // P0-2: LLM / network failures do NOT fall back
+                        // to rule extraction for the LLM tier here.
+                        // Bump retry count; after 3 retries the task is
+                        // parked in Deferred so we stop wasting cycles.
+                        match db.bump_memory_task_retry(&canonical_id, &err) {
+                            Ok(MemoryTaskStatus::Deferred) => {
+                                tracing::error!(
+                                    task_id = %canonical_id,
+                                    turn_id = %turn_id_str,
+                                    "memory extraction task DEFERRED (max retries exceeded)"
+                                );
+                            }
+                            _ => {}
+                        }
                         return;
                     }
                 };
 
                 if result.claims.is_empty() {
+                    let _ = db.update_memory_task_status(
+                        &canonical_id,
+                        MemoryTaskStatus::Succeeded,
+                        Some("no claims extracted"),
+                    );
                     return;
                 }
+                let total_claims = result.claims.len();
 
                 // 3) propose_and_commit on a blocking pool (SQLite CRUD).
                 let extractor_model = extractor_label(extractor.as_ref());
+                // P0-2/3/4: gate options are fixed at the supervisor level
+                // (they come from CLI flags / env in a future diff). For
+                // now we use the conservative P0 contract default: rule
+                // tier defaults to Candidate, except identity user-explicit
+                // claims are still allowed into Active for back-compat.
+                // `tier_label` is the *composite* label so gate can tell
+                // rule-only from LLM-backed.
+                let gate_opts = grodex_memory::ProposalGateOptions {
+                    rule_mode: extractor.rule_mode(),
+                    force_user_explicit_active: true,
+                    tier_label: extractor_model.clone(),
+                };
                 let db_cloned = db.clone();
                 // Make clones BEFORE the spawn_blocking `move` closure so
                 // the outer task can still reuse `turn_id_str` below.
@@ -1777,7 +1860,12 @@ impl SessionSupervisor {
                 let turn_id_for_join = turn_id_str.clone();
                 let committed_ids: Vec<String> = match tokio::task::spawn_blocking(move || {
                     let turn_id_str = turn_id_for_blocking;
-                    let report = grodex_memory::propose_and_commit(&db_cloned, &result, &extractor_model);
+                    let report = grodex_memory::propose_and_commit(
+                        &db_cloned,
+                        &result,
+                        &extractor_model,
+                        &gate_opts,
+                    );
                     if report.proposed > 0 || report.committed > 0 || !report.rejected.is_empty() {
                         tracing::debug!(
                             proposed = report.proposed,
@@ -1803,14 +1891,28 @@ impl SessionSupervisor {
                 {
                     Ok(ids) => ids,
                     Err(e) => {
+                        let err = truncate_for_log(&e.to_string(), 500);
                         tracing::warn!(
                             error = %e,
                             turn_id = %turn_id_for_join,
                             "propose_and_commit background task panicked"
                         );
+                        let _ = db.bump_memory_task_retry(&canonical_id, &err);
                         return;
                     }
                 };
+
+                // Mark the durable task as completed so recovery does
+                // not try to replay it.
+                let _ = db.update_memory_task_status(
+                    &canonical_id,
+                    MemoryTaskStatus::Succeeded,
+                    Some(&format!(
+                        "committed={},claims={}",
+                        committed_ids.len(),
+                        total_claims
+                    )),
+                );
 
                 // 4) Surface a non-intrusive info banner only when we
                 // actually wrote a new explicit preference/fact — users
@@ -1843,7 +1945,9 @@ fn assemble_extraction_context(
     outcome: &crate::step::TurnOutcome,
 ) -> Option<grodex_memory::ExtractionContext> {
     use grodex_core::context::ContextItem;
-    use grodex_memory::{SourceRef, ToolCallSummary, ToolResultSummary};
+    use grodex_memory::{
+        AssistantSegment, EvidenceAuthority, SourceRef, ToolCallSummary, ToolResultSummary,
+    };
 
     // Find the last User-item starting boundary; everything after it
     // belongs to the turn we just finished.
@@ -1851,22 +1955,52 @@ fn assemble_extraction_context(
     let tail = &conversation[start..];
 
     let mut user_input = String::new();
-    let mut assistant_content: Vec<String> = Vec::new();
+    let mut assistant_segments: Vec<AssistantSegment> = Vec::new();
+    let mut legacy_assistant: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCallSummary> = Vec::new();
     let mut tool_results: Vec<ToolResultSummary> = Vec::new();
+    // (P0-5) Track whether the user actually spoke so we can tag the
+    // context's `strongest_user_authority` correctly; without this a
+    // pure tool-result turn could be promoted as "user supported".
+    let mut has_user_explicit = false;
+    // (P0-5) Track whether assistant *explicitly acknowledged* user
+    // content. Cheap heuristic: assistant text contains any of the
+    // acknowledgement markers ("好的", "ok", "收到", "I will remember",
+    // "记住了", "已记住"). We match both Chinese and English since the
+    // model mixes languages freely.
+    let ack_markers: &[&str] = &[
+        "好的", "收到", "记住了", "已记住", "明白了", "知道了",
+        "i will remember", "i'll remember", "noted", "okay,", "ok.",
+        "acknowledged", "got it",
+    ];
 
     for item in tail {
         match item {
             ContextItem::User { content, .. } => {
+                has_user_explicit = true;
                 if !user_input.is_empty() {
                     user_input.push('\n');
                 }
                 user_input.push_str(content);
             }
             ContextItem::Assistant { content } => {
-                if !content.trim().is_empty() {
-                    assistant_content.push(content.clone());
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    continue;
                 }
+                let lower = trimmed.to_lowercase();
+                let authority = if has_user_explicit
+                    && ack_markers.iter().any(|m| lower.contains(&m.to_lowercase()))
+                {
+                    EvidenceAuthority::AssistantAcknowledged
+                } else {
+                    EvidenceAuthority::AssistantSummary
+                };
+                assistant_segments.push(AssistantSegment {
+                    text: trimmed.to_string(),
+                    authority,
+                });
+                legacy_assistant.push(trimmed.to_string());
             }
             ContextItem::ToolCall { name, arguments, .. } => {
                 // W4 filter: skip SubAgent / Delegate tool noise.
@@ -1880,6 +2014,7 @@ fn assemble_extraction_context(
                 tool_calls.push(ToolCallSummary {
                     name: name.clone(),
                     arguments: truncate_for_context(&args, 2000),
+                    authority: EvidenceAuthority::ToolObservation,
                 });
             }
             ContextItem::ToolResult { call_id, content, is_error } => {
@@ -1891,6 +2026,7 @@ fn assemble_extraction_context(
                     name,
                     is_error: *is_error,
                     content: truncate_for_context(content, 2000),
+                    authority: EvidenceAuthority::ToolObservation,
                 });
             }
             _ => {}
@@ -1902,27 +2038,73 @@ fn assemble_extraction_context(
     // present only there).
     if !outcome.final_text.trim().is_empty() {
         let ft = outcome.final_text.trim();
-        if assistant_content.iter().all(|a| a.trim() != ft) {
-            assistant_content.push(ft.to_string());
+        if legacy_assistant.iter().all(|a| a.trim() != ft) {
+            let lower = ft.to_lowercase();
+            let authority = if has_user_explicit
+                && ack_markers.iter().any(|m| lower.contains(&m.to_lowercase()))
+            {
+                EvidenceAuthority::AssistantAcknowledged
+            } else {
+                EvidenceAuthority::AssistantSummary
+            };
+            assistant_segments.push(AssistantSegment {
+                text: ft.to_string(),
+                authority,
+            });
+            legacy_assistant.push(ft.to_string());
         }
     }
 
+    // P0-8: SourceRef seq_start/seq_end — use positional indices inside
+    // the conversation slice. The conversation items don't carry raw
+    // rollout seq numbers, so we map the slice boundary onto a
+    // 1-based range: seq_start = start + 1 (since rposition returns
+    // the array index), seq_end = conversation.len(). This is stable
+    // across restarts because the conversation is rebuilt from the
+    // journal in event order (which matches rollout seq order). For
+    // callers that don't provide a journal-backed transcript this
+    // degrades gracefully to an inclusive-ordered range instead of
+    // the old "0..0" unknown sentinel, which is already strictly more
+    // useful for audit.
+    //
+    // NOTE: upping both values by 1 so a zero-indexed conversation of
+    // length 1 still produces a non-zero `seq_end`; downstream audit
+    // code uses seq_start == 0 as a legacy "unpopulated" marker.
+    let seq_start = (start as i64).saturating_add(1).max(1);
+    let seq_end = (conversation.len() as i64).max(seq_start);
     let source = SourceRef {
         rollout_id: rollout_id.to_string(),
-        seq_start: 0,
-        seq_end: 0,
+        seq_start,
+        seq_end,
         turn_id: turn_id.to_string(),
         step_id: None,
     };
 
+    // P0-5: compute the strongest authority the extractor is allowed
+    // to rely on. If the turn has no user input at all, we clamp to
+    // `AssistantSummary` — tool-only turns and pure assistant-inference
+    // turns MUST NOT be able to produce UserExplicitStatement claims,
+    // regardless of downstream mislabelling (P0-7 failsafe).
+    let strongest_user_authority = if has_user_explicit {
+        EvidenceAuthority::UserExplicitStatement
+    } else if assistant_segments.iter().any(|s| {
+        matches!(s.authority, EvidenceAuthority::AssistantAcknowledged)
+    }) {
+        EvidenceAuthority::AssistantAcknowledged
+    } else {
+        EvidenceAuthority::AssistantSummary
+    };
+
     Some(grodex_memory::ExtractionContext {
         user_input,
-        assistant_content,
+        assistant_segments,
+        assistant_content: legacy_assistant,
         tool_calls,
         tool_results,
         adjacent_events: Vec::new(),
         existing_memory: Vec::new(),
         source,
+        strongest_user_authority,
     })
 }
 

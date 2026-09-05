@@ -16,7 +16,8 @@ use rusqlite::Connection;
 ///   v2: +document_embeddings (brute-force vector blob store) + embedding_metadata
 ///   v3: +evidence_units.access_count/last_accessed_at + governance runtime columns
 ///   v4: +memory_units provenance/confidence columns + memory_conflicts + memory_proposals
-pub const SCHEMA_VERSION: u32 = 4;
+///   v5: +evidence_units.fingerprint UNIQUE (P0-10 dedup) + memory_tasks durable state (P0-11/14)
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Apply the full DDL to a fresh connection. Idempotent — safe to call on
 /// every open. Uses `CREATE TABLE IF NOT EXISTS` for all tables.
@@ -113,6 +114,7 @@ pub fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
             status              TEXT    NOT NULL DEFAULT 'active',
             content             TEXT    NOT NULL DEFAULT '',
             content_hash        TEXT    NOT NULL DEFAULT '',
+            fingerprint         TEXT    NOT NULL DEFAULT '',
             occurred_at         TEXT    NOT NULL,
             created_at          TEXT    NOT NULL,
             superseded_by       TEXT,
@@ -121,7 +123,8 @@ pub fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
             rollout_expired_at  TEXT,
             subchunk_index      INTEGER NOT NULL DEFAULT 0,
             access_count        INTEGER NOT NULL DEFAULT 0,
-            last_accessed_at    TEXT
+            last_accessed_at    TEXT,
+            UNIQUE(fingerprint)
         );
         CREATE INDEX IF NOT EXISTS idx_evidence_path ON evidence_units(path);
         CREATE INDEX IF NOT EXISTS idx_evidence_rollout ON evidence_units(rollout_id);
@@ -293,6 +296,22 @@ pub fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
                 "ALTER TABLE evidence_units ADD COLUMN last_accessed_at TEXT",
             );
         }
+        // ─── v5 migration: evidence_units.fingerprint ──────────────
+        // (P0-10) Both the turn-coordinator's real-time evidence writer
+        // and the rollout_extractor's historical scan now write a
+        // deterministic `fingerprint` so the two paths converge without
+        // producing duplicates. `fingerprint` lives alongside
+        // `content_hash` and `(rollout_id, section)`; the UNIQUE
+        // constraint on DDL is enforced on new DBs; legacy DBs just
+        // get the column. We do NOT add the UNIQUE constraint via
+        // ALTER (SQLite can't) — legacy DBs rely on application-level
+        // dedup (INSERT OR IGNORE on fingerprint via a pre-lookup,
+        // which is implemented in `upsert_evidence_unit`).
+        if !has_column(conn, "evidence_units", "fingerprint") {
+            let _ = conn.execute_batch(
+                "ALTER TABLE evidence_units ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''",
+            );
+        }
     }
 
     // ─── v4 migration: memory_units provenance columns ───────────
@@ -381,6 +400,47 @@ pub fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
 
+    // ─── 15. memory_tasks (v5, P0-11/14/12) ─────────────────────
+    // Durable queue of asynchronous extraction work. Both per-Turn
+    // extraction AND historical rollout scans queue rows here before
+    // spawning work. On startup the supervisor can recover any rows
+    // stuck in `running` or `requested` for longer than TTL by
+    // resetting them back to `requested` with `retry_count += 1`.
+    //
+    // `kind`:
+    //   * 'turn'  — run after a single turn completes.
+    //   * 'rollout_until_seq' — process a rollout journal up to `seq_end`.
+    //
+    // `status`: requested → running → succeeded / failed / deferred.
+    //
+    // UNIQUE (kind, rollout_id, turn_id, seq_end) prevents queueing
+    // the same work twice. seq_end defaults to -1 for turn tasks
+    // where the range is implicit (the turn itself). seq_end IS the
+    // inclusive upper journal sequence that a rollout_until_seq task
+    // has finished processing; it's the P0-12 cursor.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_tasks (
+            task_id         TEXT    PRIMARY KEY,
+            kind            TEXT    NOT NULL,
+            rollout_id      TEXT    NOT NULL,
+            turn_id         TEXT    NOT NULL DEFAULT '',
+            seq_end         INTEGER NOT NULL DEFAULT -1,
+            status          TEXT    NOT NULL DEFAULT 'requested',
+            retry_count     INTEGER NOT NULL DEFAULT 0,
+            max_retries     INTEGER NOT NULL DEFAULT 3,
+            request_payload TEXT    NOT NULL DEFAULT '{}',
+            error_message   TEXT    NOT NULL DEFAULT '',
+            enqueued_at     TEXT    NOT NULL,
+            started_at      TEXT,
+            finished_at     TEXT,
+            UNIQUE(kind, rollout_id, turn_id, seq_end)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_tasks_status ON memory_tasks(status);
+        CREATE INDEX IF NOT EXISTS idx_memory_tasks_rollout ON memory_tasks(rollout_id, kind, seq_end);
+        "#,
+    )?;
+
     Ok(())
 }
 
@@ -438,6 +498,7 @@ mod tests {
             "embedding_metadata",
             "memory_conflicts",
             "memory_proposals",
+            "memory_tasks",
         ] {
             assert!(tables.contains(&expected.to_string()), "missing table: {expected}");
         }

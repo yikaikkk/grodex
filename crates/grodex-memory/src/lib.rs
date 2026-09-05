@@ -73,14 +73,15 @@ pub use indexer::{
     ReconciliationDiff, ScannedFile,
 };
 pub use llm_extractor::{
-    EvidenceExtractor, ExtractionContext, ExtractionError, ExtractionResult, ExtractedClaim,
-    MockEvidenceExtractor, RolloutEventSummary, SourceRef, ToolCallSummary, ToolResultSummary,
-    EXTRACTOR_SYSTEM_PROMPT, render_context_for_llm,
+    AssistantSegment, EvidenceAuthority, EvidenceExtractor, ExtractionContext, ExtractionError,
+    ExtractionResult, ExtractedClaim, MockEvidenceExtractor, RolloutEventSummary, SourceRef,
+    ToolCallSummary, ToolResultSummary, EXTRACTOR_SYSTEM_PROMPT, render_context_for_llm,
+    gate_extraction_output, MemoryRuleMode, MemoryWriteGateDecision, extract_name,
 };
 pub use consolidator::ConsolidationReport;
 pub use governance::{GovernanceReport, format_governance_banner, run_conflict_resolution_pass};
 pub use parser::{ParsedMemoryChunk, ParsedMemoryFile};
-pub use proposal::{ProposalCommitReport, RejectedClaim, propose_and_commit, validate_claim, create_proposal};
+pub use proposal::{ProposalCommitReport, ProposalGateOptions, RejectedClaim, propose_and_commit, validate_claim, create_proposal, lookup_evidence_ids_for_claim};
 pub use conflict_judge::{
     ConflictJudge, ConflictJudgeError, ConflictJudgeInput, ConflictJudgeResult,
     MockConflictJudge, CONFLICT_JUDGE_PROMPT,

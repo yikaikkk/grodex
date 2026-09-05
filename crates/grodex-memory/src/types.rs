@@ -8,6 +8,8 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
+use std::fmt::Write as _;
 
 // ───────────────────────── Memory Unit ─────────────────────────
 
@@ -212,6 +214,12 @@ pub struct EvidenceUnit {
     pub content: String,
     /// SHA-256 hash of the source section content.
     pub content_hash: String,
+    /// (P0-10) Deterministic deduplication fingerprint computed as
+    /// `sha256(rollout_id + "|" + path + "|" + section + "|" + subchunk_index + "|" + content_hash)`.
+    /// Carried as a UNIQUE column so the turn-coordinator real-time
+    //  evidence writer and the historical rollout_extractor both
+    /// converge on the same row, avoiding double writes.
+    pub fingerprint: String,
     /// When the original event occurred.
     pub occurred_at: DateTime<Utc>,
     /// When this evidence unit was first indexed.
@@ -226,6 +234,40 @@ pub struct EvidenceUnit {
     pub rollout_expired_at: Option<DateTime<Utc>>,
     /// Sub-chunk index for units exceeding max_chunk_chars (0 = whole unit).
     pub subchunk_index: i64,
+}
+
+impl EvidenceUnit {
+    /// (P0-10) Compute the deterministic deduplication fingerprint for
+    /// the given evidence tuple. This is `sha256(rollout_id + "|" + path
+    /// + "|" + section + "|" + subchunk_index + "|" + content_hash)`,
+    /// which is stable across both the turn-coordinator's real-time
+    /// evidence writer and the rollout_extractor's historical rescan.
+    pub fn compute_fingerprint(
+        rollout_id: &str,
+        path: &str,
+        section: &str,
+        subchunk_index: i64,
+        content_hash: &str,
+    ) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(rollout_id.as_bytes());
+        hasher.update(b"|");
+        hasher.update(path.as_bytes());
+        hasher.update(b"|");
+        hasher.update(section.as_bytes());
+        hasher.update(b"|");
+        hasher.update(subchunk_index.to_string().as_bytes());
+        hasher.update(b"|");
+        hasher.update(content_hash.as_bytes());
+        let h = hasher.finalize();
+        let mut o = String::with_capacity(64);
+        for b in &h {
+            use std::fmt::Write;
+            let _ = write!(o, "{:02x}", b);
+        }
+        o
+    }
 }
 
 // ───────────────────────── Skill Catalog Entry ─────────────────────────
@@ -625,6 +667,171 @@ impl ResultSource {
             Self::Evidence => "evidence",
             Self::GlobalUserPreference => "global_user_preference",
         }
+    }
+}
+
+// ───────────────────────── Memory Tasks (P0-11/14) ──────────────────
+
+/// Lifecycle of a durable asynchronous extraction job.
+///
+/// Mirrors `memory_tasks.status`. The state transitions are:
+///
+/// ```text
+/// Requested → Running → Succeeded
+///                 ↘
+///                   Failed  →(retry<max) Requested
+///                                   ↘(retry≥max) Deferred
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryTaskStatus {
+    /// Queued, waiting to be claimed by a worker.
+    Requested,
+    /// A worker has claimed the row; extraction is in progress.
+    Running,
+    /// Extraction completed successfully.
+    Succeeded,
+    /// Extraction failed; the row can be retried up to `max_retries`.
+    Failed,
+    /// Poisoned (retry_count >= max_retries) or explicitly parked.
+    /// Requires manual operator intervention or a reset pass.
+    Deferred,
+}
+
+impl MemoryTaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Deferred => "deferred",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "requested" => Some(Self::Requested),
+            "running" => Some(Self::Running),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+}
+
+impl Default for MemoryTaskStatus {
+    fn default() -> Self {
+        Self::Requested
+    }
+}
+
+/// A durable extraction task (P0-11/14).
+///
+/// `kind` and the unique-constraint columns have specific semantics:
+///
+/// | kind                | meaning                                     | unique key seq semantics            |
+/// |---------------------|---------------------------------------------|-------------------------------------|
+/// | `turn`              | per-Turn extraction after TurnCompleted     | `seq_end = -1` (sentinal)           |
+/// | `rollout_until_seq` | process rollout journal up to `seq_end`     | `seq_end = inclusive upper seq`     |
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryTask {
+    pub task_id: String,
+    /// `turn` or `rollout_until_seq`.
+    pub kind: String,
+    pub rollout_id: String,
+    /// Only meaningful for turn tasks (and unique key); empty for
+    /// rollout tasks.
+    #[serde(default)]
+    pub turn_id: String,
+    /// Inclusive upper sequence processed by a rollout_until_seq task
+    /// (P0-12 cursor); `-1` when unused for turn tasks.
+    pub seq_end: i64,
+    pub status: MemoryTaskStatus,
+    pub retry_count: i64,
+    pub max_retries: i64,
+    /// Opaque JSON payload carried across retries; currently stores
+    /// things like `{ "snapshot_seq": N }` for recovery auditing.
+    pub request_payload: String,
+    /// Most recent error message, if any.
+    #[serde(default)]
+    pub error_message: String,
+    pub enqueued_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl MemoryTask {
+    /// Build a turn extraction task for `(rollout_id, turn_id)`. The
+    /// task is constructed in `Requested` status so a worker must
+    /// still claim it before execution.
+    pub fn turn_task(task_id: String, rollout_id: String, turn_id: String) -> Self {
+        Self {
+            task_id,
+            kind: "turn".into(),
+            rollout_id,
+            turn_id,
+            seq_end: -1,
+            status: MemoryTaskStatus::Requested,
+            retry_count: 0,
+            max_retries: 3,
+            request_payload: "{}".into(),
+            error_message: String::new(),
+            enqueued_at: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// Build a rollout-extraction task covering journal rows up to
+    /// and including `seq_end`. Idempotency comes from the
+    /// UNIQUE(kind, rollout_id, turn_id="", seq_end) constraint.
+    pub fn rollout_task(task_id: String, rollout_id: String, seq_end: i64) -> Self {
+        Self {
+            task_id,
+            kind: "rollout_until_seq".into(),
+            rollout_id,
+            turn_id: String::new(),
+            seq_end,
+            status: MemoryTaskStatus::Requested,
+            retry_count: 0,
+            max_retries: 3,
+            request_payload: "{}".into(),
+            error_message: String::new(),
+            enqueued_at: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// Helper for `claim_memory_tasks` query_map. Keeps column order
+    /// in one place so the select statement and row deserialization
+    /// can't drift.
+    pub(crate) fn from_row<'r>(
+        row: &rusqlite::Row<'r>,
+    ) -> rusqlite::Result<Self> {
+        use crate::database::parse_ts;
+        fn opt(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
+            let s: Option<String> = row.get(idx)?;
+            Ok(s.as_deref().map(parse_ts))
+        }
+        Ok(Self {
+            task_id: row.get(0)?,
+            kind: row.get(1)?,
+            rollout_id: row.get(2)?,
+            turn_id: row.get(3)?,
+            seq_end: row.get(4)?,
+            status: MemoryTaskStatus::from_str(&row.get::<_, String>(5)?)
+                .unwrap_or(MemoryTaskStatus::Requested),
+            retry_count: row.get(6)?,
+            max_retries: row.get(7)?,
+            request_payload: row.get(8)?,
+            error_message: row.get(9)?,
+            enqueued_at: opt(row, 10)?,
+            started_at: opt(row, 11)?,
+            finished_at: opt(row, 12)?,
+        })
     }
 }
 
