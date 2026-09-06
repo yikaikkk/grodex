@@ -1331,8 +1331,7 @@ impl SessionRuntimeBuilder {
                     msg = subagent_progress_rx.recv() => {
                         match msg {
                             Some(progress) => {
-                                eprintln!("[fwd] subagent progress -> broadcast");
-                                let ev = LoopSessionEvent::SubagentProgress(progress);
+                                                                let ev = LoopSessionEvent::SubagentProgress(progress);
                                 if event_broadcast_tx.send(ev).await.is_err() {
                                     break;
                                 }

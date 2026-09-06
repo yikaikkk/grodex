@@ -535,26 +535,15 @@ impl SamplingClient {
                 }
                 // All other variants use the 1:1 mapping.
                 other => {
-                    // Flush any pending reasoning as an assistant message so it
-                    // is not silently dropped when no assistant message follows.
-                    // NOTE: must NOT use role "developer" — Chat Completions
-                    // endpoints (esp. third-party) reject unknown roles; this
-                    // flush path triggers after mid-tool-call interrupts when a
-                    // ReasoningSummary is followed directly by a ToolResult.
-                    //
-                    // CRITICAL: set the `reasoning_content` FIELD (not just
-                    // text content). DeepSeek/Qwen thinking-mode APIs require
-                    // this field to be echoed back verbatim — putting it in
-                    // the message text does NOT satisfy the requirement and
-                    // triggers a 400 "reasoning_content must be passed back".
-                    if let Some(r) = pending_reasoning.take() {
-                        if !r.is_empty() {
-                            messages.push(serde_json::json!({
-                                "role": "assistant",
-                                "content": "",
-                                "reasoning_content": r,
-                            }));
-                        }
+                    // If a ReasoningSummary has no following Assistant/ToolCall
+                    // to pair with, DROP it rather than emitting a synthetic
+                    // `assistant content:"" + reasoning_content` message.
+                    // DeepSeek/Qwen thinking-mode APIs reject such an empty
+                    // assistant on replay (400 "reasoning_content must be
+                    // passed back") because the original response never
+                    // contained a content-less reasoning-only assistant.
+                    if pending_reasoning.take().is_some() {
+                        // intentionally discarded (see comment above)
                     }
                     if let Some(m) = self.map_chat_item(other) {
                         messages.push(m);
@@ -564,21 +553,10 @@ impl SamplingClient {
         }
         // --- END of main iteration ---
         //
-        // Flush any still-pending reasoning if the last context item was a
-        // ReasoningSummary with no following Assistant/ToolCall/other to
-        // consume it. The main loop's "other" branch only flushes when a
-        // following item exists, so a trailing ReasoningSummary would be
-        // dropped without this guard — which causes thinking-mode APIs
-        // (Doubao/DeepSeek/Qwen) to return a 400 on the NEXT API call.
-        if let Some(r) = pending_reasoning.take() {
-            if !r.is_empty() {
-                messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": "",
-                    "reasoning_content": r,
-                }));
-            }
-        }
+        // Trailing ReasoningSummary with no following Assistant/ToolCall: drop
+        // it instead of emitting a content-less `reasoning_content` assistant,
+        // which thinking-mode APIs (DeepSeek/Qwen) reject on replay.
+        let _ = pending_reasoning.take();
         // Trailing volatile instruction blocks (e.g. per-turn memory RAG)
         // go AFTER the conversation history so the stable prefix
         // (system + history) remains cacheable across turns.
@@ -829,8 +807,13 @@ mod wire_role_tests {
             .map(|m| m["role"].as_str().unwrap())
             .collect();
         assert!(!roles.contains(&"developer"), "roles: {roles:?}");
-        // The flushed reasoning must still be present (not dropped).
-        assert!(roles.contains(&"assistant"));
+        // Orphan reasoning (no following assistant/tool-call to pair with) must
+        // be DROPPED — never emitted as a content-less `reasoning_content`
+        // assistant, which thinking-mode APIs reject on replay.
+        let has_synth = body["messages"].as_array().unwrap().iter().any(|m| {
+            m.get("reasoning_content").is_some() && m["content"].as_str() == Some("")
+        });
+        assert!(!has_synth, "must not emit a content-less reasoning assistant: {body:?}");
     }
 
     /// Regression: trailing volatile instruction blocks with Developer role

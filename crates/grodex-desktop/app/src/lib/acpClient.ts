@@ -503,7 +503,6 @@ function onEvent(envelope: AcpEnvelope) {
       break;
     }
     case 'SubagentProgress': {
-      console.debug('[acp] SubagentProgress', c.id, c.phase, c.label);
       const subId = c.id!;
       const phase = c.phase || '';
       const detail = c.detail || '';

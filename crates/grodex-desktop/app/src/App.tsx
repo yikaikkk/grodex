@@ -243,7 +243,6 @@ export default function App() {
     });
 
     const unsubSubagent = eventBus.on('subagentUpdate', (node: SubAgentNode) => {
-      console.debug('[app] subagentUpdate', node.id, node.status, node.logs?.length);
       setSubagents((prev) => {
         const existingIdx = prev.findIndex((s) => s.id === node.id);
         if (existingIdx >= 0) {
@@ -345,14 +344,14 @@ export default function App() {
       const list = await acp.listSessions();
       if (cancelled) return;
       setSessions(list);
+      // Start on the blank "new task" page: do NOT auto-select the most recent
+      // session and do NOT spawn `grodex serve`. A session/process is only
+      // created lazily on the first real send or when the user opens one from
+      // the sidebar.
       const first = list[0];
       if (first) {
-        // Just select the most recent session — do NOT spawn `grodex serve`
-        // yet. A process (and its boot session dir) is only created lazily on
-        // the first real send / when the user explicitly opens a session.
         const ws = first.workspace || '';
         setWorkspace(ws);
-        setActiveSessionId(first.id);
       } else {
         showNotice('没有找到历史会话。点击「新建任务」选择一个工作目录开始。');
       }
