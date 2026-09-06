@@ -17,6 +17,7 @@ grodex-protocol.workspace = true
 grodex-core.workspace = true
 grodex-prompt.workspace = true
 grodex-skills.workspace = true
+grodex-acp-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

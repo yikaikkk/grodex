@@ -1,0 +1,26 @@
+# NOTE: `name`/`version` are written explicitly (NOT inherited from
+# `[workspace.package]`). Tauri's build scripts/keychain tooling choke on
+# inherited package metadata, so this crate self-describes like a standalone
+# Tauri project while remaining a workspace member.
+
+[package]
+name = "grodex-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/grodex/grodex"
+rust-version = "1.85"
+default-run = "grodex-desktop"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+chrono = { workspace = true }
+grodex-acp-client = { workspace = true }
+grodex-protocol = { workspace = true }

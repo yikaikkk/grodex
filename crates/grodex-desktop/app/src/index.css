@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+/* Typography plugin: the demo's `prose …` classes style chat markdown. */
+@plugin "@tailwindcss/typography";
+
+@layer components {
+  /* Keep markdown inside chat bubbles inside the bubble (no overflow),
+     while still letting long code tokens wrap instead of pushing out. */
+  .md-body {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+  .md-body pre {
+    max-width: 100%;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .bubble-wrap {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+}
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+  
+  body {
+    background-color: #faf9f7;
+    color: #3a3f45;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+    user-select: none;
+    overflow: hidden;
+  }
+
+  code, pre, kbd, samp {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  }
+}
+
+/* Paper-like subtle background texture gradient */
+.bg-paper-warm {
+  background-color: #faf9f7;
+  background-image: radial-gradient(at 0% 0%, rgba(245, 240, 230, 0.4) 0px, transparent 50%),
+                    radial-gradient(at 100% 100%, rgba(238, 242, 246, 0.4) 0px, transparent 50%);
+}
+
+/* Custom soft scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(160, 155, 145, 0.25);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(140, 135, 125, 0.45);
+}
+
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.animate-cursor-blink {
+  animation: cursor-blink 1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+

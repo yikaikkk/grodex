@@ -23,6 +23,8 @@ members = [
     "crates/grodex-telemetry",
     "crates/grodex-cli",
     "crates/grodex-tui",
+    "crates/grodex-acp-client",
+    "crates/grodex-desktop/src-tauri",
 ]
 
 [workspace.package]
@@ -83,6 +85,8 @@ grodex-memory = { path = "crates/grodex-memory" }
 grodex-telemetry = { path = "crates/grodex-telemetry" }
 grodex-cli = { path = "crates/grodex-cli" }
 grodex-tui = { path = "crates/grodex-tui" }
+grodex-acp-client = { path = "crates/grodex-acp-client" }
+grodex-desktop = { path = "crates/grodex-desktop/src-tauri" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
