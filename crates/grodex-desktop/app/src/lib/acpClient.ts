@@ -442,20 +442,17 @@ function onEvent(envelope: AcpEnvelope) {
     case 'RequestPermission': {
       const ticketId = c.ticket_id || uid();
       const toolName = c.tool_name || 'tool';
-      // Find the most recent open tool of this name to mark it awaiting.
-      const callId = lastCallByTool.get(toolName);
-      const stub = callId ? tools.get(callId) : undefined;
-      if (stub && stub.status === 'running') {
-        stub.status = 'awaiting_approval';
-        stub.approvalId = ticketId;
-        upsertTool(stub);
-      }
+      // Do NOT guess-link the ticket to an existing running tool card.
+      // Approval happens BEFORE the tool actually starts (ToolCallStart only
+      // arrives after the decision), so matching by name here can pin the WRONG
+      // (earlier) card into `awaiting_approval` forever. The modal alone carries
+      // the request; the real tool card shows up once it runs after approval.
       const params = (c.arguments_snapshot as Record<string, unknown>) || {};
       const timeoutMs = Math.max(0, c.timeout_remaining_ms ?? 0);
       const remaining = Math.max(0, Math.ceil(timeoutMs / 1000));
       const request: ApprovalRequest = {
         id: ticketId,
-        toolItemId: stub?.id || '',
+        toolItemId: '',
         toolName: toolName as ApprovalRequest['toolName'],
         params,
         target: summaryOf(toolName, params),
@@ -506,6 +503,7 @@ function onEvent(envelope: AcpEnvelope) {
       break;
     }
     case 'SubagentProgress': {
+      console.debug('[acp] SubagentProgress', c.id, c.phase, c.label);
       const subId = c.id!;
       const phase = c.phase || '';
       const detail = c.detail || '';
@@ -712,9 +710,32 @@ export async function sendPrompt(text: string): Promise<void> {
   await sendWire(cmd);
 }
 
+/** Stop a cancel/error: mark any tool still running/awaiting as failed so its
+ * timer stops and the card never hangs on "running". */
+function finalizeAllRunningTools(reason: string) {
+  for (const [callId, stub] of Array.from(tools.entries())) {
+    if (stub.status === 'running' || stub.status === 'awaiting_approval') {
+      stub.status = 'failed';
+      eventBus.emit('toolFinished', {
+        id: callId,
+        status: 'failed',
+        error: reason,
+        elapsedSec: (Date.now() - stub.startTime) / 1000,
+        params: stub.params,
+      });
+      tools.delete(callId);
+      toolNameByCall.delete(callId);
+      argsBuf.delete(callId);
+      const nm = stub.toolName;
+      if (lastCallByTool.get(nm) === callId) lastCallByTool.delete(nm);
+    }
+  }
+}
+
 export async function stop(): Promise<void> {
   const cmd = withSession({ type: 'Cancel', command_id: uid() });
   await sendWire(cmd);
+  finalizeAllRunningTools('已停止');
   finalizeAssistant();
   endThoughtBurst();
   resetStreaming();
@@ -723,6 +744,11 @@ export async function stop(): Promise<void> {
     isRunning: false,
     sessionId: clientSessionId,
   });
+}
+
+/** Remove phantom (empty / no-conversation) session dirs. */
+export async function purgeEmptySessions(): Promise<number> {
+  return invoke<number>('purge_empty_sessions');
 }
 
 /** Ensure a `grodex serve` process exists (spawn in `cwd` only if none). */
@@ -778,6 +804,28 @@ export async function resolveApproval(
       resolution = { narrow: { narrowed_args: narrowedParams ?? {} } };
       break;
   }
+  // Deny: proactively finish the tool card tied to this ticket so its timer
+  // stops immediately — some paths never emit a ToolResult for a denied call,
+  // which previously left the card "running" forever.
+  if (action === 'denied') {
+    for (const [callId, stub] of Array.from(tools.entries())) {
+      if (stub.approvalId !== approvalId) continue;
+      stub.status = 'failed';
+      eventBus.emit('toolFinished', {
+        id: callId,
+        status: 'failed',
+        error: '已拒绝执行该工具',
+        elapsedSec: (Date.now() - stub.startTime) / 1000,
+        params: stub.params,
+      });
+      tools.delete(callId);
+      toolNameByCall.delete(callId);
+      argsBuf.delete(callId);
+      const nm = stub.toolName;
+      if (lastCallByTool.get(nm) === callId) lastCallByTool.delete(nm);
+    }
+  }
+
   const cmd = {
     type: 'ResolveApproval',
     command_id: uid(),
@@ -831,6 +879,52 @@ export async function listSessions(): Promise<Session[]> {
 /** Permanently delete a session's rollout directory. */
 export async function deleteSession(sessionId: string): Promise<void> {
   await invoke('delete_session', { sessionId });
+}
+
+// ── Memory management ────────────────────────────────────────────────────
+
+export interface MemoryRow {
+  id: string;
+  status: string;
+  kind: string;
+  scope: string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConflictRow {
+  conflictId: string;
+  leftMemoryId: string;
+  rightMemoryId: string;
+  relation: string;
+  status: string;
+  reason: string;
+}
+
+export interface MemoryOverview {
+  units: MemoryRow[];
+  conflicts: ConflictRow[];
+}
+
+export interface MaintenanceReport {
+  units: number;
+  conflictsPending: number;
+  governanceOk: boolean;
+  consolidationOk: boolean;
+}
+
+export async function listMemories(): Promise<MemoryOverview> {
+  return invoke<MemoryOverview>('list_memories');
+}
+
+/** Soft-delete a memory unit (status → orphaned; excluded from retrieval). */
+export async function deleteMemory(id: string): Promise<void> {
+  await invoke('delete_memory', { id });
+}
+
+export async function runMemoryMaintenance(): Promise<MaintenanceReport> {
+  return invoke<MaintenanceReport>('run_memory_maintenance');
 }
 
 export async function loadConfig(): Promise<SettingsState> {

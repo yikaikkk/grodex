@@ -137,6 +137,37 @@ impl MemoryDatabase {
             Err(_) => report.errors += 1,
         }
 
+        // ── 1b. Deterministic "fact-slot" conflicts (P0) ─────────────
+        // Hash-prefix buckets above only catch near-duplicates. Slot-based
+        // detection catches semantic contradictions (iker vs ikkk) and writes
+        // pending `memory_conflicts` rows for later resolution.
+        // ── 1d. Promote name-slot candidates to Active (C4) ─────────
+        // Must run BEFORE slot-conflict detection so a newly promoted name
+        // participates in this same pass's conflict check. A told name
+        // ("记住我叫iker") stored as Candidate should become usable; identity
+        // is low-risk, high-value and clearly user-specified.
+        match self.promote_identity_candidates(MAX_OPS_PER_PASS) {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::debug!("memory C4: promoted {n} identity candidate(s) to active");
+                }
+            }
+            Err(_) => report.errors += 1,
+        }
+
+        match self.ensure_slot_conflicts(MAX_OPS_PER_PASS) {
+            Ok(n) => report.conflicts_detected += n,
+            Err(_) => report.errors += 1,
+        }
+
+        // ── 1c. Deterministic conflict auto-resolution (B2) ──────────
+        // Slot conflicts are inserted oldest-first, so Supersedes keeps the
+        // newer unit active and supersedes the older one. Rule-based, no LLM.
+        match self.auto_resolve_conflicts_deterministic(MAX_OPS_PER_PASS) {
+            Ok(n) => report.conflicts_resolved_via_judge += n,
+            Err(_) => report.errors += 1,
+        }
+
         // ── 2. Rollout TTL expiry ───────────────────────────────────
         if let Some(root) = sessions_root {
             match self.list_rollout_missing_evidences(root) {

@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod memory_ui;
 mod sessions;
 mod transport;
 
@@ -37,6 +38,10 @@ fn main() {
             commands::list_sessions,
             commands::get_config,
             commands::delete_session,
+            commands::purge_empty_sessions,
+            memory_ui::list_memories,
+            memory_ui::delete_memory,
+            memory_ui::run_memory_maintenance,
         ])
         .build(tauri::generate_context!())
         .expect("error while building grodex desktop");

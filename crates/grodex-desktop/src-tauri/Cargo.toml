@@ -24,3 +24,4 @@ dirs = { workspace = true }
 chrono = { workspace = true }
 grodex-acp-client = { workspace = true }
 grodex-protocol = { workspace = true }
+grodex-memory = { workspace = true }

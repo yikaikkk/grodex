@@ -65,10 +65,19 @@ impl MemoryDatabase {
             }
 
             // W3: Preference 兜底提升 — UserQuestion 组只要命中
-            // 「叫我/记住我/call me/remember/我是/我叫」且 ≥1 条时
-            // 直接升 Memory kind=Preference scope=Global，绕过
-            // MIN_OCCURRENCES 门槛。
+            // 「叫我/记住我/call me/remember/我叫/我的名字是」且 ≥1 条
+            // 且不是闲聊/提问时，直接升 Memory kind=Preference scope=Global，
+            // 绕过 MIN_OCCURRENCES 门槛。
             let pref_fallback = is_preference_pattern(&evidences);
+            let question_only = evidences
+                .iter()
+                .all(|e| is_user_question_section(&e.section));
+            if question_only && !pref_fallback {
+                // 纯聊天/提问回声（"继续 / 你是什么模型 / 我叫什么名字你知道吗"…）
+                // 永远不会成为长期记忆，即使重复 ≥MIN_OCCURRENCES 次。
+                report.groups_insufficient += 1;
+                continue;
+            }
             if evidences.len() < MIN_OCCURRENCES && !pref_fallback {
                 report.groups_insufficient += 1;
                 continue;
@@ -205,44 +214,23 @@ impl MemoryDatabase {
             report.memories_created += 1;
         }
 
+        // P0: after promoting, register any semantic (fact-slot) conflicts the
+        // new Active memories create with existing ones (e.g. two different
+        // stored names) so contradictory units never silently coexist.
+        let _ = self.ensure_slot_conflicts(MAX_PROMOTIONS_PER_RUN);
+
         Ok(report)
     }
 }
 
-fn compose_memory_content(evs: &[EvidenceUnit], kind: MemoryKind) -> String {
-    if evs.is_empty() { return String::new(); }
-    let main = &evs[0].content;
-    let mut out = String::new();
-    let kind_label = match kind {
-        MemoryKind::Preference => "[Stable Preference]",
-        MemoryKind::Decision => "[Stable Decision]",
-        MemoryKind::Constraint => "[Stable Constraint]",
-        MemoryKind::Solution => "[Stable Solution]",
-        MemoryKind::Fact => "[Stable Fact]",
-    };
-    out.push_str(kind_label);
-    out.push('\n');
-    out.push_str(main);
-    out.push_str("\n\n");
-    out.push_str(&format!(
-        "Confirmed across {} historical sessions ({} distinct). Sources:",
-        evs.len(),
-        evs.iter()
-            .map(|e| e.rollout_id.as_str())
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-    ));
-    out.push('\n');
-    for (i, e) in evs.iter().enumerate().take(8) {
-        out.push_str(&format!(
-            "  [{}] session {} ({})",
-            i,
-            &e.rollout_id[..std::cmp::min(8, e.rollout_id.len())],
-            e.occurred_at.format("%Y-%m-%d"),
-        ));
-        out.push('\n');
-    }
-    out
+fn compose_memory_content(evs: &[EvidenceUnit], _kind: MemoryKind) -> String {
+    // Store ONLY the clean factual content. The "[Stable …] / Confirmed across
+    // … / Sources:" display boilerplate used to leak verbatim into the unit,
+    // polluting what gets retrieved & injected. Provenance already lives in
+    // memory_evidence_edges / memory_units.source_* columns.
+    evs.first()
+        .map(|e| e.content.trim().to_string())
+        .unwrap_or_default()
 }
 
 fn compose_memory_section(evs: &[EvidenceUnit]) -> String {
@@ -266,7 +254,8 @@ fn decide_memory_kind(evs: &[EvidenceUnit]) -> MemoryKind {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for e in evs {
         let sec = e.section.as_str();
-        let hint = if sec.contains("用户问题") || sec.contains("偏好") || sec.contains("preference") {
+        // 用户问题 section 不再映射成 preference——纯提问绝不能当稳定偏好。
+        let hint = if sec.contains("用户偏好") || sec.contains("偏好") || sec.contains("preference") {
             "preference"
         } else if sec.contains("修复") || sec.contains("fix") || sec.contains("solution") {
             "solution"
@@ -383,10 +372,10 @@ fn group_evidence_by_normalized_content(
     groups.into_iter().collect()
 }
 
-/// W3 Preference 兜底：当 group 内任一 UserQuestion evidence 的 content
-/// 命中「叫我/记住我/我是/我叫/我喜欢/my name is / call me / remember (that)?」
-/// 等模式，即可把门槛从 MIN_OCCURRENCES=2 降到 1，并强制 kind=Preference、
-/// scope=Global。
+/// W3 Preference 兜底：当 group 内任一 evidence 的 content 命中
+/// 「叫我/记住我/我的名字是/我叫/我的X是/call me/remember (that)?/my name is」
+/// 等模式（且不是闲聊/提问句式），即可把门槛从 MIN_OCCURRENCES=2 降到 1，
+/// 并强制 kind=Preference、scope=Global。
 fn is_preference_pattern(evs: &[EvidenceUnit]) -> bool {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -396,7 +385,9 @@ fn is_preference_pattern(evs: &[EvidenceUnit]) -> bool {
         let pats: &[&str] = &[
             // 中文称呼
             r"(?im)^\s*(以后|之后)?\s*请?(把我|叫我|喊我|称呼我)\s*(做|为)?\s*[:：]?\s*.+",
-            r"(?im)^\s*(我叫|我的名字是|我是)\s*(做|为)?\s*[:：]?\s*\S+",
+            // 自称/命名：保留「我叫/我的名字是」，去掉宽泛的「我是」(会误吞
+            // “我是说…先给我端prompt…”这类普通叙述)。
+            r"(?im)^\s*(我叫|我的名字是)\s*(做|为)?\s*[:：]?\s*\S+",
             // 中文记住 + 喜欢/不喜欢
             r"(?im)^\s*(请?|麻烦|劳烦)?\s*记住?我(喜欢|偏好|比较?喜欢|更爱|最爱|不喜欢|讨厌|反感)\s*[:：]?\s*.+",
             // 我的 XX 是 XX
@@ -419,13 +410,24 @@ fn is_preference_pattern(evs: &[EvidenceUnit]) -> bool {
         }
     });
     evs.iter().any(|e| {
-        // 限定 UserQuestion / preference section 或 content 命中即可
+        // 限定 UserQuestion / preference section 或 content 命中即可，
+        // 且剔除闲聊/提问句式（“我叫什么名字你知道吗”“你是什么模型”等）。
+        // 共用 database::is_chat_noise（保留“可以叫我Tom/记住我叫iker吗”这类
+        // 带偏好/身份线索的真实句），并单独拒绝“我叫什么…?”这类提问身份行。
         (e.section.contains("用户问题")
             || e.section.contains("用户偏好")
             || e.section.contains("preference")
             || e.section.contains("question"))
+            && !crate::database::identity_value_is_question(&e.content)
+            && !crate::database::is_chat_noise(&e.content)
             && re.is_match(&e.content)
     })
+}
+
+/// Evidence section 是否属于“用户提问”类。
+fn is_user_question_section(section: &str) -> bool {
+    let l = section.to_lowercase();
+    l.contains("用户问题") || l.contains("question")
 }
 
 #[cfg(test)]
@@ -590,11 +592,11 @@ mod tests {
 
     #[test]
     fn consolidation_promotes_two_identical_evidences_after_min_drop() {
-        // P1(W3) MIN_OCCURRENCES 从 3 → 2：之前这个用例断言不 promote，
-        // 现在断言一定会 promote，以守住新阈值语义。
+        // P1(W3) MIN_OCCURRENCES 从 3 → 2：两个重复的“偏好陈述”应提升。
+        // 注意 section 用「用户偏好」——纯「用户问题」重复不再提升（见下例）。
         let db = make_db();
-        insert_evidence(&db, "same content", "r1", "用户问题");
-        insert_evidence(&db, "same content", "r2", "用户问题");
+        insert_evidence(&db, "用户偏好深色主题", "r1", "用户偏好");
+        insert_evidence(&db, "用户偏好深色主题", "r2", "用户偏好");
 
         let rpt = db.run_consolidation_pass().unwrap();
         assert_eq!(rpt.memories_created, 1);
@@ -604,13 +606,43 @@ mod tests {
     #[test]
     fn consolidation_is_idempotent() {
         let db = make_db();
-        insert_evidence(&db, "重复三次", "r1", "用户问题");
-        insert_evidence(&db, "重复三次", "r2", "用户问题");
-        insert_evidence(&db, "重复三次", "r3", "用户问题");
+        insert_evidence(&db, "用户偏好深色主题", "r1", "用户偏好");
+        insert_evidence(&db, "用户偏好深色主题", "r2", "用户偏好");
+        insert_evidence(&db, "用户偏好深色主题", "r3", "用户偏好");
 
         let r1 = db.run_consolidation_pass().unwrap();
         let r2 = db.run_consolidation_pass().unwrap();
         assert_eq!(r1.memories_created, 1);
         assert_eq!(r2.memories_created, 0, "idempotent second pass must not re-promote");
+    }
+
+    #[test]
+    fn consolidation_never_promotes_user_question_echoes() {
+        // 关键回归：仅由「用户问题」构成的组（即便重复 ≥2 次、内容不带提问词）
+        // 也不得提升成长期记忆——这正是历史上产生“继续/你是什么模型/我叫什么
+        // 名字你知道吗”噪音的路径。
+        let db = make_db();
+        insert_evidence(&db, "重复的用户提问文本", "r1", "用户问题");
+        insert_evidence(&db, "重复的用户提问文本", "r2", "用户问题");
+
+        let rpt = db.run_consolidation_pass().unwrap();
+        assert_eq!(rpt.memories_created, 0);
+        assert_eq!(rpt.evidence_superseded, 0);
+    }
+
+    #[test]
+    fn preference_fallback_rejects_question_like_identity_lines() {
+        // “我叫什么名字你知道吗”是提问，不该作为真实身份偏好提升；
+        // “我叫iker”才是有效身份陈述。
+        let db = make_db();
+        insert_evidence(&db, "我叫什么名字你知道吗", "r1", "用户问题");
+        insert_evidence(&db, "我叫iker", "r2", "用户问题");
+
+        let rpt = db.run_consolidation_pass().unwrap();
+        // 只有 "我叫iker"（非提问、命中偏好模式）会被提升。
+        assert_eq!(rpt.memories_created, 1);
+        let units = db.list_memory_units(crate::types::UnitStatus::Active).unwrap();
+        assert!(units.iter().any(|u| u.content.contains("iker")));
+        assert!(!units.iter().any(|u| u.content.contains("什么名字")));
     }
 }

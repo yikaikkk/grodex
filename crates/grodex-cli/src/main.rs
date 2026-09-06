@@ -653,6 +653,7 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
         }
         LoopSessionEvent::SubagentProgress(p) => {
             // Flatten the structured loop event into the ACP wire form.
+            eprintln!("[serve] SubagentProgress reached ACP mapper");
             let (id, label, phase, detail, ok) = match p {
                 grodex_loop::delegate_tool::SubagentProgress::Started {
                     id,

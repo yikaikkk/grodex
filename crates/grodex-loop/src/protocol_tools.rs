@@ -123,7 +123,21 @@ impl ProtocolToolHost {
         label: &str,
         task_id: &str,
     ) -> Result<DelegateChildLink, String> {
-        let agent_id = self.spawn_child(label)?;
+        // Deadlock avoidance: delegate_task can run while the parent turn
+        // already holds the CollaborationProtocol lock (blocking spawn_child's
+        // `.lock()`). Use try_lock so we fail fast instead of wedging the
+        // whole turn; on contention the child simply runs WITHOUT tree
+        // registration (no interrupt/list, but it still completes).
+        let mut p = match self.protocol.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return Err("CollaborationProtocol lock busy — skip child registration".into())
+            }
+        };
+        let agent_id = p.manager_mut().register_node(self.caller, label)?;
+        p.router_mut().register(agent_id);
+        drop(p);
+
         let entry = DelegateChildEntry {
             task_id: task_id.to_string(),
             label: label.to_string(),
@@ -131,31 +145,20 @@ impl ProtocolToolHost {
             finished: Arc::new(AtomicBool::new(false)),
             interrupted: Arc::new(AtomicBool::new(false)),
         };
-        self.delegate_children.lock().unwrap().insert(agent_id, entry);
-        Ok(DelegateChildLink {
+        let mut map = match self.delegate_children.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return Err("delegate_children lock busy — skip child registration".into())
+            }
+        };
+        let link = DelegateChildLink {
             agent_id,
-            finished: self
-                .delegate_children
-                .lock()
-                .unwrap()
-                .get(&agent_id)
-                .map(|e| e.finished.clone())
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-            interrupted: self
-                .delegate_children
-                .lock()
-                .unwrap()
-                .get(&agent_id)
-                .map(|e| e.interrupted.clone())
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-            cancel: self
-                .delegate_children
-                .lock()
-                .unwrap()
-                .get(&agent_id)
-                .map(|e| e.cancel.clone())
-                .unwrap_or_else(tokio_util::sync::CancellationToken::new),
-        })
+            finished: entry.finished.clone(),
+            interrupted: entry.interrupted.clone(),
+            cancel: entry.cancel.clone(),
+        };
+        map.insert(link.agent_id, entry);
+        Ok(link)
     }
 
     /// Mark a delegate child finished (ok=true → completed, false → failed).

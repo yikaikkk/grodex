@@ -263,12 +263,19 @@ fn extract_single_session(
                     .get("text")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if text.trim().is_empty() { continue; }
+                let t = text.trim();
+                // A1: 低信号闲聊/提问（"继续 / 你是什么模型 / 好的"…）不再作为
+                // 「用户问题」证据入库——这正是历史上把聊天回声提升成长期偏好的
+                // 一大来源。判定与提升层共用 database::is_chat_noise（带
+                // 偏好/身份线索的真实句 "可以叫我Tom/以后我喜欢深色" 会保留）。
+                if t.is_empty() || crate::database::is_chat_noise(t) {
+                    continue;
+                }
                 if let Some(eu) = build_evidence(
                     rollout_id,
                     journal,
                     "用户问题",
-                    text,
+                    t,
                     MemoryScope::Workspace,
                     occurred,
                 ) {
@@ -566,5 +573,48 @@ mod tests {
         let db = MemoryDatabase::open_in_memory().unwrap();
         let n = db.extract_evidence_from_session("test_user_input", &journal).unwrap();
         assert_eq!(n, 1, "UserInputAccepted should produce 1 evidence unit");
+    }
+
+    /// A1: 低信号闲聊/提问（"继续"、"你是什么模型？"）不应入库。
+    #[test]
+    fn low_signal_user_lines_produce_no_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = write_rollout(tmp.path(), &[
+            mk_event("UserInputAccepted", serde_json::json!({"text": "继续"})),
+            mk_event("UserInputAccepted", serde_json::json!({"text": "你是什么模型？"})),
+            mk_event("UserInputAccepted", serde_json::json!({"text": "好的"})),
+        ]);
+
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let n = db.extract_evidence_from_session("test_low_signal", &journal).unwrap();
+        assert_eq!(n, 0, "低信号用户行不得生成 evidence");
+    }
+
+    /// A1: 真实偏好/身份句（"记住我叫iker"）仍必须入库，否则身份记忆断源。
+    #[test]
+    fn identity_statement_still_produces_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = write_rollout(tmp.path(), &[
+            mk_event("UserInputAccepted", serde_json::json!({"text": "记住我叫iker"})),
+        ]);
+
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let n = db.extract_evidence_from_session("test_identity", &journal).unwrap();
+        assert_eq!(n, 1, "身份偏好句仍应生成 evidence");
+    }
+
+    /// 客套/口语化的身份句（"好的，以后叫我阿祖"/"可以叫我Tom"）也必须保留。
+    #[test]
+    fn polite_identity_lines_are_not_chat_noise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = write_rollout(tmp.path(), &[
+            mk_event("UserInputAccepted", serde_json::json!({"text": "好的，以后叫我阿祖"})),
+            mk_event("UserInputAccepted", serde_json::json!({"text": "可以叫我Tom"})),
+            mk_event("UserInputAccepted", serde_json::json!({"text": "记住我叫iker吗？"})),
+        ]);
+
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let n = db.extract_evidence_from_session("test_polite_identity", &journal).unwrap();
+        assert_eq!(n, 3, "客套/带问号的身份句不应被当闲聊滤掉");
     }
 }

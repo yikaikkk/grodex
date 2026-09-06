@@ -567,9 +567,97 @@ impl MemoryRetriever {
         });
         results.truncate(self.config.memory_quota);
 
+        // P1: identity-slot recall — direct answers for "我的名字是什么 /
+        // 你叫什么" style queries. Literal FTS + the ceil(n/2) coverage gate
+        // can't connect "记住我叫 ikkk" (stored) with "名字是什么" (asked)
+        // because they barely share characters. When the query looks like an
+        // identity/name question we also surface any ACTIVE memory that holds
+        // a clean name slot, ranked ahead of generic hits.
+        let mut augmented = false;
+        if crate::database::looks_like_identity_query(user_input) {
+            // Respect the same scope/kind hints applied to FTS candidates above,
+            // so identity recall never resurrects a unit the intent filtered out.
+            let (scope_hint, kind_hint) = filters.unwrap_or((None, None));
+
+            let mut active_names: Vec<RetrievalResult> = Vec::new();
+            let mut candidate_names: Vec<RetrievalResult> = Vec::new();
+
+            let mut consider = |u: &MemoryUnit, out: &mut Vec<RetrievalResult>| {
+                if let Some(want_scope) = scope_hint {
+                    if u.scope != want_scope {
+                        return;
+                    }
+                }
+                if let Some(want_kind) = kind_hint {
+                    if u.kind != want_kind {
+                        return;
+                    }
+                }
+                let Some((label, _value)) = crate::database::fact_slot_of(&u.content) else {
+                    return;
+                };
+                if label != "name" {
+                    return;
+                }
+                out.push(RetrievalResult {
+                    unit_id: u.id.clone(),
+                    path: u.path.clone(),
+                    content: u.content.clone(),
+                    section: String::new(),
+                    memory_kind: None,
+                    updated_at: Some(u.updated_at),
+                    rollout_id: String::new(),
+                    superseded_by: None,
+                    occurred_at: None,
+                    bm25_score: 0.0,
+                    term_coverage: usize::MAX,
+                    total_terms: 1,
+                    source: ResultSource::Memory,
+                });
+            };
+
+            if let Ok(a) = self.db.list_memory_units(UnitStatus::Active) {
+                for u in &a {
+                    consider(u, &mut active_names);
+                }
+            }
+            if let Ok(c) = self.db.list_memory_units(UnitStatus::Candidate) {
+                for u in &c {
+                    consider(u, &mut candidate_names);
+                }
+            }
+
+            // Prefer confirmed Active names; only fall back to (unreviewed)
+            // candidate names when there is no Active answer yet.
+            let mut extra = if active_names.is_empty() {
+                candidate_names
+            } else {
+                active_names
+            };
+            if !extra.is_empty() {
+                let seen: std::collections::HashSet<String> =
+                    results.iter().map(|r| r.unit_id.clone()).collect();
+                extra.retain(|r| !seen.contains(&r.unit_id));
+                // name-slot answers go first (stable prepend), then cap.
+                extra.extend(results);
+                results = extra;
+                results.truncate(self.config.memory_quota);
+                augmented = true;
+            }
+        }
+
         // P1-1: bump access counters for the truncated top-K.
         for r in &results {
             let _ = self.db.record_memory_access(&r.unit_id);
+        }
+
+        let mut reason_codes = if results.is_empty() {
+            vec!["no_qualified_memory".to_string()]
+        } else {
+            Vec::new()
+        };
+        if augmented {
+            reason_codes.push("identity_augmented".into());
         }
 
         let diagnostics = RetrievalDiagnostics {
@@ -579,11 +667,7 @@ impl MemoryRetriever {
             qualified_count: results.len(),
             returned_count: results.len(),
             index_generation: index_gen,
-            reason_codes: if results.is_empty() {
-                vec!["no_qualified_memory".to_string()]
-            } else {
-                Vec::new()
-            },
+            reason_codes,
         };
 
         (results, diagnostics)
@@ -1105,10 +1189,65 @@ mod tests {
 
         let retriever = EvidenceRetriever::new(db, RetrievalConfig::default());
         let (results, _) = retriever.retrieve("cargo build failed", false);
-        assert!(results.is_empty(), "superseded evidence should be excluded");
+        assert!(results.is_empty(), "superseded evidence should be excluded by default");
 
+        // History/evolution queries opt in to superseded evidence.
         let (results_with, _) = retriever.retrieve("cargo build failed", true);
-        assert!(!results_with.is_empty(), "superseded evidence should be included when requested");
+        assert!(!results_with.is_empty(), "include_superseded must surface superseded evidence");
+    }
+
+    #[test]
+    fn memory_retriever_identity_recall_finds_name_despite_coverage() {
+        // "我的名字是什么" shares almost no chars with "记住我叫iker", so plain
+        // FTS + coverage gate would miss it. Identity-slot recall must surface it.
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        db.upsert_memory_unit(&MemoryUnit {
+            id: "mem_name".to_string(),
+            path: "MEMORY.md".to_string(),
+            section: "#pref".to_string(),
+            kind: MemoryKind::Preference,
+            scope: MemoryScope::Global,
+            status: UnitStatus::Active,
+            content: "记住我叫iker".to_string(),
+            content_hash: "h_name".to_string(),
+            updated_at: Utc::now(),
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        let retriever = MemoryRetriever::new(db, RetrievalConfig::default());
+        let (results, _diag) = retriever.retrieve("我的名字是什么");
+        assert!(
+            results.iter().any(|r| r.content.contains("iker")),
+            "identity recall should surface the stored name; got: {results:?}"
+        );
+    }
+
+    #[test]
+    fn memory_retriever_identity_recall_reads_candidate_names() {
+        // C4: a told name stored as `candidate` must still be usable by
+        // retrieval (not sit invisible until promoted).
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        db.upsert_memory_unit(&MemoryUnit {
+            id: "mem_cand_bob".to_string(),
+            path: "MEMORY.md".to_string(),
+            section: "#pref".to_string(),
+            kind: MemoryKind::Preference,
+            scope: MemoryScope::Global,
+            status: UnitStatus::Candidate,
+            content: "记住我叫bob".to_string(),
+            content_hash: "h_bob".to_string(),
+            updated_at: Utc::now(),
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        let retriever = MemoryRetriever::new(db, RetrievalConfig::default());
+        let (results, _diag) = retriever.retrieve("你叫什么名字");
+        assert!(
+            results.iter().any(|r| r.content.contains("bob")),
+            "candidate name should be retrievable; got: {results:?}"
+        );
     }
 
     #[test]

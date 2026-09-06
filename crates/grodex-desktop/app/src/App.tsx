@@ -17,6 +17,7 @@ import { AgentTreePanel } from './components/AgentTreePanel';
 import { ApprovalModal } from './components/ApprovalModal';
 import { SettingsModal } from './components/SettingsModal';
 import { EmptyState } from './components/EmptyState';
+import { MemoryManager } from './components/MemoryManager';
 import { AlertTriangle, RotateCcw, XCircle, Check, Loader2, Trash2 } from 'lucide-react';
 
 interface IndeterminateReq {
@@ -52,6 +53,7 @@ export default function App() {
   const [notice, setNotice] = useState<{ message: string; kind: string } | null>(null);
   const [isAgentTreeOpen, setIsAgentTreeOpen] = useState<boolean>(true);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+  const [isMemoryOpen, setIsMemoryOpen] = useState<boolean>(false);
   const [settings, setSettings] = useState<SettingsState>(makeDefaultSettings);
 
   // App-owned dialogs (window.confirm / window.prompt are unavailable in the
@@ -241,6 +243,7 @@ export default function App() {
     });
 
     const unsubSubagent = eventBus.on('subagentUpdate', (node: SubAgentNode) => {
+      console.debug('[app] subagentUpdate', node.id, node.status, node.logs?.length);
       setSubagents((prev) => {
         const existingIdx = prev.findIndex((s) => s.id === node.id);
         if (existingIdx >= 0) {
@@ -336,31 +339,20 @@ export default function App() {
       await acp.init();
       const cfg = await acp.loadConfig();
       if (!cancelled) setSettings(cfg);
+      // Remove phantom (empty boot) sessions so merely opening the app never
+      // leaves a "session created with no conversation".
+      await acp.purgeEmptySessions();
       const list = await acp.listSessions();
       if (cancelled) return;
       setSessions(list);
       const first = list[0];
       if (first) {
+        // Just select the most recent session — do NOT spawn `grodex serve`
+        // yet. A process (and its boot session dir) is only created lazily on
+        // the first real send / when the user explicitly opens a session.
         const ws = first.workspace || '';
         setWorkspace(ws);
         setActiveSessionId(first.id);
-        if (ws) {
-          // Spawn the agent process bound to this workspace first; only then
-          // can we ResumeSession into the most recent journal.
-          try {
-            await acp.ensureAgent(ws);
-          } catch (e: any) {
-            showNotice(`无法启动 grodex serve：${e?.message || e}`, 'error');
-            return;
-          }
-          try {
-            await acp.resumeSession(first.id);
-          } catch (e: any) {
-            showNotice(`打开最近会话失败：${e?.message || e}`, 'error');
-          }
-        } else {
-          showNotice('点击「新建任务」选择工作目录以开始。');
-        }
       } else {
         showNotice('没有找到历史会话。点击「新建任务」选择一个工作目录开始。');
       }
@@ -464,9 +456,33 @@ export default function App() {
   };
 
   const handleSendPrompt = async (text: string) => {
+    // No session yet → create one on the first real message only.
     if (!activeSessionId) {
       const ok = await prepareSessionForTurn();
       if (!ok) return;
+    }
+    const boundToActive = acp.currentSessionId() === activeSessionId;
+    if (!boundToActive) {
+      // A historical/just-selected session: make sure a live process exists,
+      // then bind it to this session (resume/rebind) BEFORE sending — so a
+      // message continues THIS conversation, never creates a fresh one.
+      if (isRunning) await acp.stop();
+      const target = sessions.find((s) => s.id === activeSessionId);
+      const cwd = target?.workspace || workspace;
+      if (cwd) {
+        try {
+          await acp.ensureAgent(cwd);
+        } catch (e: any) {
+          showNotice(`启动 agent 失败：${e?.message || e}`, 'error');
+          return;
+        }
+      }
+      try {
+        await acp.resumeSession(activeSessionId);
+      } catch (e: any) {
+        showNotice(`打开会话失败：${e?.message || e}`, 'error');
+        return;
+      }
     }
     try {
       await acp.sendPrompt(text);
@@ -557,6 +573,7 @@ export default function App() {
         onToggleAgentTree={() => setIsAgentTreeOpen(!isAgentTreeOpen)}
         isAgentTreeOpen={isAgentTreeOpen}
         onOpenSettings={() => setIsSettingsOpen(true)}
+        onOpenMemory={() => setIsMemoryOpen(true)}
       />
 
       {/* Transient banners (compaction / notices) */}
@@ -796,6 +813,12 @@ export default function App() {
           }}
         />
       )}
+
+      {/* Memory management panel */}
+      <MemoryManager
+        isOpen={isMemoryOpen}
+        onClose={() => setIsMemoryOpen(false)}
+      />
     </div>
   );
 }

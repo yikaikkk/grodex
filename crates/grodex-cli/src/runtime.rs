@@ -10,7 +10,7 @@
 //!   7. RolloutWriter   (FileRolloutStore, shared by supervisor + coordinator)
 //!   8. PromptProvider   (assembled per-turn inside supervisor.start_turn;
 //!                        memory retriever injected for RAG context)
-//!   9. MemoryProvider   (LegacyRetriever over MemoryStore)
+//!   9. MemoryProvider   (V2 MemoryDatabase retrieval — see memory_snapshot.rs)
 //!
 //! Before this module existed, `build_session_parts` (CLI chat), the resume
 //! path and `serve_acp` each re-implemented the wiring — and several
@@ -1331,6 +1331,7 @@ impl SessionRuntimeBuilder {
                     msg = subagent_progress_rx.recv() => {
                         match msg {
                             Some(progress) => {
+                                eprintln!("[fwd] subagent progress -> broadcast");
                                 let ev = LoopSessionEvent::SubagentProgress(progress);
                                 if event_broadcast_tx.send(ev).await.is_err() {
                                     break;

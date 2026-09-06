@@ -65,6 +65,9 @@ fn summarize_journal(journal: &PathBuf, id: &str) -> Option<RawSession> {
     let mut meta: Option<(String, String, String)> = None; // (cwd, model, provider)
     let mut created_at: Option<String> = None;
     let mut first_user_text: Option<String> = None;
+    // A fresh `grodex serve` writes only a `SessionStarted` line at boot, even
+    // with no conversation. Such phantom dirs must not appear in the task list.
+    let mut has_content = false;
 
     for (i, line) in reader.lines().enumerate() {
         if i >= SCAN_LIMIT {
@@ -81,6 +84,15 @@ fn summarize_journal(journal: &PathBuf, id: &str) -> Option<RawSession> {
         let Some(et) = v.get("event_type").and_then(|x| x.as_str()) else {
             continue;
         };
+        if matches!(
+            et,
+            "UserInputAccepted"
+                | "ModelItemProduced"
+                | "ToolExecutionStarted"
+                | "ToolResultCommitted"
+        ) {
+            has_content = true;
+        }
         if created_at.is_none() {
             created_at = v
                 .get("timestamp")
@@ -122,6 +134,11 @@ fn summarize_journal(journal: &PathBuf, id: &str) -> Option<RawSession> {
         .unwrap_or_else(|| format!("会话 {}", &id[..id.len().min(8)]));
     let preview = user_text.chars().take(180).collect::<String>();
 
+    if !has_content {
+        // SessionStarted-only journal = an empty boot session with no chat.
+        return None;
+    }
+
     let mtime = std::fs::metadata(journal).and_then(|m| m.modified()).ok();
 
     Some(RawSession {
@@ -142,6 +159,36 @@ fn summarize_journal(journal: &PathBuf, id: &str) -> Option<RawSession> {
 
 fn first_line(text: &str) -> Option<&str> {
     text.lines().map(|l| l.trim()).find(|l| !l.is_empty())
+}
+
+/// Remove session dirs that only contain an empty/SessionStarted-only journal
+/// (phantom dirs left by a `grodex serve` boot that never saw a conversation).
+/// Returns how many were removed.
+pub fn purge_empty_sessions() -> usize {
+    let root = sessions_dir();
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in rd.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let journal = dir.join("rollout.jsonl");
+        let empty = match std::fs::metadata(&journal) {
+            Ok(m) if m.len() == 0 => true,
+            Ok(_) => false,
+            Err(_) => false, // no journal yet — leave it
+        };
+        let no_content = !empty && summarize_journal(&journal, "x").is_none();
+        if empty || no_content {
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 pub fn list_sessions() -> Vec<SessionSummary> {

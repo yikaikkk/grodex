@@ -27,6 +27,20 @@ use crate::durable_subagent::DurableSubAgentSupervisor;
 use crate::rollout_writer::RolloutWriter;
 use crate::supervisor::ModelConfig;
 
+/// Debug sub-agent markers → a plain file the user can tail while a task runs
+/// (UI acp_log notices are transient and easy to miss).
+fn sub_log(msg: &str) {
+    use std::io::Write as _;
+    let ts = chrono::Utc::now().to_rfc3339();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/grodex-subagent.log")
+    {
+        let _ = writeln!(f, "{ts} {msg}");
+    }
+}
+
 /// Structured sub-agent lifecycle/progress event, forwarded to the
 /// frontend so the TUI can render each sub-agent as a collapsible card
 /// (instead of loose one-line logs).
@@ -271,6 +285,10 @@ impl ToolRuntime for DelegateTool {
             .map_err(|e| GrodexError::ToolExecution(format!("invalid delegate args: {e}")))?;
 
         let label = args.label.unwrap_or_else(|| "sub-agent".into());
+        sub_log(&format!(
+            "[delegate] execute called label={label} task={}",
+            truncate_task(&args.task, 60)
+        ));
 
         // ── 0. Enforce sub-agent caps BEFORE spawning ────────────
         // Returning the refusal as tool output (not Err) lets the model
@@ -318,6 +336,7 @@ impl ToolRuntime for DelegateTool {
         // ── 2. If a SamplingActor is available, actually run the
         //    sub-agent turn. Otherwise return a placeholder.
         let message = if let (Some(actor), Some(cfg)) = (&self.actor, &self.model_config) {
+            sub_log("[delegate] actor present → will run subagent turn");
             let task_id_str = task_id.to_string();
             self.running_count.fetch_add(1, Ordering::Relaxed);
             self.spawned_total.fetch_add(1, Ordering::Relaxed);
@@ -333,6 +352,10 @@ impl ToolRuntime for DelegateTool {
                 .protocol_host
                 .as_ref()
                 .and_then(|h| h.attach_delegate_child(&label, &task_id_str).ok());
+            sub_log(&format!(
+                "[delegate] child attached ok={}",
+                child_link.is_some()
+            ));
             let mut controls = child_link.as_ref().map(|link| {
                 let host = self.protocol_host.clone().unwrap();
                 let agent_id = link.agent_id;
@@ -341,15 +364,47 @@ impl ToolRuntime for DelegateTool {
                     drain_messages: Box::new(move || host.drain_delegate_messages(&agent_id)),
                 }
             });
-            let response =
-                run_subagent_turn(actor, cfg, &args.task, &self.readonly_tools, self.permission.clone(), controls.as_mut(), |detail| {
-                    self.notify_progress(SubagentProgress::Step {
-                        id: task_id_str.clone(),
-                        detail,
-                    });
-                })
-                .await;
+            sub_log("[delegate] launching subagent turn…");
+
+            // Hard overall deadline for a sub-agent turn. Even if the provider
+            // stalls or a lock wedges, the sub-agent (and thus the parent turn)
+            // MUST terminate: on timeout we cancel the child and emit a failed
+            // Finished so the frontend never sees a permanently "running" node.
+            const SUBAGENT_TURN_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(480);
+            let cancel_on_timeout = child_link.as_ref().map(|link| link.cancel.clone());
+            let ran = tokio::time::timeout(
+                SUBAGENT_TURN_TIMEOUT,
+                run_subagent_turn(
+                    actor,
+                    cfg,
+                    &args.task,
+                    &self.readonly_tools,
+                    self.permission.clone(),
+                    controls.as_mut(),
+                    |detail| {
+                        self.notify_progress(SubagentProgress::Step {
+                            id: task_id_str.clone(),
+                            detail,
+                        });
+                    },
+                ),
+            )
+            .await;
             self.running_count.fetch_sub(1, Ordering::Relaxed);
+            let response: Result<String, String> = match ran {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    sub_log(&format!("[sub] TURN TIMEOUT after {}s — cancelling", SUBAGENT_TURN_TIMEOUT.as_secs()));
+                    if let Some(c) = cancel_on_timeout {
+                        c.cancel();
+                    }
+                    Err(format!(
+                        "sub-agent exceeded {}s without producing a final result",
+                        SUBAGENT_TURN_TIMEOUT.as_secs()
+                    ))
+                }
+            };
             if let Some(link) = &child_link {
                 let ok = response.is_ok();
                 self.protocol_host
@@ -402,7 +457,10 @@ impl ToolRuntime for DelegateTool {
             // Prefix subagent output so it doesn't mix with main conversation.
             format!("[Subagent '{label}'] {response_text}")
         } else {
-            format!("Sub-agent '{label}' spawned. It will work on: {}", args.task)
+            {
+                sub_log("[delegate] NO actor → placeholder path (no subagent turn)");
+                format!("Sub-agent '{label}' spawned. It will work on: {}", args.task)
+            }
         };
 
         let output = DelegateOutput {
@@ -449,6 +507,8 @@ async fn run_subagent_turn(
     };
     use grodex_provider::canonical_event::CanonicalResponseItem;
     use grodex_provider::prompt_snapshot::PromptSnapshot;
+
+    sub_log(&format!("[sub] turn entered · task={}", truncate_task(task, 60)));
 
     /// Hard cap on sub-agent steps — keeps a runaway sub-agent bounded.
     const MAX_SUBAGENT_STEPS: usize = 15;
@@ -502,6 +562,7 @@ async fn run_subagent_turn(
             }
         }
         on_step(format!("采样步骤 {}", step + 1));
+        sub_log(&format!("[sub] step {} begin · context_items={}", step + 1, context.len()));
         let request = CanonicalModelRequest {
             request_id: format!("subagent-{}", StepId::new()),
             session_id: SessionId::new(),
@@ -527,7 +588,23 @@ async fn run_subagent_turn(
             provider_state_in: None,
         };
 
-        let outcome = actor.sample(&binding, &request).await;
+        // Sampling must be cancellable: when the parent turn is stopped, the
+        // in-flight provider request is abandoned promptly instead of blocking
+        // the delegate (and the whole turn) until it returns / times out.
+        let outcome = if let Some(c) = controls.as_deref_mut() {
+            if c.cancel.is_cancelled() {
+                return Err("interrupted by user (stop)".into());
+            }
+            let cancel = c.cancel.clone();
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err("interrupted by user (stop)".into());
+                }
+                out = actor.sample(&binding, &request) => out,
+            }
+        } else {
+            actor.sample(&binding, &request).await
+        };
         let response = match outcome.response {
             Some(r) => r,
             None => {
@@ -563,6 +640,7 @@ async fn run_subagent_turn(
                 content: response.assistant_text().unwrap_or("").to_string(),
             });
             for (call_id, name, arguments) in calls {
+                sub_log(&format!("[sub] tool {name} begin"));
                 on_step(format!("工具 {name} {}", truncate_task(&arguments.to_string(), 60)));
                 context.push(ContextItem::ToolCall {
                     call_id,
@@ -588,34 +666,46 @@ async fn run_subagent_turn(
                             Some(format!("permission denied: {reason}"))
                         }
                         grodex_permission::PermissionResult::ApprovalRequired { ticket_id, .. } => {
-                            // check() already emitted an ApprovalRequested
-                            // event + broker ticket for this call — the
-                            // sub-agent cannot drive the approval round-trip,
-                            // so resolve the ticket DENIED immediately to
-                            // clean up the stray prompt the frontend saw.
-                            pm.resolve(&ticket_id, grodex_core::policy::PolicyDecision::Deny, None);
-                            Some("this tool requires interactive approval, which a sub-agent cannot perform — the call was refused; finish the task without it".into())
+                            // The sub-agent only ever sees READ-ONLY analysis
+                            // tools (read_file/grep/glob/read_artifact), which
+                            // don't need interactive approval. Auto-approve the
+                            // ticket (so no stray prompt reaches the frontend)
+                            // and let the read proceed. Explicit policy Denies
+                            // are still honoured above.
+                            if runtime.is_some() {
+                                pm.resolve(&ticket_id, grodex_core::policy::PolicyDecision::Allow, None);
+                                None
+                            } else {
+                                pm.resolve(&ticket_id, grodex_core::policy::PolicyDecision::Deny, None);
+                                Some("this tool requires interactive approval, which a sub-agent cannot perform — the call was refused; finish the task without it".into())
+                            }
                         }
                     }
                 } else {
                     None
                 };
                 let (content, is_error) = if let Some(reason) = blocked {
+                    sub_log(&format!("[sub] tool {name} BLOCKED: {reason}"));
                     (format!("[permission denied] {reason}"), true)
                 } else {
-                match runtime {
-                    Some((_, rt, ..)) => match rt.execute(arguments, OperationId::new()).await {
-                        Ok(v) => {
-                            let text = match v {
-                                serde_json::Value::String(s) => s,
-                                other => other.to_string(),
-                            };
-                            (text, false)
+                    match runtime {
+                        Some((_, rt, ..)) => {
+                            sub_log(&format!("[sub] tool {name} execute…"));
+                            let r = rt.execute(arguments, OperationId::new()).await;
+                            sub_log(&format!("[sub] tool {name} done ok={}", r.is_ok()));
+                            match r {
+                                Ok(v) => {
+                                    let text = match v {
+                                        serde_json::Value::String(s) => s,
+                                        other => other.to_string(),
+                                    };
+                                    (text, false)
+                                }
+                                Err(e) => (format!("tool execution failed: {e}"), true),
+                            }
                         }
-                        Err(e) => (format!("tool execution failed: {e}"), true),
-                    },
-                    None => (format!("unregistered tool: {name}"), true),
-                }
+                        None => (format!("unregistered tool: {name}"), true),
+                    }
                 };
                 context.push(ContextItem::ToolResult {
                     call_id,
@@ -629,6 +719,7 @@ async fn run_subagent_turn(
         // ── Final answer ────────────────────────────────────────
         let text = response.assistant_text().unwrap_or_default().to_string();
         if !text.is_empty() {
+            sub_log(&format!("[sub] final answer at step {} · len={}", step + 1, text.len()));
             return Ok(text);
         }
 

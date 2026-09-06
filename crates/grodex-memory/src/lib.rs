@@ -26,9 +26,6 @@
 //! | `negative_cache` | Session-level empty-result cache |
 //! | `eval` | Offline replay Eval harness + MemoryEvalCli (with_embedding_model for hybrid delta) |
 //! | `governance` | Conflict detection, rollout TTL expiry, stale-memory decay, embedding model rotation hooks |
-//! | `entry` | Legacy in-memory MemoryEntry (kept for backward compat) |
-//! | `store` | Legacy in-memory MemoryStore (with hybrid stubs) |
-//! | `retriever` | Legacy keyword retriever |
 
 // V2 modules
 pub mod backfill;
@@ -52,11 +49,6 @@ pub mod schema;
 pub mod static_context;
 pub mod template;
 pub mod types;
-
-// Legacy modules (kept for backward compatibility)
-pub mod entry;
-pub mod retriever;
-pub mod store;
 
 // V2 re-exports
 pub use backfill::{backfill_missing_embeddings, batch_chunks, is_backfill_possible};
@@ -106,8 +98,3 @@ pub use schema::{SCHEMA_VERSION, apply_schema, bump_index_generation, read_index
 pub use static_context::{StaticContext, StaticContextLoader};
 pub use template::{EvidenceMetadata, EvidenceTemplate, EvidenceValidation};
 pub use types::*;
-
-// Legacy re-exports
-pub use entry::MemoryEntry;
-pub use retriever::MemoryRetriever as LegacyRetriever;
-pub use store::MemoryStore;

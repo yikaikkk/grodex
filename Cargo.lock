@@ -1681,6 +1681,7 @@ dependencies = [
  "chrono",
  "dirs",
  "grodex-acp-client",
+ "grodex-memory",
  "grodex-protocol",
  "serde",
  "serde_json",

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::embedding::{cosine_similarity, EmbeddingVector};
@@ -317,6 +318,36 @@ impl MemoryDatabase {
              updated_at, created_at FROM memory_units WHERE status = ?1 ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map(params![status.as_str()], |row| {
+            Ok(MemoryUnit {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                section: row.get(2)?,
+                kind: MemoryKind::from_str(&row.get::<_, String>(3)?).unwrap_or(MemoryKind::Fact),
+                scope: MemoryScope::from_str(&row.get::<_, String>(4)?)
+                    .unwrap_or(MemoryScope::Workspace),
+                status: UnitStatus::from_str(&row.get::<_, String>(5)?)
+                    .unwrap_or(UnitStatus::Active),
+                content: row.get(6)?,
+                content_hash: row.get(7)?,
+                updated_at: parse_ts(&row.get::<_, String>(8)?),
+                created_at: parse_ts(&row.get::<_, String>(9)?),
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// List memory units of every status (for management UIs / audits).
+    pub fn list_all_memory_units(&self) -> Result<Vec<MemoryUnit>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, section, kind, scope, status, content, content_hash,
+             updated_at, created_at FROM memory_units ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
             Ok(MemoryUnit {
                 id: row.get(0)?,
                 path: row.get(1)?,
@@ -823,6 +854,11 @@ impl MemoryDatabase {
     }
 
     /// Execute an FTS5 query against the evidence_fts table.
+    ///
+    /// By default only `active` evidence is returned (superseded evidence is
+    /// the old side of a conflict/upgrade and must NOT resurface into normal
+    /// prompts). History/evolution queries set `include_superseded=true` (via
+    /// the Router) so the superseded side can be inspected deliberately.
     pub(crate) fn fts5_evidence_candidates(
         &self,
         fts_query: &str,
@@ -1194,6 +1230,48 @@ impl MemoryDatabase {
     ///   - emb=None / enabled=false / No API key → vec_list = []
     ///   - Embedding HTTP 超时/429/网络错误 → vec_list = []
     ///   - Vector store 表缺失 → vec_list = []
+    /// Name-slot boost for identity queries: ACTIVE name memories preferred,
+    /// `candidate` names as fallback (before governance promotes them).
+    fn name_slot_boost_results(&self) -> Vec<RetrievalResult> {
+        use crate::types::UnitStatus;
+        let to_result = |u: &MemoryUnit| RetrievalResult {
+            unit_id: u.id.clone(),
+            path: u.path.clone(),
+            content: u.content.clone(),
+            section: u.section.clone(),
+            memory_kind: Some(u.kind),
+            updated_at: Some(u.updated_at),
+            rollout_id: String::new(),
+            superseded_by: None,
+            occurred_at: None,
+            bm25_score: 0.0,
+            term_coverage: usize::MAX,
+            total_terms: 1,
+            source: ResultSource::Memory,
+        };
+
+        let mut active: Vec<RetrievalResult> = Vec::new();
+        let mut candidate: Vec<RetrievalResult> = Vec::new();
+        if let Ok(units) = self.list_memory_units(UnitStatus::Active) {
+            for u in units {
+                if fact_slot_of(&u.content).is_some_and(|(l, _)| l == "name") {
+                    active.push(to_result(&u));
+                }
+            }
+        }
+        if active.is_empty() {
+            if let Ok(units) = self.list_memory_units(UnitStatus::Candidate) {
+                for u in units {
+                    if fact_slot_of(&u.content).is_some_and(|(l, _)| l == "name") {
+                        candidate.push(to_result(&u));
+                    }
+                }
+            }
+            return candidate;
+        }
+        active
+    }
+
     pub async fn retrieve_hybrid_memory(
         &self,
         query: &str,
@@ -1225,7 +1303,25 @@ impl MemoryDatabase {
         };
 
         let fused = reciprocal_rank_fusion(&fts_ids, &vector_ids, top_k, 60.0);
-        let results = load_memory_results_in_order(self, &fused);
+        let mut results = load_memory_results_in_order(self, &fused);
+        // Identity-slot recall on the LIVE memory leg: "我的名字是什么" barely
+        // shares chars with stored "记住我叫iker", so pure FTS/hybrid misses
+        // it. When the query is a name question, prepend clean name-slot units
+        // (Active, else Candidate) before the quota cap.
+        if looks_like_identity_query(query) {
+            let extra = self.name_slot_boost_results();
+            if !extra.is_empty() {
+                let seen: std::collections::HashSet<&str> =
+                    results.iter().map(|r| r.unit_id.as_str()).collect();
+                let mut boosted: Vec<RetrievalResult> = extra
+                    .into_iter()
+                    .filter(|e| !seen.contains(e.unit_id.as_str()))
+                    .collect();
+                boosted.extend(results);
+                results = boosted;
+                results.truncate(top_k);
+            }
+        }
         // P1-1: count accesses for units that actually made it into the top-K
         // (not every candidate). Swallow errors — retrieval must never fail
         // open because of counter updates.
@@ -1865,6 +1961,296 @@ impl MemoryDatabase {
         }
         Ok(out)
     }
+
+    /// True if a conflict row already exists between two memories (either order).
+    pub(crate) fn has_conflict_between(&self, a: &str, b: &str) -> Result<bool, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_conflicts
+             WHERE (left_memory_id=?1 AND right_memory_id=?2)
+                OR (left_memory_id=?2 AND right_memory_id=?1)",
+            params![a, b],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Deterministic "fact-slot" conflict detection (P0).
+    ///
+    /// Groups ACTIVE memory units by `(kind, scope, slot-label)` — e.g. every
+    /// identity memory ("我叫iker"/"记住我叫ikkk") shares label `name` — then
+    /// records a pending `memory_conflicts` row whenever two units in the same
+    /// slot hold DIFFERENT values. Unlike the hash-prefix bucket in
+    /// `list_conflict_candidate_pairs`, this catches real semantic
+    /// contradictions (iker vs ikkk), not just near-duplicates.
+    pub(crate) fn ensure_slot_conflicts(&self, limit: usize) -> Result<usize, DbError> {
+        use std::collections::BTreeMap;
+        let units = self.list_memory_units(UnitStatus::Active)?;
+        let mut buckets: BTreeMap<(String, String, String), Vec<(String, chrono::DateTime<Utc>, String)>> =
+            BTreeMap::new();
+        for u in units {
+            let Some((label, value)) = fact_slot_of(&u.content) else {
+                continue;
+            };
+            let key = (u.kind.as_str().to_string(), u.scope.as_str().to_string(), label);
+            // Order by CREATED time (when the fact was told/stored), not the
+            // updated_at maintenance stamp — promotion/retrieval bumps later
+            // and would make an old fact look "newer" for newest-wins resolve.
+            buckets.entry(key).or_default().push((u.id.clone(), u.created_at, value));
+        }
+
+        let mut inserted = 0usize;
+        for (_key, mut group) in buckets {
+            group.sort_by_key(|(_, t, _)| *t); // oldest first
+            for i in 0..group.len() {
+                if inserted >= limit {
+                    return Ok(inserted);
+                }
+                for j in (i + 1)..group.len() {
+                    if group[i].2 == group[j].2 {
+                        continue; // same value — not a conflict
+                    }
+                    let (a, b) = (&group[i].0, &group[j].0);
+                    if self.has_conflict_between(a, b)? {
+                        continue;
+                    }
+                    let id = slot_conflict_id(a, b);
+                    let now = Utc::now();
+                    let conflict = MemoryConflict {
+                        conflict_id: id,
+                        left_memory_id: a.clone(),
+                        right_memory_id: b.clone(),
+                        relation: ConflictRelation::Conflicts,
+                        confidence: 0.9,
+                        reason: format!(
+                            "同一事实槽取值冲突：`{}` vs `{}`",
+                            group[i].2, group[j].2
+                        ),
+                        status: ConflictStatus::Pending,
+                        resolved_at: None,
+                        resolution: String::new(),
+                        created_at: now,
+                    };
+                    self.add_conflict(&conflict)?;
+                    inserted += 1;
+                    if inserted >= limit {
+                        return Ok(inserted);
+                    }
+                }
+            }
+        }
+        Ok(inserted)
+    }
+
+    /// List pending conflict ids (for deterministic auto-resolution).
+    pub(crate) fn list_pending_conflict_ids(&self, limit: usize) -> Result<Vec<(String, String, String)>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT conflict_id, left_memory_id, right_memory_id
+             FROM memory_conflicts WHERE status='pending'
+             ORDER BY created_at LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    /// Deterministic conflict auto-resolution (B2). Our slot conflicts are
+    /// always inserted oldest-first (left=older, right=newer), so resolving
+    /// each pending row as `Supersedes` keeps the newer unit Active and
+    /// supersedes the older one. Rule-based and side-effect free — the
+    /// optional LLM judge can be layered on top later. Returns # resolved.
+    pub(crate) fn auto_resolve_conflicts_deterministic(&self, limit: usize) -> Result<usize, DbError> {
+        let pending = self.list_pending_conflict_ids(limit)?;
+        let mut resolved = 0usize;
+        for (conflict_id, _left, _right) in pending {
+            // Supersedes: left (old) → superseded, right (new) → active.
+            if self.resolve_conflict(&conflict_id, ConflictRelation::Supersedes).is_ok() {
+                resolved += 1;
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// C4: promote `candidate` memory units that hold a clean name slot
+    /// ("我叫iker" etc.) to `active` so a told name actually becomes usable by
+    /// retrieval instead of sitting as an un-retrievable candidate.
+    pub(crate) fn promote_identity_candidates(&self, limit: usize) -> Result<usize, DbError> {
+        let candidates = self.list_memory_units(UnitStatus::Candidate)?;
+        let mut promoted = 0usize;
+        for u in candidates {
+            if promoted >= limit {
+                break;
+            }
+            let Some((label, _value)) = fact_slot_of(&u.content) else {
+                continue;
+            };
+            if label != "name" {
+                continue;
+            }
+            let proposal_id = format!("prop_{}", &u.id[4.min(u.id.len())..]);
+            if self
+                .promote_candidate_to_active(&u.id, &proposal_id, None, "C4 name-slot candidate")
+                .unwrap_or(0)
+                > 0
+            {
+                promoted += 1;
+            }
+        }
+        Ok(promoted)
+    }
+}
+
+/// Extract a normalized "fact slot" (label, value) from a memory unit's
+/// content. Currently recognises identity lines ("我叫X / 记住我叫X / 我的名字是X /
+/// call me X") and "我的<属性>是X" statements. Question-like values and
+/// fillers are rejected so a stored question never becomes a conflicting slot.
+pub(crate) fn fact_slot_of(content: &str) -> Option<(String, String)> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // (?P<val>) capture must be a short non-space token (a name / value).
+        let pats: &[&str] = &[
+            // identity: 我叫 / 记住我叫 / 请叫我 / 名字是 / 我的名字是 / 姓名是
+            r"(?im)^.*?(?:记住?我?叫|我叫|请?叫我|我的名字是|我的姓名是|名字是|姓名是|名字叫|my name is|call me)\s*[:：]?\s*(?P<val>\S+)",
+            // 我的<属性>是X
+            r"(?im)^.*?我的(?:名字|姓名|昵称|称呼|邮箱|email|手机|电话|github|用户名|微信|wechat|qq|id)\s*(?:是|为|=)\s*[:：]?\s*(?P<val2>\S+)",
+        ];
+        regex::Regex::new(&pats.join("|")).expect("fact-slot regex")
+    });
+
+    let caps = re.captures(content.trim())?;
+    // val = identity group (name), val2 = "我的<属性>是X" group. Distinguish by
+    // which group actually matched — do NOT infer the label from substrings.
+    let is_identity = caps.name("val").is_some();
+    let raw = caps
+        .name("val")
+        .or_else(|| caps.name("val2"))?
+        .as_str()
+        .to_string();
+    // normalize: drop trailing punctuation
+    let mut value = raw;
+    while value
+        .chars()
+        .last()
+        .is_some_and(|c| "，。！？!?.,:：；;".contains(c))
+    {
+        value.pop();
+    }
+    let value_l = value.trim().to_lowercase();
+    // reject question/filler values
+    if value_l.len() < 2 {
+        return None;
+    }
+    if ["?", "？", "吗", "呢", "么", "什么", "怎么", "为何", "为什么", "你", "我", "这个", "那个"]
+        .iter()
+        .any(|q| value_l.contains(q))
+    {
+        return None;
+    }
+    let label = if is_identity {
+        // 我叫X / 记住我叫X / 我的名字是X / call me X → name slot
+        "name".to_string()
+    } else {
+        // "我的<属性>是X" → attr:<property>
+        let hay = content.to_lowercase();
+        for attr in ["邮箱", "email", "昵称", "称呼", "手机", "电话", "github", "用户名", "微信", "qq", "id", "姓名", "名字"] {
+            if hay.contains(attr) {
+                return Some((format!("attr:{attr}"), value_l));
+            }
+        }
+        return Some(("attr".to_string(), value_l));
+    };
+    Some((label, value_l))
+}
+
+/// Cheap identity/name-intent detector, shared by the live memory leg and the
+/// offline MemoryRetriever so both answer name questions identically.
+pub(crate) fn looks_like_identity_query(input: &str) -> bool {
+    let l = input.to_lowercase();
+    const CUES: &[&str] = &[
+        "名字", "姓名", "称呼", "叫什么", "名字是", "叫啥", "叫我", "谁叫我",
+        "我是谁", "我的名字", "叫什么名字", "记住我",
+        "name", "who am i", "my name",
+    ];
+    CUES.iter().any(|c| l.contains(c))
+}
+
+/// Canonical low-signal classifier shared by extraction and consolidation.
+///
+/// A user line is "chat noise" (should not become evidence or memory) when it
+/// is a pure question/filler AND does not itself state a preference/identity.
+/// If the line carries an identity/preference cue ("记住我叫X / 可以叫我Tom /
+/// 以后我喜欢深色"), it is preserved even when phrased politely or with a
+/// trailing question — this keeps told names/real preferences from being
+/// dropped by an over-broad question/filler filter.
+pub(crate) fn is_chat_noise(s: &str) -> bool {
+    let t = s.trim();
+    if t.chars().count() < 2 {
+        return true;
+    }
+    let lower = t.to_lowercase();
+
+    // 1) Preference/identity cues → never noise.
+    const CUES: &[&str] = &[
+        "叫我", "记住我", "请叫我", "以后叫我", "名字是", "姓名", "昵称", "称呼",
+        "邮箱", "email", "手机", "电话", "喜欢", "偏好", "不喜欢", "讨厌", "反感",
+        "希望", "请记住", "不想", "别用", "用不了", "remember", "call me", "my name",
+        "我是", "我叫",
+    ];
+    if CUES.iter().any(|c| lower.contains(c)) {
+        return false;
+    }
+
+    // 2) Question markers anywhere → noise.
+    const QUESTION: &[&str] = &[
+        "?", "？", "吗", "呢", "么", "什么", "怎么", "如何", "为什么",
+        "为啥", "干嘛", "咋", "哪", "是不是", "可否", "能否", "行吗", "几号",
+    ];
+    if QUESTION.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+
+    // 3) Exact filler words (equality only — never prefix, so "好的，以后…"
+    //    is handled by the cue check above, not swallowed here).
+    const FILLERS: &[&str] = &[
+        "继续", "接着", "好的", "好", "ok", "okay", "谢谢", "多谢", "可以",
+        "行", "对", "嗯", "开始吧", "走吧", "再来", "下一个",
+    ];
+    FILLERS.iter().any(|f| lower == *f)
+}
+
+/// True if the first value token after an identity cue is a question word
+/// ("我叫什么名字…"), which must never be treated as a real told name.
+pub(crate) fn identity_value_is_question(content: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?im)(?:记住?我?叫|我叫|请?叫我|名字是|姓名是|my name is|call me)\s*[:：]?\s*(\S+)",
+        )
+        .expect("identity-value regex")
+    });
+    let Some(caps) = re.captures(content.trim()) else {
+        return false;
+    };
+    let Some(first) = caps.get(1) else {
+        return false;
+    };
+    let tok = first.as_str().trim_start_matches([':', '：']).to_lowercase();
+    const QSTARTS: &[&str] = &["什么", "吗", "呢", "怎么", "谁", "啥", "如何", "几", "哪", "?"];
+    QSTARTS.iter().any(|q| tok.starts_with(q))
+}
+
+/// Deterministic conflict id for a slot pair.
+fn slot_conflict_id(a: &str, b: &str) -> String {
+    let mut parts = vec![a.to_string(), b.to_string()];
+    parts.sort();
+    let joined = parts.join("|");
+    let d = Sha256::digest(joined.as_bytes());
+    let hex: String = d.iter().take(24).map(|b| format!("{b:02x}")).collect();
+    format!("conf_slot_{hex}")
 }
 
 /// Parse an RFC3339 timestamp, falling back to epoch on failure.
@@ -2333,6 +2719,33 @@ impl MemoryDatabase {
                 resolved_at: resolved.as_ref().map(|s| parse_ts(s)),
                 resolution: row.get(8)?,
                 created_at: parse_ts(&created),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    /// List every conflict row (for management UIs).
+    pub fn list_all_conflicts(&self) -> Result<Vec<MemoryConflict>, DbError> {
+        use crate::types::{ConflictRelation as CR, ConflictStatus as CS};
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT conflict_id, left_memory_id, right_memory_id, relation, confidence,
+                    reason, status, resolved_at, resolution, created_at
+             FROM memory_conflicts ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let resolved: Option<String> = r.get(7)?;
+            Ok(MemoryConflict {
+                conflict_id: r.get(0)?,
+                left_memory_id: r.get(1)?,
+                right_memory_id: r.get(2)?,
+                relation: CR::from_str(&r.get::<_, String>(3)?).unwrap_or(CR::Conflicts),
+                confidence: r.get(4)?,
+                reason: r.get(5)?,
+                status: CS::from_str(&r.get::<_, String>(6)?).unwrap_or(CS::Pending),
+                resolved_at: resolved.as_deref().map(parse_ts),
+                resolution: r.get(8)?,
+                created_at: parse_ts(&r.get::<_, String>(9)?),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
@@ -2847,8 +3260,144 @@ mod tests {
         assert_eq!(active_only.len(), 1);
         assert_eq!(active_only[0].0, "ev_active");
 
+        // History/evolution queries explicitly request superseded evidence.
         let with_super = db.fts5_evidence_candidates("cargo", 10, true).unwrap();
         assert_eq!(with_super.len(), 2);
+    }
+
+    #[test]
+    fn slot_conflicts_detect_contradictory_names() {
+        // iker vs ikkk are different texts → different content hashes → the
+        // hash-prefix bucketing never flags them. Fact-slot detection must.
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        db.upsert_memory_unit(&make_memory_unit("mem_iker", "我叫iker")).unwrap();
+        db.upsert_memory_unit(&make_memory_unit("mem_ikkk", "记住我叫ikkk")).unwrap();
+
+        let n = db.ensure_slot_conflicts(10).unwrap();
+        assert_eq!(n, 1, "two different stored names in the same slot must conflict");
+        assert!(
+            db.has_conflict_between("mem_iker", "mem_ikkk").unwrap(),
+            "a pending memory_conflicts row should exist between iker and ikkk"
+        );
+
+        // Idempotent: a second pass must not duplicate the conflict.
+        let n2 = db.ensure_slot_conflicts(10).unwrap();
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn slot_conflicts_ignore_same_value_and_questions() {
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        // Same value → not a conflict.
+        db.upsert_memory_unit(&make_memory_unit("m1", "我叫ikkk")).unwrap();
+        db.upsert_memory_unit(&make_memory_unit("m2", "记住我叫 ikkk")).unwrap();
+        // Question-like stored line must not produce a slot.
+        db.upsert_memory_unit(&make_memory_unit("m3", "我叫什么名字你知道吗")).unwrap();
+
+        let n = db.ensure_slot_conflicts(10).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn slot_conflicts_auto_resolve_keeps_newer() {
+        // older = iker, newer = ikkk (insertion order → left=older). Auto
+        // resolution (Supersedes) must keep the newer one Active.
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let older = make_memory_unit("mem_older", "我叫iker");
+        let newer = make_memory_unit("mem_newer", "记住我叫ikkk");
+        db.upsert_memory_unit(&older).unwrap();
+        db.upsert_memory_unit(&newer).unwrap();
+        assert_eq!(db.ensure_slot_conflicts(10).unwrap(), 1);
+
+        let resolved = db.auto_resolve_conflicts_deterministic(10).unwrap();
+        assert_eq!(resolved, 1, "one pending conflict should be auto-resolved");
+        assert_eq!(db.list_pending_conflict_ids(10).unwrap().len(), 0);
+
+        let o = db.get_memory_unit("mem_older").unwrap().unwrap();
+        let n = db.get_memory_unit("mem_newer").unwrap().unwrap();
+        assert_eq!(o.status, UnitStatus::Superseded);
+        assert_eq!(n.status, UnitStatus::Active);
+    }
+
+    #[test]
+    fn slot_conflict_resolution_uses_stated_time_not_maintenance_time() {
+        // 胜者按“被说出的时间”(created_at)，而不是维护/提升踩的新 updated_at：
+        // 老名 updated_at 被刷到最新也不应赢得裁决。
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let t0 = Utc::now() - chrono::Duration::days(10); // 早先说的
+        let t1 = Utc::now() - chrono::Duration::days(1); // 最近说的
+        let mk = |id: &str, content: &str, created: chrono::DateTime<Utc>, updated: chrono::DateTime<Utc>| MemoryUnit {
+            id: id.to_string(),
+            path: "MEMORY.md".to_string(),
+            section: "#pref".to_string(),
+            kind: MemoryKind::Preference,
+            scope: MemoryScope::Global,
+            status: UnitStatus::Active,
+            content: content.to_string(),
+            content_hash: format!("h_{id}"),
+            updated_at: updated,
+            created_at: created,
+        };
+        // “记住我叫iker”是早先说的，但其 updated_at 被维护刷成最新。
+        db.upsert_memory_unit(&mk("m_old_name", "记住我叫iker", t0, Utc::now())).unwrap();
+        // “我叫ikkk”是最近说的（created_at 更晚）。
+        db.upsert_memory_unit(&mk("m_new_name", "我叫ikkk", t1, t1)).unwrap();
+
+        assert_eq!(db.ensure_slot_conflicts(10).unwrap(), 1);
+        assert_eq!(db.auto_resolve_conflicts_deterministic(10).unwrap(), 1);
+
+        let old = db.get_memory_unit("m_old_name").unwrap().unwrap();
+        let new = db.get_memory_unit("m_new_name").unwrap().unwrap();
+        assert_eq!(old.status, UnitStatus::Superseded, "较早说的名字应被 superseded");
+        assert_eq!(new.status, UnitStatus::Active, "最近说的名字(按说法时间)应胜出");
+    }
+
+    #[test]
+    fn identity_candidate_promotes_to_active() {
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let cand = MemoryUnit {
+            id: "mem_cand_name".to_string(),
+            path: "MEMORY.md".to_string(),
+            section: "#pref".to_string(),
+            kind: MemoryKind::Preference,
+            scope: MemoryScope::Global,
+            status: UnitStatus::Candidate,
+            content: "记住我叫bob".to_string(),
+            content_hash: "hx".to_string(),
+            updated_at: Utc::now(),
+            created_at: Utc::now(),
+        };
+        db.upsert_memory_unit(&cand).unwrap();
+
+        let promoted = db.promote_identity_candidates(10).unwrap();
+        assert_eq!(promoted, 1);
+        let got = db.get_memory_unit("mem_cand_name").unwrap().unwrap();
+        assert_eq!(got.status, UnitStatus::Active);
+    }
+
+    #[test]
+    fn slot_conflicts_unify_phrasing_across_name_labels() {
+        // "记住我叫X" and "我的名字是X" must share the SAME name slot so a
+        // real identity contradiction is detected regardless of phrasing.
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        db.upsert_memory_unit(&make_memory_unit("m_a", "记住我叫iker")).unwrap();
+        db.upsert_memory_unit(&make_memory_unit("m_b", "我的名字是ikkk")).unwrap();
+        let n = db.ensure_slot_conflicts(10).unwrap();
+        assert_eq!(n, 1, "同槽不同措辞的矛盾应被检测");
+    }
+
+    #[tokio::test]
+    async fn retrieve_hybrid_memory_identity_boost_returns_stored_name() {
+        // Live path: "我的名字是什么" shares almost no chars with "记住我叫iker".
+        // The hybrid memory leg must still surface the stored name.
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        db.upsert_memory_unit(&make_memory_unit("m_name_live", "记住我叫iker")).unwrap();
+
+        let out = db.retrieve_hybrid_memory("我的名字是什么", 5, None).await.unwrap();
+        assert!(
+            out.iter().any(|r| r.content.contains("iker")),
+            "live hybrid memory leg must recall identity-slot name; got: {out:?}"
+        );
     }
 
     /// Fail-open regression: `retrieve_hybrid_memory` with `emb=None` must

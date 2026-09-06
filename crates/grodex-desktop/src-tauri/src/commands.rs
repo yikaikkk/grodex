@@ -68,3 +68,10 @@ pub fn get_config() -> ConfigSummary {
 pub fn delete_session(session_id: String) -> Result<(), String> {
     sessions::delete_session(&session_id)
 }
+
+/// Remove phantom (empty / SessionStarted-only) session dirs. Called at app
+/// startup so each app open never shows a session that had no conversation.
+#[tauri::command]
+pub fn purge_empty_sessions() -> usize {
+    sessions::purge_empty_sessions()
+}
