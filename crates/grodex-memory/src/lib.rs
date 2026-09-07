@@ -69,6 +69,7 @@ pub use llm_extractor::{
     ExtractionResult, ExtractedClaim, MockEvidenceExtractor, RolloutEventSummary, SourceRef,
     ToolCallSummary, ToolResultSummary, EXTRACTOR_SYSTEM_PROMPT, render_context_for_llm,
     gate_extraction_output, MemoryRuleMode, MemoryWriteGateDecision, extract_name,
+    derive_fact_key, is_acknowledgement_valid,
 };
 pub use consolidator::ConsolidationReport;
 pub use governance::{GovernanceReport, format_governance_banner, run_conflict_resolution_pass};

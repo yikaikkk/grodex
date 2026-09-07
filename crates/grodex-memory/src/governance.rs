@@ -101,6 +101,19 @@ impl MemoryDatabase {
             Err(_) => report.errors += 1,
         }
 
+        // ── 0b. Quarantine legacy workspace ACTIVE units (P1) ───────
+        // Auto memory now only stores GLOBAL user facts; any remaining
+        // `scope='workspace'` active records are project-scoped legacy and must
+        // not surface as global memory. Mark orphaned (kept for audit).
+        match self.quarantine_workspace_memory() {
+            Ok(n) => {
+                if n > 0 {
+                    eprintln!("[memory] P1: quarantined {n} legacy workspace memory unit(s)");
+                }
+            }
+            Err(_) => report.errors += 1,
+        }
+
         // ── 1. Conflict candidates ──────────────────────────────────
         match self.list_conflict_candidate_pairs(MAX_OPS_PER_PASS) {
             Ok(pairs) => {
@@ -525,7 +538,7 @@ mod tests {
             path: "MEMORY.md".into(),
             section: String::new(),
             kind,
-            scope: MemoryScope::Workspace,
+            scope: MemoryScope::Global,
             status: UnitStatus::Active,
             content: content.into(),
             content_hash,
@@ -551,7 +564,7 @@ mod tests {
             rollout_id: rollout_id.into(),
             path: "__test__".into(),
             section: String::new(),
-            scope: MemoryScope::Workspace,
+            scope: MemoryScope::Global,
             status: EvidenceStatus::Active,
             content: content.into(),
             content_hash,

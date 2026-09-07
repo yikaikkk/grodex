@@ -80,10 +80,10 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
     <div id="approval-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#21262d]/40 backdrop-blur-xs animate-in fade-in duration-150">
       <div
         id="approval-modal-card"
-        className="w-full max-w-xl rounded-3xl border border-[#ded8cd] bg-[#ffffff] shadow-2xl overflow-hidden"
+        className="w-full max-w-2xl rounded-3xl border border-[#ded8cd] bg-[#ffffff] shadow-2xl overflow-hidden flex flex-col max-h-[92vh]"
       >
         {/* Header with Circular Countdown Indicator */}
-        <div className="flex items-center justify-between px-6 py-4.5 bg-[#faf8f4] border-b border-[#ece6dc]">
+        <div className="flex items-center justify-between px-6 py-4.5 bg-[#faf8f4] border-b border-[#ece6dc] shrink-0">
           <div className="flex items-center gap-3">
             <div className="p-2 rounded-2xl bg-[#fef8ea] text-[#b07419] border border-[#f5dfb4]">
               <ShieldAlert className="w-5 h-5" />
@@ -130,7 +130,7 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
         </div>
 
         {/* Modal Body */}
-        <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto text-xs">
+        <div className="p-6 space-y-4 flex-1 min-h-0 overflow-y-auto text-xs">
           {/* Reason & Source Metadata */}
           <div className="p-3.5 rounded-2xl bg-[#fdf9f2] border border-[#f5dfb4] space-y-1.5">
             <div className="flex items-center gap-2 text-[#9c6514] font-semibold">
@@ -209,7 +209,7 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
         </div>
 
         {/* Action Buttons */}
-        <div className="px-6 py-4 bg-[#faf8f4] border-t border-[#ece6dc] flex items-center justify-between gap-3">
+        <div className="px-6 py-4 bg-[#faf8f4] border-t border-[#ece6dc] flex items-center justify-between gap-3 shrink-0">
           <div className="flex items-center gap-2">
             <button
               id="approval-deny-btn"

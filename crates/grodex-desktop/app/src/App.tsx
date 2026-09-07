@@ -455,18 +455,45 @@ export default function App() {
   };
 
   const handleSendPrompt = async (text: string) => {
-    // No session yet → create one on the first real message only.
-    if (!activeSessionId) {
+    // No session yet → create one on the first real message only. Note:
+    // `activeSessionId` state updates async, so AFTER prepare we must use the
+    // freshly minted id from the client (not the stale closure value).
+    let sid = activeSessionId;
+    let createdNew = false;
+    if (!sid) {
       const ok = await prepareSessionForTurn();
       if (!ok) return;
+      sid = acp.currentSessionId();
+      createdNew = true;
     }
-    const boundToActive = acp.currentSessionId() === activeSessionId;
+    if (createdNew) {
+      // React hasn't re-rendered with the new session id yet: the event-bus
+      // handlers still target the OLD (empty) id, so append the user bubble
+      // and set the sidebar title HERE, against the real sid.
+      const firstLine = text.split('\n').map((l) => l.trim()).find((l) => l.length > 0) || text;
+      const stamp = new Date().toLocaleTimeString();
+      setTimelines((prev) => ({
+        ...prev,
+        [sid]: [
+          ...(prev[sid] || []),
+          { id: `msg_${Date.now()}`, type: 'user', content: text, timestamp: stamp },
+        ],
+      }));
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === sid
+            ? { ...s, title: firstLine.slice(0, 60), preview: firstLine.slice(0, 180), updatedAt: '刚刚' }
+            : s
+        )
+      );
+    }
+    const boundToActive = acp.currentSessionId() === sid;
     if (!boundToActive) {
       // A historical/just-selected session: make sure a live process exists,
       // then bind it to this session (resume/rebind) BEFORE sending — so a
       // message continues THIS conversation, never creates a fresh one.
       if (isRunning) await acp.stop();
-      const target = sessions.find((s) => s.id === activeSessionId);
+      const target = sessions.find((s) => s.id === sid);
       const cwd = target?.workspace || workspace;
       if (cwd) {
         try {
@@ -477,14 +504,14 @@ export default function App() {
         }
       }
       try {
-        await acp.resumeSession(activeSessionId);
+        await acp.resumeSession(sid);
       } catch (e: any) {
         showNotice(`打开会话失败：${e?.message || e}`, 'error');
         return;
       }
     }
     try {
-      await acp.sendPrompt(text);
+      await acp.sendPrompt(text, createdNew ? { skipUserBubble: true } : undefined);
     } catch (e: any) {
       showNotice(`发送失败：${e?.message || e}`, 'error');
       setIsRunning(false);

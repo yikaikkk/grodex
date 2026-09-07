@@ -1802,7 +1802,7 @@ impl SessionSupervisor {
                 };
 
                 // 2) Run extractor.
-                let result = match extractor.extract(&ctx).await {
+                let mut result = match extractor.extract(&ctx).await {
                     Ok(r) => r,
                     Err(e) => {
                         let err = truncate_for_log(&e.to_string(), 500);
@@ -1829,6 +1829,21 @@ impl SessionSupervisor {
                     }
                 };
 
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/private/tmp/grodex-memory.log")
+                    {
+                        let _ = writeln!(
+                            f,
+                            "[mem] turn={turn_id_str} user={} raw_claims={}",
+                            truncate_for_log(&ctx.user_input, 120),
+                            result.claims.len()
+                        );
+                    }
+                }
                 if result.claims.is_empty() {
                     let _ = db.update_memory_task_status(
                         &canonical_id,
@@ -1838,6 +1853,53 @@ impl SessionSupervisor {
                     return;
                 }
                 let total_claims = result.claims.len();
+
+                // 2.5) Pipeline gates before commit (§2/§4):
+                //   - Auto memory is ALWAYS current-user + GLOBAL (§2): force
+                //     scope=Global so project/workspace content can never be
+                //     written as a scoped memory unit.
+                //   - assistant_acknowledged claims are only valid if the user
+                //     actually stated the request in this turn; otherwise
+                //     downgrade to AssistantSummary (never Active) (§4).
+                let user_input_for_gate = ctx.user_input.clone();
+                for claim in result.claims.iter_mut() {
+                    claim.scope = grodex_memory::MemoryScope::Global;
+                    if matches!(
+                        claim.authority,
+                        grodex_memory::EvidenceAuthority::AssistantAcknowledged
+                    ) && !grodex_memory::is_acknowledgement_valid(claim, &user_input_for_gate)
+                    {
+                        claim.authority = grodex_memory::EvidenceAuthority::AssistantSummary;
+                        claim.provenance_hint = format!(
+                            "{} (downgraded: user never stated in this turn)",
+                            claim.provenance_hint
+                        );
+                    }
+                }
+
+                {
+                    use std::io::Write as _;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/private/tmp/grodex-memory.log")
+                        .ok();
+                    let mut w = |s: String| {
+                        if let Some(f2) = f.as_mut() {
+                            let _ = writeln!(f2, "{s}");
+                        }
+                    };
+                    w(format!("[memory-extract] turn={turn_id_str} final_claims={}", result.claims.len()));
+                    for c in &result.claims {
+                        w(format!(
+                            "  claim fact={} auth={} conf={} persist={}",
+                            truncate_for_log(&c.fact, 120),
+                            c.authority.as_str(),
+                            c.confidence,
+                            c.should_persist
+                        ));
+                    }
+                }
 
                 // 3) propose_and_commit on a blocking pool (SQLite CRUD).
                 let extractor_model = extractor_label(extractor.as_ref());
@@ -1866,6 +1928,28 @@ impl SessionSupervisor {
                         &extractor_model,
                         &gate_opts,
                     );
+                    {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/private/tmp/grodex-memory.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "[mem-report] proposed={} committed={} rejected={}",
+                                report.proposed, report.committed, report.rejected.len()
+                            );
+                            for r in &report.rejected {
+                                let _ = writeln!(
+                                    f,
+                                    "  rejected fact={} reason={}",
+                                    truncate_for_log(&r.fact, 100),
+                                    truncate_for_log(&r.reason, 200)
+                                );
+                            }
+                        }
+                    }
                     if report.proposed > 0 || report.committed > 0 || !report.rejected.is_empty() {
                         tracing::debug!(
                             proposed = report.proposed,

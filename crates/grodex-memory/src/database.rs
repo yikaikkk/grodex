@@ -1230,6 +1230,41 @@ impl MemoryDatabase {
     ///   - emb=None / enabled=false / No API key → vec_list = []
     ///   - Embedding HTTP 超时/429/网络错误 → vec_list = []
     ///   - Vector store 表缺失 → vec_list = []
+    /// Preference boost for user-preference queries ("你喜欢吃什么"):
+    /// surface ACTIVE global preference units even when the query words don't
+    /// literally appear in the stored fact (stored English vs asked Chinese).
+    fn preference_boost_results(&self) -> Vec<RetrievalResult> {
+        use crate::types::UnitStatus;
+        let to_result = |u: &MemoryUnit| RetrievalResult {
+            unit_id: u.id.clone(),
+            path: u.path.clone(),
+            content: u.content.clone(),
+            section: u.section.clone(),
+            memory_kind: Some(u.kind),
+            updated_at: Some(u.updated_at),
+            rollout_id: String::new(),
+            superseded_by: None,
+            occurred_at: None,
+            bm25_score: 0.0,
+            term_coverage: usize::MAX,
+            total_terms: 1,
+            source: ResultSource::Memory,
+        };
+        let mut out = Vec::new();
+        if let Ok(units) = self.list_memory_units(UnitStatus::Active) {
+            for u in units {
+                if u.scope == MemoryScope::Global && u.kind == MemoryKind::Preference {
+                    // Skip pure identity-name rows — identity is handled by the
+                    // name slot path and would otherwise dominate preference hits.
+                    if !fact_slot_of(&u.content).is_some_and(|(l, _)| l == "name") {
+                        out.push(to_result(&u));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Name-slot boost for identity queries: ACTIVE name memories preferred,
     /// `candidate` names as fallback (before governance promotes them).
     fn name_slot_boost_results(&self) -> Vec<RetrievalResult> {
@@ -1310,6 +1345,22 @@ impl MemoryDatabase {
         // (Active, else Candidate) before the quota cap.
         if looks_like_identity_query(query) {
             let extra = self.name_slot_boost_results();
+            if !extra.is_empty() {
+                let seen: std::collections::HashSet<&str> =
+                    results.iter().map(|r| r.unit_id.as_str()).collect();
+                let mut boosted: Vec<RetrievalResult> = extra
+                    .into_iter()
+                    .filter(|e| !seen.contains(e.unit_id.as_str()))
+                    .collect();
+                boosted.extend(results);
+                results = boosted;
+                results.truncate(top_k);
+            }
+        }
+        // Preference recall: "我喜欢吃什么 / 你喜欢什么" should surface stored
+        // global preferences even when stored in another phrasing/language.
+        if looks_like_user_preference_query(query) {
+            let extra = self.preference_boost_results();
             if !extra.is_empty() {
                 let seen: std::collections::HashSet<&str> =
                     results.iter().map(|r| r.unit_id.as_str()).collect();
@@ -2107,6 +2158,14 @@ impl MemoryDatabase {
 /// call me X") and "我的<属性>是X" statements. Question-like values and
 /// fillers are rejected so a stored question never becomes a conflicting slot.
 pub(crate) fn fact_slot_of(content: &str) -> Option<(String, String)> {
+    // §8: temporary-scope statements ("这次…/本次…/临时…/暂时…") are NOT
+    // global user facts and must never overwrite an existing global slot.
+    let lower = content.to_lowercase();
+    const TEMP: &[&str] = &["这次", "本次", "这次先", "临时", "暂时"];
+    if TEMP.iter().any(|t| lower.contains(t)) {
+        return None;
+    }
+
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
@@ -2173,6 +2232,17 @@ pub(crate) fn looks_like_identity_query(input: &str) -> bool {
         "名字", "姓名", "称呼", "叫什么", "名字是", "叫啥", "叫我", "谁叫我",
         "我是谁", "我的名字", "叫什么名字", "记住我",
         "name", "who am i", "my name",
+    ];
+    CUES.iter().any(|c| l.contains(c))
+}
+
+/// §recall: user-preference-intent queries ("我喜欢吃什么 / 你喜欢什么 / prefer / like / eat").
+pub(crate) fn looks_like_user_preference_query(input: &str) -> bool {
+    let l = input.to_lowercase();
+    const CUES: &[&str] = &[
+        "喜欢", "偏好", "爱吃", "吃什么", "喜欢吃什么", "吃", "想", "希望",
+        "不喜欢", "讨厌", "风格", "倾向", "习惯", "prefer", "like", "eat",
+        "food", "favorite", "want", "风格",
     ];
     CUES.iter().any(|c| l.contains(c))
 }
@@ -2749,6 +2819,19 @@ impl MemoryDatabase {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    /// P1: quarantine legacy `scope='workspace'` ACTIVE units (mark orphaned so
+    /// they are excluded from default retrieval). Kept on disk for audit rather
+    /// than deleted. Returns how many were quarantined.
+    pub fn quarantine_workspace_memory(&self) -> Result<usize, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE memory_units SET status='orphaned', updated_at=?1
+             WHERE scope='workspace' AND status='active'",
+            params![Utc::now().to_rfc3339()],
+        )?;
+        Ok(n)
     }
 
     /// Update a memory unit's status (used by governance / proposal flow).
@@ -3398,6 +3481,46 @@ mod tests {
             out.iter().any(|r| r.content.contains("iker")),
             "live hybrid memory leg must recall identity-slot name; got: {out:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn retrieve_hybrid_memory_preference_recall_cross_language() {
+        // 中文“我喜欢吃什么”应能召回英文存的全局偏好 jackfruit。
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        let now = Utc::now();
+        db.upsert_memory_unit(&MemoryUnit {
+            id: "mem_food".into(),
+            path: "MEMORY.md".into(),
+            section: "#pref".into(),
+            kind: MemoryKind::Preference,
+            scope: MemoryScope::Global,
+            status: UnitStatus::Active,
+            content: "The user likes eating jackfruit (菠萝蜜).".into(),
+            content_hash: "h_food".into(),
+            updated_at: now,
+            created_at: now,
+        })
+        .unwrap();
+
+        let out = db.retrieve_hybrid_memory("我喜欢吃什么", 5, None).await.unwrap();
+        assert!(
+            out.iter().any(|r| r.content.contains("jackfruit") || r.content.contains("菠萝蜜")),
+            "preference recall must surface the stored food preference; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn slot_conflicts_ignore_temporary_scope() {
+        // §8: “这次/本次/临时/暂时”开头的不是全局事实，绝不生成槽、也不覆盖
+        // 已有的全局名字。
+        let db = MemoryDatabase::open_in_memory().unwrap();
+        db.upsert_memory_unit(&make_memory_unit("m_real", "记住我叫iker")).unwrap();
+        db.upsert_memory_unit(&make_memory_unit("m_tmp", "这次示例先叫我Bob")).unwrap();
+
+        let n = db.ensure_slot_conflicts(10).unwrap();
+        assert_eq!(n, 0, "临时指令不得与全局槽冲突");
+        let real = db.get_memory_unit("m_real").unwrap().unwrap();
+        assert_eq!(real.status, UnitStatus::Active);
     }
 
     /// Fail-open regression: `retrieve_hybrid_memory` with `emb=None` must

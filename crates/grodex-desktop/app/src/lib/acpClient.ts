@@ -688,13 +688,18 @@ function withSession(fields: Record<string, unknown>): Record<string, unknown> {
 // ── Public actions ──────────────────────────────────────────────────────
 
 /** Send a user prompt and optimistically show the user bubble. */
-export async function sendPrompt(text: string): Promise<void> {
+export async function sendPrompt(
+  text: string,
+  opts?: { skipUserBubble?: boolean }
+): Promise<void> {
   resetStreaming();
-  eventBus.emit('userMessage', {
-    id: `msg_${uid()}`,
-    content: text,
-    timestamp: clockTime(),
-  });
+  if (!opts?.skipUserBubble) {
+    eventBus.emit('userMessage', {
+      id: `msg_${uid()}`,
+      content: text,
+      timestamp: clockTime(),
+    });
+  }
   eventBus.emit('sessionStateChanged', {
     status: 'running',
     isRunning: true,

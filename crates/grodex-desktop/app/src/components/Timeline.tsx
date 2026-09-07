@@ -67,17 +67,25 @@ function FrameBody({
   onOpenDiff: (diffId: string) => void;
 }) {
   const miniRef = useRef<HTMLDivElement>(null);
+  const stuckRef = useRef(false); // true = user scrolled up inside the mini box
 
-  // Inner auto-follow: only when the mini frame is scrolled to (near) bottom.
+  // Inner smart-follow: auto-stick to the bottom as content (thinking text or
+  // tool cards) streams in. Only paused while the user has scrolled UP; going
+  // back to the bottom re-engages following.
   useEffect(() => {
     if (expanded) return;
     const el = miniRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    if (nearBottom) {
-      el.scrollTop = el.scrollHeight;
-    }
+    if (stuckRef.current) return;
+    el.scrollTop = el.scrollHeight;
   }, [items, expanded]);
+
+  const onMiniScroll = () => {
+    const el = miniRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    stuckRef.current = !nearBottom;
+  };
 
   const content = (
     <>
@@ -108,6 +116,7 @@ function FrameBody({
   return (
     <div
       ref={miniRef}
+      onScroll={onMiniScroll}
       className="max-h-40 overflow-y-auto px-3.5 py-2.5 space-y-2.5"
     >
       {content}
@@ -159,17 +168,39 @@ function ThinkingFrame({
 
 export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const pageStuckRef = useRef(false); // true = user scrolled UP (pauses follow)
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  // Page auto-scroll: only when the user is already near the bottom.
+  // Page smart-follow:
+  //  - while anything is live (thinking streaming / tool running / assistant
+  //    streaming) keep sticking to the bottom as new output arrives;
+  //  - for static changes, follow only when the user is already near bottom;
+  //  - if the user scrolled up, pause until they return to the bottom.
+  const isLive =
+    items.some(
+      (it) =>
+        (it.type === 'thinking' && it.isStreaming) ||
+        (it.type === 'tool' &&
+          (it.status === 'running' || it.status === 'awaiting_approval')) ||
+        (it.type === 'assistant' && it.isStreaming)
+    );
+
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
-    if (nearBottom) {
+    if (pageStuckRef.current && !isLive) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
+    if (nearBottom || isLive) {
       el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
     }
-  }, [items]);
+  }, [items, isLive]);
+
+  const onPageScroll = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
+    pageStuckRef.current = !nearBottom;
+  };
 
   const handleCopyText = (id: string, text: string) => {
     navigator.clipboard.writeText(text);
@@ -256,6 +287,7 @@ export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff }) => {
   return (
     <div
       ref={containerRef}
+      onScroll={onPageScroll}
       id="session-timeline-container"
       className="flex-1 overflow-y-auto px-4 sm:px-6 py-5 w-full space-y-4 font-sans"
     >

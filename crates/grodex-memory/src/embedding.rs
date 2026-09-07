@@ -52,6 +52,10 @@ pub struct EmbeddingConfig {
     #[serde(default)]
     pub api_key_env_var: String,
 
+    /// 直接内联 API key（优先于 `api_key_env_var` 指向的环境变量）。
+    #[serde(default)]
+    pub api_key: String,
+
     #[serde(default = "default_dim")]
     pub expected_dimension: usize,
 
@@ -91,6 +95,7 @@ impl Default for EmbeddingConfig {
             endpoint: default_endpoint(),
             model: default_model(),
             api_key_env_var: String::new(),
+            api_key: String::new(),
             expected_dimension: default_dim(),
             batch_size: default_batch_size(),
             backfill_max_documents: default_backfill_max(),
@@ -123,12 +128,17 @@ impl OpenAiCompatibleModel {
         if !cfg.enabled {
             return Err(EmbeddingError::NotConfigured);
         }
-        let env_var = if cfg.api_key_env_var.is_empty() {
-            "GRODEX_OPENAI_API_KEY".to_string()
+        // Direct inline key first; fall back to the env var.
+        let api_key = if !cfg.api_key.trim().is_empty() {
+            cfg.api_key.trim().to_string()
         } else {
-            cfg.api_key_env_var.clone()
+            let env_var = if cfg.api_key_env_var.is_empty() {
+                "GRODEX_OPENAI_API_KEY".to_string()
+            } else {
+                cfg.api_key_env_var.clone()
+            };
+            std::env::var(&env_var).map_err(|_| EmbeddingError::NotConfigured)?
         };
-        let api_key = std::env::var(&env_var).map_err(|_| EmbeddingError::NotConfigured)?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()

@@ -332,56 +332,51 @@ pub trait EvidenceExtractor: Send + Sync + 'static {
 /// logic and can be surfaced in `memory_units.prompt_version`.
 pub const EXTRACTOR_SYSTEM_PROMPT: &str = r#"You are a memory extraction assistant. Your job is to read the following turn context and extract STABLE, LONG-TERM-MEMORY-WORTHY facts that the user would want remembered across sessions.
 
-EXTRACT only:
-- User preferences (e.g. "remember to call me X", "I prefer dark mode")
-- Stable facts about the project or environment (e.g. "the build command is cargo build --release")
-- Architectural or process decisions (e.g. "we decided to use SQLite for the index")
-- Long-term constraints or invariants (e.g. "the schema version must be bumped on DDL changes")
-- Confirmed problems and their solutions
+EXTRACT ONLY the CURRENT USER's GLOBAL, LONG-TERM memory — facts about the user themself that remain true across projects and sessions.
 
-DO NOT extract:
-- Plans or intentions ("I will do X next")
-- Transient state ("the file currently has 42 lines")
-- Model speculation or hypotheses
-- Intermediate reasoning steps
-- Code snippets or tool output verbatim
-- Anything that is not user-directed or user-confirmed
+You are NOT allowed to extract anything about the project, workspace, environment, or this task. Such content must be excluded from long-term memory and lives in AGENTS.md / docs / journal / Evidence instead.
+
+EXTRACT only (must be about the USER themself and durable across projects):
+- How the user wants to be addressed ("以后叫我 ikkk", "my name is ikkk")
+- The user's language / communication preferences ("我习惯使用中文")
+- The user's answer style preferences ("回答简洁一些")
+- Long-term behavioral requirements for the agent ("改代码前先给我方案")
+- Long-term tool/habit preferences ("我习惯用 Rust")
+- The user's identity, role, background (self-stated)
+
+DO NOT extract (reject / return []) even if mentioned multiple times:
+- Project facts ("项目用 SQLite / 构建用 cargo / 目录结构 / Tool 注册方式 / 部署在 staging")
+- Workspace or environment content
+- This-task-only intentions ("这次先用英文", "本次任务…")
+- Assistant summaries, suggestions, or inferences about the user
+- Tool observations (build result, file contents, command outputs)
+- Plans, transient state, code snippets
 
 RULES:
-- scope=global ONLY for preferences the user explicitly stated should apply everywhere (e.g. "remember my name is X"). Default to scope=workspace.
-- certainty=explicit when the user directly stated the fact. certainty=inferred when you deduce it. certainty=hypothesis for tentative conclusions.
-- should_persist=false for borderline observations — log them but do not persist.
-- confidence is 0.0–1.0: how sure you are this is a stable, persistent fact.
-- It is perfectly valid to return an empty claims array if nothing is worth remembering.
-
-SOURCE ATTRIBUTION RULES (source_hint field, REQUIRED for every claim):
-- "user_explicit":
-  - The fact was FIRST STATED by the user verbatim in "User Input" — even if the assistant subsequently repeats/acknowledges it.
-  - Examples: user says "记住我的名字叫 ikkk" → claim about user's name uses source_hint="user_explicit".
-  - Examples: user says "my name is ikkk" → claim uses source_hint="user_explicit".
-  - Examples: user says "I prefer dark mode" → claim uses source_hint="user_explicit".
-- "assistant_acknowledged":
-  - User never explicitly said the fact in this turn, but the assistant says "好的 / 记住了 / noted / I'll remember that" in direct response to a user's explicit request. The original fact is still rooted in user intent; assistant merely acknowledged it.
-  - NOTE: if the user ALSO explicitly stated the same fact, prefer "user_explicit" over "assistant_acknowledged".
-- "assistant_summary":
-  - The assistant summarised, paraphrased or re-stated a prior idea, but the user did NOT utter that exact phrasing or statement in "User Input" of THIS turn.
-  - The fact appears only in assistant output sections, never in user input.
-- "assistant_inference":
-  - The assistant guessed, inferred or speculated ("I think you probably like...", "you seem to want..."). The user never confirmed.
-- "tool_observation":
-  - Fact taken directly from a tool result / file content. NOT a user statement or assistant belief.
+- scope is ALWAYS "global" and subject is ALWAYS the current user. Never output scope=workspace, project, or environment — such content simply must NOT be extracted.
+- certainty=explicit only when the USER explicitly stated the fact; certainty=inferred / hypothesis never becomes Active.
+- source_hint is REQUIRED per claim:
+  - user_explicit: user first stated it verbatim in User Input.
+  - assistant_acknowledged: user explicitly requested it and assistant merely accepted/remembered ("好的 / 记住了 / noted / I'll remember that"). If the user ALSO stated it, prefer user_explicit.
+  - assistant_summary / assistant_inference / tool_observation: the assistant or tools stated/inferred it — the user did NOT. These claims must set should_persist=false and must NEVER describe the user as confirmed fact.
+- confidence is 0.0–1.0 (how sure it's a stable, persistent global user fact).
+- It is perfectly valid to return an empty claims array if nothing is worth remembering (most turns return []).
 
 Respond with a JSON object of this exact shape:
-{"claims": [{"fact": "...", "kind": "preference|fact|decision|constraint|solution", "scope": "global|workspace", "certainty": "explicit|inferred|hypothesis", "confidence": 0.9, "should_persist": true, "source_hint": "user_explicit|assistant_acknowledged|assistant_summary|assistant_inference|tool_observation"}]}
+{"claims": [{"fact": "...", "kind": "preference|fact|constraint", "scope": "global", "certainty": "explicit|inferred|hypothesis", "confidence": 0.9, "should_persist": true, "source_hint": "user_explicit|assistant_acknowledged|assistant_summary|assistant_inference|tool_observation"}]}
 
 Few-shot examples:
 User Input: 记住我的名字叫 ikkk
 Assistant Output: ["好的，以后我会叫你 ikkk。"]
 → {"claims": [{"fact":"The user's name is ikkk.","kind":"preference","scope":"global","certainty":"explicit","confidence":0.95,"should_persist":true,"source_hint":"user_explicit"}]}
 
-User Input: Please remember my name is ikkk. I prefer dark mode.
-Assistant Output: ["Noted! I'll call you ikkk and use dark mode for you."]
-→ {"claims": [{"fact":"The user's name is ikkk.","kind":"preference","scope":"global","certainty":"explicit","confidence":0.95,"should_persist":true,"source_hint":"user_explicit"},{"fact":"The user prefers dark mode.","kind":"preference","scope":"global","certainty":"explicit","confidence":0.95,"should_persist":true,"source_hint":"user_explicit"}]}
+User Input: 这个仓库的构建命令是 cargo build。
+Assistant Output: ["项目用的是 cargo。"]
+→ {"claims": []}   // project fact — NOT global user memory
+
+User Input: 你觉得这个项目适合 Rust 吗？
+Assistant Output: ["我建议用 Rust。"]
+→ {"claims": []}   // assistant inference — not a user-stated global fact
 "#;
 
 /// The user-message body: renders the ExtractionContext as text the
@@ -623,6 +618,21 @@ pub enum MemoryWriteGateDecision {
 ///    - `AllowActive` → follow authority normally.
 /// 4. For llm-tier output: authority alone decides (Active only for
 ///    UserExplicitStatement / AssistantAcknowledged).
+    /// §7: claims below this confidence never become Active (spec 0.80).
+    const ACTIVE_CONFIDENCE_FLOOR: f64 = 0.80;
+
+/// True when a claim's fact is placeholder/question-shaped and carries no
+/// concrete user value (e.g. "叫我 什么名字", "prefer which color?").
+fn claim_has_placeholder_or_question(fact: &str) -> bool {
+    let l = fact.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "什么", "？", "吗", "呢", "怎么样", "怎样", "哪个", "哪些",
+        "如何", "哪样", "啥", "?", "who", "which", "where", "what", "when",
+        "how", "unknown", "n/a", "placeholder",
+    ];
+    MARKERS.iter().any(|m| l.contains(m))
+}
+
 pub fn gate_extraction_output(
     claim: &ExtractedClaim,
     tier_label_hint: &str,
@@ -634,6 +644,16 @@ pub fn gate_extraction_output(
     if claim.authority.is_tool_derived() {
         return MemoryWriteGateDecision::Skip {
             reason: "claim authority=ToolObservation; tool results must stay in evidence".into(),
+        };
+    }
+    // §3/§7 hard line: placeholder / question-shaped "facts" carry no concrete
+    // value and are never real user memory ("叫我 什么名字", "我喜欢 什么…").
+    if claim_has_placeholder_or_question(&claim.fact) {
+        return MemoryWriteGateDecision::Skip {
+            reason: format!(
+                "claim fact is placeholder/question-shaped (no concrete value): {}",
+                claim.fact
+            ),
         };
     }
     // should_persist guard — extractor can borderline claims off without
@@ -671,7 +691,7 @@ pub fn gate_extraction_output(
                 // write Active. Only UserExplicitStatement claims (regex
                 // matched against user_input direct voice) are allowed
                 // to Active for backwards compatibility.
-                if matches!(claim.authority, UserExplicitStatement) && force_user_explicit_active {
+                if matches!(claim.authority, UserExplicitStatement) && force_user_explicit_active && claim.confidence >= ACTIVE_CONFIDENCE_FLOOR {
                     MemoryWriteGateDecision::PromoteActive {
                         reason: "AllowCandidate + authority=UserExplicitStatement + force_user_explicit_active: identity/preference regex claims must stay end-to-end capable".into(),
                     }
@@ -685,9 +705,9 @@ pub fn gate_extraction_output(
                 }
             }
             MemoryRuleMode::AllowActive => {
-                if claim.authority.may_become_active_memory() {
+                if claim.authority.may_become_active_memory() && claim.confidence >= ACTIVE_CONFIDENCE_FLOOR {
                     MemoryWriteGateDecision::PromoteActive {
-                        reason: "AllowActive rule tier + eligible authority".into(),
+                        reason: "AllowActive rule tier + eligible authority + confidence>=0.8".into(),
                     }
                 } else {
                     MemoryWriteGateDecision::PromoteCandidate {
@@ -698,7 +718,7 @@ pub fn gate_extraction_output(
         }
     } else {
         // LLM / composite-with-LLM tier: authority alone decides.
-        if claim.authority.may_become_active_memory() {
+        if claim.authority.may_become_active_memory() && claim.confidence >= ACTIVE_CONFIDENCE_FLOOR {
             MemoryWriteGateDecision::PromoteActive {
                 reason: format!(
                     "LLM tier + authority={} may become active",
@@ -800,6 +820,52 @@ pub fn extract_name(input: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// §6: derive a stable fact_key for claims that ARE global user facts.
+/// Used for same-slot conflict resolution ("replacement") — different values in
+/// the same key supersede each other; temporary/"这次" claims are excluded by
+/// the slot extraction (see database::fact_slot_of) so they never reach here.
+pub fn derive_fact_key(content: &str) -> Option<&'static str> {
+    let l = content.to_lowercase();
+    let has = |xs: &[&str]| xs.iter().any(|c| l.contains(c));
+    if has(&["叫我", "记住我", "请叫我", "名字是", "名字叫", "我的名字", "姓名", "call me", "my name"]) {
+        return Some("user.preferred_name");
+    }
+    if has(&["邮箱", "email"]) {
+        return Some("user.email");
+    }
+    if has(&["github", "用户名", "username", "id"]) {
+        return Some("user.account_id");
+    }
+    if has(&["语言", "用中文", "用英文", "中文交流", "语言偏好", "language"]) {
+        return Some("user.language");
+    }
+    if has(&["喜欢", "偏好", "不喜欢", "讨厌", "希望", "prefer", "remember i", "风格", "回答简洁", "风格"]) {
+        return Some("user.preference");
+    }
+    None
+}
+
+/// §4: an `assistant_acknowledged` claim is only trustworthy if the USER
+/// themselves stated/requested the underlying fact in this turn's input
+/// (assistant merely accepted/remembered it). If the user never stated it,
+/// the acknowledgement is really an assistant inference/summary → must be
+/// downgraded and never Active.
+pub fn is_acknowledgement_valid(claim: &ExtractedClaim, user_input: &str) -> bool {
+    let is_ack = claim.provenance_hint.to_lowercase().contains("acknowledg")
+        || matches!(claim.authority, EvidenceAuthority::AssistantAcknowledged);
+    if !is_ack {
+        return true; // only validates acknowledged claims
+    }
+    let u = user_input.to_lowercase();
+    // The user must have actually asked for the thing the assistant confirmed.
+    let requested = |xs: &[&str]| xs.iter().any(|c| u.contains(c));
+    requested(&[
+        "叫我", "记住我", "名字", "姓名", "称呼", "邮箱", "email", "语言",
+        "用中文", "用英文", "喜欢", "偏好", "不喜欢", "希望", "简洁",
+        "以后", "please call", "remember",
+    ])
 }
 
 #[cfg(test)]
@@ -946,4 +1012,55 @@ mod tests {
         // try to parse a prefix out of it — returns None.
         assert_eq!(extract_name("ikkk"), None);
     }
+    #[test]
+    fn gate_low_confidence_user_explicit_is_not_active() {
+        let base = ExtractedClaim {
+            fact: "The user's name is ikkk.".into(),
+            kind: MemoryKind::Preference,
+            scope: MemoryScope::Global,
+            certainty: Certainty::Explicit,
+            confidence: 0.5,
+            should_persist: true,
+            authority: EvidenceAuthority::UserExplicitStatement,
+            provenance_hint: "test".into(),
+        };
+        // §7: confidence below 0.80 must NOT become Active (→ Candidate).
+        let low = gate_extraction_output(&base, "llm", MemoryRuleMode::AllowActive, true);
+        assert!(matches!(low, MemoryWriteGateDecision::PromoteCandidate { .. }), "{low:?}");
+
+        // At/above 0.80 + user-explicit authority → Active.
+        let high = ExtractedClaim { confidence: 0.9, ..base };
+        let ok = gate_extraction_output(&high, "llm", MemoryRuleMode::AllowActive, true);
+        assert!(matches!(ok, MemoryWriteGateDecision::PromoteActive { .. }), "{ok:?}");
+    }
+    #[test]
+    fn fact_key_and_ack_validation() {
+        assert_eq!(derive_fact_key("记住我叫iker"), Some("user.preferred_name"));
+        assert_eq!(derive_fact_key("以后请叫我阿祖"), Some("user.preferred_name"));
+        assert_eq!(derive_fact_key("我的邮箱是 a@b.com"), Some("user.email"));
+        assert_eq!(derive_fact_key("项目使用 SQLite"), None);
+
+        // Assistant acknowledged + user actually stated request → valid.
+        let ack = ExtractedClaim { fact: "user name is ikkk".into(), authority: EvidenceAuthority::AssistantAcknowledged, provenance_hint: "assistant_acknowledged".into(), ..Default::default() };
+        assert!(is_acknowledgement_valid(&ack, "记住我的名字叫 ikkk"));
+        // User never said it → invalid (downgrade candidate, not Active).
+        assert!(!is_acknowledgement_valid(&ack, "帮我看下这个项目用什么数据库"));
+    }
+
+    #[test]
+    fn gate_rejects_placeholder_facts() {
+        let c = ExtractedClaim {
+            fact: "The user prefers to be called 什么名字".into(),
+            kind: MemoryKind::Preference,
+            scope: MemoryScope::Global,
+            certainty: Certainty::Explicit,
+            confidence: 0.95,
+            should_persist: true,
+            authority: EvidenceAuthority::UserExplicitStatement,
+            provenance_hint: "test".into(),
+        };
+        let d = gate_extraction_output(&c, "llm", MemoryRuleMode::AllowActive, true);
+        assert!(matches!(d, MemoryWriteGateDecision::Skip { .. }), "{d:?}");
+    }
+
 }

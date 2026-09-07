@@ -78,7 +78,10 @@ impl MemoryDatabase {
                 report.groups_insufficient += 1;
                 continue;
             }
-            if evidences.len() < MIN_OCCURRENCES && !pref_fallback {
+            // P1 收敛：自动 Consolidation 只允许「用户本人明确表达的全局个人事实 /
+            // 长期偏好」进入 Global Memory。项目、workspace、环境、Assistant 总结、
+            // Tool 观察等一律不允许再自动提升——这类证据只能留在 Evidence / 项目上下文。
+            if !pref_fallback {
                 report.groups_insufficient += 1;
                 continue;
             }
@@ -563,7 +566,9 @@ mod tests {
     }
 
     #[test]
-    fn consolidation_promotes_three_identical_evidences() {
+    fn consolidation_never_promotes_project_or_tool_content() {
+        // P1 收敛：项目/工具观察（tool_result / 构建错误等）即使在多个 rollout
+        // 反复出现，也绝不能自动晋升为 Global Memory——只能留在 Evidence。
         let db = make_db();
         let e1 = insert_evidence(&db, "[exec] missing openssl libssl.so.3", "r1", "tool_result");
         let e2 = insert_evidence(&db, "[exec] missing openssl libssl.so.3", "r2", "tool_result");
@@ -571,11 +576,10 @@ mod tests {
         assert_ne!(e1.id, e2.id, "different rollouts should yield different evidence ids");
 
         let rpt = db.run_consolidation_pass().unwrap();
-        assert_eq!(rpt.memories_created, 1);
-        assert_eq!(rpt.evidence_superseded, 3);
-        // Evidence should now be superseded
+        assert_eq!(rpt.memories_created, 0, "项目/工具内容不得自动升 Global Memory");
+        assert_eq!(rpt.evidence_superseded, 0);
         let got = db.get_evidence_unit(&e1.id).unwrap().unwrap();
-        assert_eq!(got.status, EvidenceStatus::Superseded);
+        assert_eq!(got.status, EvidenceStatus::Active);
     }
 
     #[test]
@@ -595,8 +599,8 @@ mod tests {
         // P1(W3) MIN_OCCURRENCES 从 3 → 2：两个重复的“偏好陈述”应提升。
         // 注意 section 用「用户偏好」——纯「用户问题」重复不再提升（见下例）。
         let db = make_db();
-        insert_evidence(&db, "用户偏好深色主题", "r1", "用户偏好");
-        insert_evidence(&db, "用户偏好深色主题", "r2", "用户偏好");
+        insert_evidence(&db, "记住我喜欢深色主题", "r1", "用户偏好");
+        insert_evidence(&db, "记住我喜欢深色主题", "r2", "用户偏好");
 
         let rpt = db.run_consolidation_pass().unwrap();
         assert_eq!(rpt.memories_created, 1);
@@ -606,9 +610,9 @@ mod tests {
     #[test]
     fn consolidation_is_idempotent() {
         let db = make_db();
-        insert_evidence(&db, "用户偏好深色主题", "r1", "用户偏好");
-        insert_evidence(&db, "用户偏好深色主题", "r2", "用户偏好");
-        insert_evidence(&db, "用户偏好深色主题", "r3", "用户偏好");
+        insert_evidence(&db, "记住我喜欢深色主题", "r1", "用户偏好");
+        insert_evidence(&db, "记住我喜欢深色主题", "r2", "用户偏好");
+        insert_evidence(&db, "记住我喜欢深色主题", "r3", "用户偏好");
 
         let r1 = db.run_consolidation_pass().unwrap();
         let r2 = db.run_consolidation_pass().unwrap();
