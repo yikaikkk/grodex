@@ -14,7 +14,7 @@ English · [中文](README.zh.md)
 
 ---
 
-Grodex is a CLI tool and ACP server that reads, writes, and runs code in your projects. It features a crash-recoverable Agent Loop, kernel-enforced sandboxing, end-to-end SQLite observability, and a provider-agnostic architecture supporting OpenAI, Anthropic, DeepSeek and more.
+Grodex is a CLI tool, ACP server, and desktop app that reads, writes, and runs code in your projects. It features a crash-recoverable Agent Loop, kernel-enforced sandboxing, end-to-end SQLite observability, and a provider-agnostic architecture supporting OpenAI, Anthropic, DeepSeek and more.
 
 ## Why Grodex?
 
@@ -26,7 +26,7 @@ Grodex is a CLI tool and ACP server that reads, writes, and runs code in your pr
 | **Auditability** | 17 runtime invariants, every action journaled; credential env vars auto-stripped | Black box |
 | **Vendor lock-in** | 3 wire protocols, multi-candidate failover (credential + endpoint switch per candidate) | Single vendor |
 | **Sub-agents** | Unified agent tree: delegate, message, wait, interrupt, permission ceilings | Flat or none |
-| **Transparency** | Open source, 22 crates, 919 tests | Closed source |
+| **Transparency** | Open source, 24 crates, 919 tests | Closed source |
 
 ## Features
 
@@ -40,9 +40,10 @@ Grodex is a CLI tool and ACP server that reads, writes, and runs code in your pr
 - **exec resource limits** — memory (RLIMIT_AS) / CPU / file size / process count rlimits + setsid process-group isolation with whole-tree kill on timeout; credential env vars auto-stripped
 - **Multi-provider** — OpenAI Responses, Chat Completions (DeepSeek/Qwen thinking mode), Anthropic Messages; failover switches credential AND endpoint per candidate
 - **Credential Broker** — master credentials hidden from the agent; one-shot leases prevent replay; MCP OAuth authorization-code CLI
-- **Long-term memory** — SQLite + FTS5 hybrid retrieval (BM25 + vector RRF), periodic re-indexing, prompt injection with an injection-defense frame
+- **Long-term memory** — three-way retrieval (Skill / Memory / Evidence) fused by hybrid FTS5 + vector RRF; authority-gated writes (only user-explicit facts promote to active memory); background consolidation, conflict detection with LLM-judged auto-resolution, TTL & stale decay; CJK-aware tokenization
 - **MCP support** — stdio JSON-RPC with 60s timeouts, id-correlated responses, out-of-order buffering, OAuth authorization flow
 - **TUI** — Vim-style modal interface: thinking panel, sub-agent cards, approval cards (with args editor), mid-stream input becomes Steer
+- **Desktop app** — Tauri + React desktop client over the ACP stdio transport; approval cards, session timeline, and memory browser
 
 ## Quick Start
 
@@ -54,7 +55,7 @@ Grodex is a CLI tool and ACP server that reads, writes, and runs code in your pr
 ### Install & Run
 
 ```bash
-git clone <this-repository>
+git clone https://github.com/yikaikkk/grodex.git
 cd grodex
 cargo build --release
 
@@ -157,31 +158,35 @@ apply_patch = "ask"
 ```
 
 <details>
-<summary><strong>22 crates</strong> — click to expand the project layout</summary>
+<summary><strong>24 crates</strong> — click to expand the project layout</summary>
 
 ```
 grodex/
 ├── crates/
 │   ├── grodex-core/            # Shared types: ContextItem, IDs, PolicyDecision
-│   ├── grodex-loop/            # Agent Loop: Supervisor, TurnCoordinator, Reducer
+│   ├── grodex-capability/      # Capability descriptors, PreparedCapabilityCall
+│   ├── grodex-rollout/         # JSONL journal single-writer actor, crash recovery
+│   ├── grodex-protocol/        # ACP types, EventEnvelope, stdio transport
+│   ├── grodex-config/          # TOML config, layered merge, hot-reload pipeline
+│   ├── grodex-auth-types/      # Auth / credential shared types
+│   ├── grodex-sandbox-types/   # Sandbox shared types
 │   ├── grodex-provider/        # Canonical request/event model, protocol descriptors
 │   ├── grodex-sampler/         # HTTP client, streaming decoders (3 protocols), failover
-│   ├── grodex-capability/      # Capability descriptors, PreparedCapabilityCall
+│   ├── grodex-loop/            # Agent Loop: Supervisor, TurnCoordinator, Reducer
 │   ├── grodex-permission/      # Policy engine, approval broker, leases, session grants
-│   ├── grodex-sandbox/         # Seatbelt enforcement, path/network validation, limits
 │   ├── grodex-tools/           # Built-in tools: read/write/edit/exec/patch/web_fetch/...
-│   ├── grodex-subagent/        # Sub-agent tree, delegation envelopes, mailbox, protocol
-│   ├── grodex-auth/            # Credential broker, secret stores, MCP OAuth
-│   ├── grodex-config/          # TOML config, layered merge, hot-reload pipeline
-│   ├── grodex-protocol/        # ACP types, EventEnvelope, stdio transport
 │   ├── grodex-skills/          # Skill catalog, progressive disclosure, trust markers
+│   ├── grodex-prompt/          # Four-zone prompt assembly, discovery, budget trimming
+│   ├── grodex-subagent/        # Sub-agent tree, delegation envelopes, mailbox, protocol
+│   ├── grodex-sandbox/         # Seatbelt enforcement, path/network validation, limits
+│   ├── grodex-auth/            # Credential broker, secret stores, MCP OAuth
 │   ├── grodex-mcp/             # MCP client, JSON-RPC process management, OAuth coordinator
 │   ├── grodex-memory/          # SQLite + FTS5 memory store and retrieval
-│   ├── grodex-prompt/          # Four-zone prompt assembly, discovery, budget trimming
-│   ├── grodex-rollout/         # JSONL journal single-writer actor, crash recovery
 │   ├── grodex-telemetry/       # SQLite telemetry projection, queries, retention
 │   ├── grodex-cli/             # CLI entry: run/serve/resume/telemetry/mcp-auth/...
-│   └── grodex-tui/             # Terminal UI (ratatui + crossterm)
+│   ├── grodex-tui/             # Terminal UI (ratatui + crossterm)
+│   ├── grodex-acp-client/      # ACP client library (stdio transport)
+│   └── grodex-desktop/         # Tauri desktop app (React frontend + Rust shell)
 ├── docs/                       # Design docs (14)
 └── config.example.toml
 ```
@@ -243,6 +248,7 @@ Deep design documents live in `docs/`:
 
 | Doc | Topic |
 |---|---|
+| `docs/08-memory-retrieval-v2-design.md` | Three-way memory retrieval, authority-gated writes, consolidation & governance |
 | `docs/09-agent-loop-v2-design.md` | Supervisor → TurnCoordinator → SamplingStep |
 | `docs/11-context-management-v2-design.md` | Rollout journal, compaction, projection |
 | `docs/14-provider-model-adapter-v2-design.md` | Canonical events, wire protocol decoding, failover |

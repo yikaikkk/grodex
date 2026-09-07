@@ -14,7 +14,7 @@
 
 ---
 
-Grodex 是一个能在你的项目中读、写、运行代码的 CLI 工具和 ACP 服务器。它具备崩溃可恢复的 Agent Loop、内核级沙箱强制、SQLite 全程可观测、以及支持 OpenAI / Anthropic / DeepSeek 等多供应商的协议无关架构。
+Grodex 是一个能在你的项目中读、写、运行代码的 CLI 工具、ACP 服务器和桌面应用。它具备崩溃可恢复的 Agent Loop、内核级沙箱强制、SQLite 全程可观测、以及支持 OpenAI / Anthropic / DeepSeek 等多供应商的协议无关架构。
 
 ## 为什么选择 Grodex？
 
@@ -26,7 +26,7 @@ Grodex 是一个能在你的项目中读、写、运行代码的 CLI 工具和 A
 | **可审计** | 17 条运行时不变量，每个动作记入 journal；环境凭证自动剥离 | 黑盒 |
 | **供应商锁定** | 3 种通信协议，多候选故障切换（凭证+端点随候选切换） | 单一厂商 |
 | **Sub-agent** | 统一 agent 树：委托、消息、等待、中断，权限上界 | 扁平或无 |
-| **透明度** | 开源，22 个 crate，919 个测试 | 闭源 |
+| **透明度** | 开源，24 个 crate，919 个测试 | 闭源 |
 
 ## 功能特性
 
@@ -40,9 +40,10 @@ Grodex 是一个能在你的项目中读、写、运行代码的 CLI 工具和 A
 - **exec 资源限制** — 内存（RLIMIT_AS）/ CPU / 文件大小 / 进程数 rlimits + setsid 进程组隔离，超时/取消整组击杀；凭证类环境变量自动剥离
 - **多供应商** — OpenAI Responses、Chat Completions（DeepSeek/Qwen 思考模式）、Anthropic Messages；故障切换时凭证与端点随候选切换
 - **Credential Broker** — 主凭证对代理不可见；一次性租约防重放；MCP OAuth 授权码流 CLI
-- **长期记忆** — SQLite + FTS5 混合检索（BM25 + 向量 RRF），周期重建索引，注入提示词带注入防御框架
+- **长期记忆** — 三路检索（Skill / Memory / Evidence）+ 混合 FTS5 + 向量 RRF 融合；权威门控写入（只有用户明确表达的事实才能转正为活跃记忆）；后台整合、确定性冲突检测 + LLM 裁决自动解决、TTL 过期与陈旧衰减；CJK 感知分词
 - **MCP 支持** — stdio JSON-RPC，60s 超时 + 按 id 关联 + 乱序缓冲，OAuth 授权流
 - **TUI** — Vim 风格模态界面：思考面板、Sub-agent 卡片、审批卡（含参数编辑）、流式中输入自动 Steer
+- **桌面应用** — Tauri + React 桌面客户端，走 ACP stdio 传输；审批卡片、会话时间线、记忆浏览
 
 ## 快速开始
 
@@ -156,31 +157,35 @@ apply_patch = "ask"
 ```
 
 <details>
-<summary><strong>22 个 crate</strong> — 点击展开项目结构</summary>
+<summary><strong>24 个 crate</strong> — 点击展开项目结构</summary>
 
 ```
 grodex/
 ├── crates/
 │   ├── grodex-core/            # 共享类型：ContextItem, ID, PolicyDecision
-│   ├── grodex-loop/            # Agent Loop：Supervisor, TurnCoordinator, Reducer
+│   ├── grodex-capability/      # 能力描述符，PreparedCapabilityCall
+│   ├── grodex-rollout/         # JSONL journal 单写者 actor，崩溃恢复
+│   ├── grodex-protocol/        # ACP 类型，EventEnvelope，stdio 传输
+│   ├── grodex-config/          # TOML 配置，分层合并，热更新管线
+│   ├── grodex-auth-types/      # 认证 / 凭证共享类型
+│   ├── grodex-sandbox-types/   # 沙箱共享类型
 │   ├── grodex-provider/        # 规范请求/事件模型，通信协议描述符
 │   ├── grodex-sampler/         # HTTP 客户端，流式解码器（3 种协议），故障切换
-│   ├── grodex-capability/      # 能力描述符，PreparedCapabilityCall
+│   ├── grodex-loop/            # Agent Loop：Supervisor, TurnCoordinator, Reducer
 │   ├── grodex-permission/      # 策略引擎，审批 Broker，权限租约，会话 grant
-│   ├── grodex-sandbox/         # Seatbelt 强制，路径/网络校验，资源限制
 │   ├── grodex-tools/           # 内置工具：read/write/edit/exec/patch/web_fetch/...
-│   ├── grodex-subagent/        # Sub-agent 树，委托信封，邮箱，协作协议
-│   ├── grodex-auth/            # 凭证 Broker，密钥存储，MCP OAuth
-│   ├── grodex-config/          # TOML 配置，分层合并，热更新管线
-│   ├── grodex-protocol/        # ACP 类型，EventEnvelope，stdio 传输
 │   ├── grodex-skills/          # Skill 目录，渐进式披露，trust 标记
+│   ├── grodex-prompt/          # 提示词四区装配，指令发现，预算裁剪
+│   ├── grodex-subagent/        # Sub-agent 树，委托信封，邮箱，协作协议
+│   ├── grodex-sandbox/         # Seatbelt 强制，路径/网络校验，资源限制
+│   ├── grodex-auth/            # 凭证 Broker，密钥存储，MCP OAuth
 │   ├── grodex-mcp/             # MCP 客户端，JSON-RPC 进程管理，OAuth 协调
 │   ├── grodex-memory/          # SQLite + FTS5 记忆存储与检索
-│   ├── grodex-prompt/          # 提示词四区装配，指令发现，预算裁剪
-│   ├── grodex-rollout/         # JSONL journal 单写者 actor，崩溃恢复
 │   ├── grodex-telemetry/       # SQLite 遥测投影，查询，保留期
 │   ├── grodex-cli/             # CLI 入口：run/serve/resume/telemetry/mcp-auth/...
-│   └── grodex-tui/             # 终端 UI（ratatui + crossterm）
+│   ├── grodex-tui/             # 终端 UI（ratatui + crossterm）
+│   ├── grodex-acp-client/      # ACP 客户端库（stdio 传输）
+│   └── grodex-desktop/         # Tauri 桌面应用（React 前端 + Rust 外壳）
 ├── docs/                       # 设计文档（14 份）
 └── config.example.toml
 ```
@@ -242,6 +247,7 @@ cargo test -p grodex-loop
 
 | 文档 | 说明 |
 |---|---|
+| [记忆系统](docs/08-memory-retrieval-v2-design.md) | 三路记忆检索、权威门控写入、整合与治理 |
 | [Agent Loop](docs/09-agent-loop-v2-design.md) | Supervisor → TurnCoordinator → SamplingStep |
 | [上下文管理](docs/11-context-management-v2-design.md) | Rollout Journal、压缩、投影 |
 | [供应商适配](docs/14-provider-model-adapter-v2-design.md) | 规范事件、通信协议解码、故障切换 |
