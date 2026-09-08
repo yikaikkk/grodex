@@ -1,4 +1,4 @@
-import { Settings, GitBranch, Brain } from 'lucide-react';
+import { Settings, GitBranch, Brain, Activity } from 'lucide-react';
 import { Session } from '../types';
 
 interface HeaderProps {
@@ -7,6 +7,7 @@ interface HeaderProps {
   isAgentTreeOpen: boolean;
   onOpenSettings: () => void;
   onOpenMemory: () => void;
+  onOpenObservability: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -15,6 +16,7 @@ export const Header: React.FC<HeaderProps> = ({
   isAgentTreeOpen,
   onOpenSettings,
   onOpenMemory,
+  onOpenObservability,
 }) => {
   return (
     <header
@@ -54,6 +56,15 @@ export const Header: React.FC<HeaderProps> = ({
           title="记忆管理"
         >
           <Brain className="w-4 h-4 text-[#4a638b]" />
+        </button>
+
+        <button
+          id="header-observability-btn"
+          onClick={onOpenObservability}
+          className="p-1.5 rounded-md bg-[#ffffff] hover:bg-[#f0f0f2] text-[#4d535b] border border-[#dcdce0] transition-all shadow-xs"
+          title="可观测"
+        >
+          <Activity className="w-4 h-4 text-[#4a638b]" />
         </button>
 
         <button

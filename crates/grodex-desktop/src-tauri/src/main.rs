@@ -9,6 +9,7 @@
 mod commands;
 mod memory_ui;
 mod sessions;
+mod telemetry_ui;
 mod transport;
 
 use std::sync::{mpsc, Mutex};
@@ -42,6 +43,9 @@ fn main() {
             memory_ui::list_memories,
             memory_ui::delete_memory,
             memory_ui::run_memory_maintenance,
+            telemetry_ui::telemetry_overview,
+            telemetry_ui::telemetry_session,
+            telemetry_ui::telemetry_doctor,
         ])
         .build(tauri::generate_context!())
         .expect("error while building grodex desktop");

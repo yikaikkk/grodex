@@ -931,6 +931,121 @@ export async function runMemoryMaintenance(): Promise<MaintenanceReport> {
   return invoke<MaintenanceReport>('run_memory_maintenance');
 }
 
+// ── Observability (telemetry) ────────────────────────────────────────────
+
+export interface ModelAgg {
+  provider: string;
+  model: string;
+  calls: number;
+  errors: number;
+  avgMs: number;
+  maxMs: number;
+  avgFirstTokenMs: number | null;
+  cacheHitRate: number | null;
+  totalInputTokens: number;
+  totalCachedTokens: number;
+}
+
+export interface CacheStats {
+  provider: string;
+  model: string;
+  calls: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheCreationTokens: number;
+  cacheHitRate: number | null;
+}
+
+export interface TelemetryOverview {
+  sessions: number;
+  turns: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCachedTokens: number;
+  totalCacheCreationTokens: number;
+  overallCacheHitRate: number | null;
+  models: ModelAgg[];
+  cache: CacheStats[];
+}
+
+export interface TurnModelAttempt {
+  provider: string;
+  model: string;
+  attempts: number | null;
+  status: string | null;
+  errorClass: string | null;
+  httpStatus: number | null;
+  durationMs: number | null;
+  firstTokenMs: number | null;
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheCreationTokens: number | null;
+  outputTokens: number | null;
+  reasoningTokens: number | null;
+  totalTokens: number | null;
+}
+
+export interface MemoryRetrieval {
+  turnId: string | null;
+  queryChars: number | null;
+  selectedCount: number | null;
+  durationMs: number | null;
+  routerKind: string | null;
+  occurredAt: string;
+}
+
+export interface TurnDetail {
+  turnId: string;
+  status: string;
+  terminationReason: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  durationMs: number | null;
+  steps: number | null;
+  modelCalls: number | null;
+  toolCalls: number | null;
+  retries: number | null;
+  attempts: TurnModelAttempt[];
+  memoryRetrievals: MemoryRetrieval[];
+}
+
+export interface SessionDetail {
+  sessionId: string;
+  turns: TurnDetail[];
+}
+
+export interface TelemetryError {
+  occurredAt: string;
+  sessionId: string;
+  kind: string;
+  status: string | null;
+  callId: string | null;
+}
+
+export interface DoctorReport {
+  openTurns: number;
+  runningTools: number;
+  uncommittedResults: number;
+  failedAttempts: number;
+  indeterminateTools: number;
+  inFlightCompactions: number;
+  totalEvents: number;
+  totalSessions: number;
+  errors: TelemetryError[];
+}
+
+export async function telemetryOverview(): Promise<TelemetryOverview> {
+  return invoke<TelemetryOverview>('telemetry_overview');
+}
+
+export async function telemetrySession(sessionId: string): Promise<SessionDetail> {
+  return invoke<SessionDetail>('telemetry_session', { sessionId });
+}
+
+export async function telemetryDoctor(): Promise<DoctorReport> {
+  return invoke<DoctorReport>('telemetry_doctor');
+}
+
 export async function loadConfig(): Promise<SettingsState> {
   const cfg = await invoke<ConfigSummaryJson>('get_config');
   const provider = (cfg.provider || 'deepseek') as SettingsState['provider'];

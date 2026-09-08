@@ -18,6 +18,7 @@ import { ApprovalModal } from './components/ApprovalModal';
 import { SettingsModal } from './components/SettingsModal';
 import { EmptyState } from './components/EmptyState';
 import { MemoryManager } from './components/MemoryManager';
+import { ObservabilityPanel } from './components/ObservabilityPanel';
 import { AlertTriangle, RotateCcw, XCircle, Check, Loader2, Trash2 } from 'lucide-react';
 
 interface IndeterminateReq {
@@ -54,6 +55,7 @@ export default function App() {
   const [isAgentTreeOpen, setIsAgentTreeOpen] = useState<boolean>(true);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [isMemoryOpen, setIsMemoryOpen] = useState<boolean>(false);
+  const [isObservabilityOpen, setIsObservabilityOpen] = useState<boolean>(false);
   const [settings, setSettings] = useState<SettingsState>(makeDefaultSettings);
 
   // App-owned dialogs (window.confirm / window.prompt are unavailable in the
@@ -600,6 +602,7 @@ export default function App() {
         isAgentTreeOpen={isAgentTreeOpen}
         onOpenSettings={() => setIsSettingsOpen(true)}
         onOpenMemory={() => setIsMemoryOpen(true)}
+        onOpenObservability={() => setIsObservabilityOpen(true)}
       />
 
       {/* Transient banners (compaction / notices) */}
@@ -844,6 +847,14 @@ export default function App() {
       <MemoryManager
         isOpen={isMemoryOpen}
         onClose={() => setIsMemoryOpen(false)}
+      />
+
+      {/* Observability panel */}
+      <ObservabilityPanel
+        isOpen={isObservabilityOpen}
+        onClose={() => setIsObservabilityOpen(false)}
+        sessions={sessions}
+        activeSessionId={activeSessionId}
       />
     </div>
   );

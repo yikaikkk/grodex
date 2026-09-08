@@ -27,8 +27,9 @@ pub use record::{
 };
 pub use schema::SCHEMA_VERSION;
 pub use query::{
-    cache_stats, doctor, errors, projection_cursor, recovery_anomalies, session_turns, sessions,
-    slow_models, slow_tools, timeline, turn, CacheStatsRow, DoctorReport, ErrorRow, ModelAgg,
-    RecoveryRow, SessionRow, TimelineRow, ToolAgg, TurnRow,
+    cache_stats, doctor, errors, memory_retrieval_latency, overview, projection_cursor,
+    recovery_anomalies, session_turns, sessions, slow_models, slow_tools, timeline, turn,
+    turn_model_attempts, CacheStatsRow, DoctorReport, ErrorRow, MemoryRetrievalRow, ModelAgg,
+    OverviewTotals, RecoveryRow, SessionRow, TimelineRow, ToolAgg, TurnModelAttemptRow, TurnRow,
 };
 pub use sqlite::{retain, SqliteTelemetrySink, TelemetryGuard};

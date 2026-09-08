@@ -1438,6 +1438,7 @@ impl SessionSupervisor {
                         "memory_count": memory_final.len(),
                         "evidence_count": evidence_final.len(),
                         "skill_count": skill_units.len(),
+                        "selected_count": memory_final.len() + evidence_final.len() + skill_units.len(),
                         "router_memory": decision.memory_enabled,
                         "router_evidence": decision.evidence_enabled,
                         "router_skill": decision.skill_enabled,

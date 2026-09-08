@@ -22,6 +22,8 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
+rusqlite = { workspace = true }
 grodex-acp-client = { workspace = true }
 grodex-protocol = { workspace = true }
 grodex-memory = { workspace = true }
+grodex-telemetry = { workspace = true }

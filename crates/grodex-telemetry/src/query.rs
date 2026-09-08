@@ -191,8 +191,8 @@ pub fn slow_models(conn: &Connection, limit: u32) -> Result<Vec<ModelAgg>, rusql
            LIMIT ?1"#,
     )?;
     let rows = stmt.query_map([limit], |r| {
-        let input: i64 = r.get(6)?;
-        let cached: i64 = r.get(7)?;
+        let input: i64 = r.get(7)?;
+        let cached: i64 = r.get(8)?;
         Ok(ModelAgg {
             provider: r.get(0)?,
             model: r.get(1)?,
@@ -385,4 +385,128 @@ pub fn recovery_anomalies(conn: &Connection) -> Result<Vec<RecoveryRow>, rusqlit
         })
     })?;
     rows.collect()
+}
+
+// ── P5: desktop observability panel support ─────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct TurnModelAttemptRow {
+    pub provider: String,
+    pub model: String,
+    pub attempts: Option<i64>,
+    pub status: Option<String>,
+    pub error_class: Option<String>,
+    pub http_status: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub first_token_ms: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+}
+
+/// Per-turn model-attempt detail (TTFT, token usage, cache, error) — the
+/// row source for the desktop's per-session drill-down. Mirrors the raw SQL
+/// previously inlined in `grodex-cli`'s `turn_detail` formatter.
+pub fn turn_model_attempts(
+    conn: &Connection,
+    turn_id: &str,
+) -> Result<Vec<TurnModelAttemptRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"SELECT provider, model, attempts, status, error_class, http_status,
+                  duration_ms, first_token_ms,
+                  input_tokens, cached_input_tokens, cache_creation_tokens,
+                  output_tokens, reasoning_tokens, total_tokens
+           FROM model_attempts WHERE turn_id = ?1 ORDER BY started_at ASC"#,
+    )?;
+    let rows = stmt.query_map([turn_id], |r| {
+        Ok(TurnModelAttemptRow {
+            provider: r.get(0)?,
+            model: r.get(1)?,
+            attempts: r.get(2)?,
+            status: r.get(3)?,
+            error_class: r.get(4)?,
+            http_status: r.get(5)?,
+            duration_ms: r.get(6)?,
+            first_token_ms: r.get(7)?,
+            input_tokens: r.get(8)?,
+            cached_input_tokens: r.get(9)?,
+            cache_creation_tokens: r.get(10)?,
+            output_tokens: r.get(11)?,
+            reasoning_tokens: r.get(12)?,
+            total_tokens: r.get(13)?,
+        })
+    })?;
+    rows.collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryRetrievalRow {
+    pub turn_id: Option<String>,
+    pub query_chars: Option<i64>,
+    pub selected_count: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub router_kind: Option<String>,
+    pub occurred_at: String,
+}
+
+/// Memory-retrieval latency per turn for one session (out-of-band
+/// `memory_retrievals` projection). Answers 检索记忆耗时 + 命中条数.
+pub fn memory_retrieval_latency(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<MemoryRetrievalRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"SELECT turn_id, query_chars, selected_count, duration_ms, router_kind, occurred_at
+           FROM memory_retrievals WHERE session_id = ?1 ORDER BY occurred_at ASC"#,
+    )?;
+    let rows = stmt.query_map([session_id], |r| {
+        Ok(MemoryRetrievalRow {
+            turn_id: r.get(0)?,
+            query_chars: r.get(1)?,
+            selected_count: r.get(2)?,
+            duration_ms: r.get(3)?,
+            router_kind: r.get(4)?,
+            occurred_at: r.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OverviewTotals {
+    pub sessions: i64,
+    pub turns: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub overall_cache_hit_rate: Option<f64>,
+}
+
+/// Whole-database aggregate counters for the desktop overview panel —
+/// session/turn counts plus token totals and the overall prompt-cache hit
+/// rate (provider-reported cached ÷ input).
+pub fn overview(conn: &Connection) -> Result<OverviewTotals, rusqlite::Error> {
+    let one = |sql: &str| -> Result<i64, rusqlite::Error> { conn.query_row(sql, [], |r| r.get(0)) };
+    let input_tokens = one("SELECT COALESCE(SUM(input_tokens), 0) FROM model_attempts")?;
+    let cached_input_tokens =
+        one("SELECT COALESCE(SUM(cached_input_tokens), 0) FROM model_attempts")?;
+    Ok(OverviewTotals {
+        sessions: one("SELECT COUNT(*) FROM sessions")?,
+        turns: one("SELECT COUNT(*) FROM turns")?,
+        input_tokens,
+        output_tokens: one("SELECT COALESCE(SUM(output_tokens), 0) FROM model_attempts")?,
+        cached_input_tokens,
+        cache_creation_tokens: one(
+            "SELECT COALESCE(SUM(cache_creation_tokens), 0) FROM model_attempts",
+        )?,
+        overall_cache_hit_rate: if input_tokens > 0 {
+            Some(cached_input_tokens as f64 / input_tokens as f64)
+        } else {
+            None
+        },
+    })
 }
