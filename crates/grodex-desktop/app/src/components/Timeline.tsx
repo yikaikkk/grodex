@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { User, Bot, Copy, Check, Clock, Cpu, Brain, ChevronDown, ChevronRight, Wrench } from 'lucide-react';
+import { Bot, Copy, Check, Clock, Cpu, Brain, ChevronDown, ChevronRight, Wrench } from 'lucide-react';
 import { TimelineItem, ToolItem } from '../types';
 import { ToolCard } from './ToolCard';
 
@@ -98,7 +98,7 @@ function FrameBody({
             >
               {it.content}
               {it.isStreaming && (
-                <span className="inline-block w-1.5 h-3.5 ml-1 bg-[#4a5f82] animate-cursor-blink align-middle rounded-full" />
+                <span className="inline-block w-1.5 h-3.5 ml-1 bg-accent animate-cursor-blink align-middle rounded-full" />
               )}
             </div>
           );
@@ -138,26 +138,26 @@ function ThinkingFrame({
   const toolCount = items.filter((i) => i.type === 'tool').length;
 
   return (
-    <div className="rounded-2xl border border-[#e5dfd4] bg-[#fbf9f5] overflow-hidden shadow-xs">
+    <div className="rounded-2xl border border-hairline bg-card overflow-hidden shadow-xs">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3.5 py-2 border-b border-[#ece6dc] bg-[#f5f1ea] text-left text-xs select-none"
+        className="w-full flex items-center gap-2 px-3.5 py-2 border-b border-hairline bg-well text-left text-xs select-none"
         title={expanded ? '收起为小框' : '展开为大框'}
       >
-        <span className="w-4 h-4 rounded-full bg-[#e5dfd4] flex items-center justify-center text-[#4a5f82] shrink-0">
+        <span className="w-4 h-4 rounded-full bg-well flex items-center justify-center text-accent shrink-0">
           <Brain className="w-3 h-3" />
         </span>
-        <span className="font-medium text-[#524c42] shrink-0">思考过程</span>
-        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-[#ece6dc] text-[10px] text-[#7a7469] font-mono shrink-0">
+        <span className="font-medium text-primary shrink-0">思考过程</span>
+        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-well text-[10px] text-secondary font-mono shrink-0">
           <Wrench className="w-2.5 h-2.5" />
           {toolCount}
         </span>
         {expanded ? (
-          <span className="ml-auto text-[10px] text-[#9b9385]">收起为小框</span>
+          <span className="ml-auto text-[10px] text-tertiary">收起为小框</span>
         ) : (
-          <span className="ml-auto text-[10px] text-[#9b9385]">展开为大框</span>
+          <span className="ml-auto text-[10px] text-tertiary">展开为大框</span>
         )}
-        <span className="text-[#9b9385] shrink-0">
+        <span className="text-tertiary shrink-0">
           {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
         </span>
       </button>
@@ -214,22 +214,19 @@ export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff }) => {
         <div
           key={item.id}
           id={`timeline-user-msg-${item.id}`}
-          className="flex justify-end items-start gap-2.5 my-3 pl-12 sm:pl-24"
+          className="flex justify-end my-3 pl-12 sm:pl-24"
         >
           <div className="flex flex-col items-end max-w-[85%] sm:max-w-[75%]">
-            <div className="relative rounded-2xl bg-[#eef2f9] text-[#1d222b] px-4.5 py-3 text-sm leading-relaxed border border-[#d6e2f1] shadow-2xs break-words select-text">
+            <div className="relative rounded-2xl rounded-br-md bg-accent text-white px-4 py-2.5 text-sm leading-relaxed shadow-sm break-words select-text">
               <p className="whitespace-pre-wrap font-sans text-sm bubble-wrap">
                 {item.content}
               </p>
             </div>
             {item.timestamp && (
-              <span className="text-[10px] text-[#8e95a1] mt-1 pr-1 font-sans">
+              <span className="text-[10px] text-tertiary mt-1 pr-1 font-sans">
                 {item.timestamp}
               </span>
             )}
-          </div>
-          <div className="w-8 h-8 rounded-lg bg-[#dfe7f3] border border-[#cad6e6] flex items-center justify-center text-[#374967] shrink-0 mt-0.5 shadow-2xs select-none">
-            <User className="w-4 h-4" />
           </div>
         </div>
       );
@@ -242,29 +239,29 @@ export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff }) => {
         id={`timeline-assistant-msg-${item.id}`}
         className="flex justify-start items-start gap-2.5 my-3 w-full pr-2 sm:pr-6"
       >
-        <div className="w-8 h-8 rounded-lg bg-[#f0ede6] border border-[#ded8cd] flex items-center justify-center text-[#4a5f82] shrink-0 mt-0.5 shadow-2xs select-none">
+        <div className="w-8 h-8 rounded-lg bg-well border border-hairline flex items-center justify-center text-accent shrink-0 mt-0.5 shadow-2xs select-none">
           <Bot className="w-4 h-4" />
         </div>
         <div className="flex flex-col items-start flex-1 min-w-0">
-          <div className="w-full relative rounded-2xl bg-[#ffffff] border border-[#e8e6e1] p-4.5 text-[#2a2e35] shadow-2xs text-sm leading-relaxed break-words">
-            <div className="md-body prose prose-stone prose-sm max-w-none text-[#2b3036] prose-headings:text-[#1c2024] prose-headings:font-bold prose-p:leading-relaxed prose-pre:bg-[#f6f3ed] prose-pre:border prose-pre:border-[#e6e0d5] prose-pre:rounded-xl prose-pre:w-full prose-code:font-mono prose-code:text-[#2d3238] prose-code:bg-[#f2efe8] prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:border prose-code:border-[#e4ded3] prose-strong:text-[#1c2024]">
+          <div className="w-full relative rounded-2xl bg-white border border-hairline p-4.5 text-primary shadow-2xs text-sm leading-relaxed break-words">
+            <div className="md-body prose prose-stone prose-sm max-w-none text-primary prose-headings:text-primary prose-headings:font-bold prose-p:leading-relaxed prose-pre:bg-well prose-pre:border prose-pre:border-hairline prose-pre:rounded-xl prose-pre:w-full prose-code:font-mono prose-code:text-primary prose-code:bg-well prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:border prose-code:border-hairline prose-strong:text-primary">
               <ReactMarkdown>{item.content}</ReactMarkdown>
             </div>
-            <div className="flex items-center justify-between mt-3.5 pt-2.5 border-t border-[#f0ebe2] text-[11px] font-sans text-[#8a919e] gap-4">
+            <div className="flex items-center justify-between mt-3.5 pt-2.5 border-t border-hairline-2 text-[11px] font-sans text-secondary gap-4">
               <div className="flex items-center gap-3">
                 <span className="flex items-center gap-1 font-sans">
-                  <Cpu className="w-3 h-3 text-[#9aa0aa]" />
+                  <Cpu className="w-3 h-3 text-tertiary" />
                   {item.tokens ?? item.content.length} 令牌
                 </span>
               </div>
               <button
                 id={`copy-assistant-msg-${item.id}`}
                 onClick={() => handleCopyText(item.id, item.content)}
-                className="flex items-center gap-1 px-2 py-0.5 rounded-md hover:bg-[#f5f1ea] text-[#787f8c] hover:text-[#2b3036] transition-colors"
+                className="flex items-center gap-1 px-2 py-0.5 rounded-md hover:bg-well text-secondary hover:text-primary transition-colors"
                 title="复制回复内容"
               >
                 {copiedId === item.id ? (
-                  <Check className="w-3 h-3 text-[#256e2c]" />
+                  <Check className="w-3 h-3 text-green-dark" />
                 ) : (
                   <Copy className="w-3 h-3" />
                 )}
@@ -273,7 +270,7 @@ export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff }) => {
             </div>
           </div>
           {item.timestamp && (
-            <span className="text-[10px] text-[#8e95a1] mt-1 pl-1 font-sans">
+            <span className="text-[10px] text-tertiary mt-1 pl-1 font-sans">
               {item.timestamp}
             </span>
           )}

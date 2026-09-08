@@ -31,10 +31,10 @@ function pct(rate: number | null): string {
 
 function StatCard({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
-    <div className="flex-1 min-w-[110px] px-3 py-2.5 rounded-xl bg-white border border-[#e6e0d6]">
-      <div className="text-[10px] text-[#8a919e] uppercase tracking-wide">{label}</div>
-      <div className="text-lg font-bold text-[#20232a] mt-0.5">{value}</div>
-      {hint && <div className="text-[10px] text-[#a0a6b0] mt-0.5">{hint}</div>}
+    <div className="flex-1 min-w-[110px] px-3 py-2.5 rounded-xl bg-white border border-hairline">
+      <div className="text-[10px] text-secondary uppercase tracking-wide">{label}</div>
+      <div className="text-lg font-bold text-primary mt-0.5">{value}</div>
+      {hint && <div className="text-[10px] text-tertiary mt-0.5">{hint}</div>}
     </div>
   );
 }
@@ -105,17 +105,17 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
   });
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#21262d]/40 backdrop-blur-xs">
-      <div className="w-full max-w-5xl h-[88vh] rounded-3xl bg-[#faf9f7] border border-[#e2ddd3] shadow-2xl flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+      <div className="w-full max-w-5xl h-[88vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="px-5 py-3.5 bg-white border-b border-[#ece6dc] flex items-center justify-between">
+        <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <div className="p-1.5 rounded-xl bg-[#eef2f9] text-[#4a5f82] border border-[#dce5f2]">
+            <div className="p-1.5 rounded-xl bg-accent-soft text-accent border border-accent-soft">
               <Activity className="w-4 h-4" />
             </div>
             <div>
-              <h3 className="text-sm font-bold text-[#2b3036]">可观测</h3>
-              <p className="text-[11px] text-[#717782]">
+              <h3 className="text-sm font-bold text-primary">可观测</h3>
+              <p className="text-[11px] text-secondary">
                 {overview
                   ? `${overview.sessions} 会话 · ${overview.turns} 轮 · 首 token / token 消耗 / cache 命中率（~/.grodex/telemetry.db）`
                   : '加载中…'}
@@ -124,14 +124,14 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-full hover:bg-[#f0ece5] text-[#717782] transition-colors"
+            className="p-1.5 rounded-full hover:bg-black/[0.05] text-secondary transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
         {notice && (
-          <div className="px-5 py-2 bg-[#fdf0f0] text-[#b83838] text-xs border-b border-[#f6cfcf]">
+          <div className="px-5 py-2 bg-red-soft text-red-dark text-xs border-b border-red-soft">
             {notice}
           </div>
         )}
@@ -140,8 +140,8 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
         <div className="flex-1 overflow-y-auto p-5 space-y-6 text-xs">
           {/* Global overview */}
           <section>
-            <h4 className="flex items-center gap-1.5 font-semibold text-[#20232a] mb-2">
-              <Gauge className="w-3.5 h-3.5 text-[#4a638b]" /> 全局概览
+            <h4 className="flex items-center gap-1.5 font-semibold text-primary mb-2">
+              <Gauge className="w-3.5 h-3.5 text-accent" /> 全局概览
             </h4>
             <div className="flex flex-wrap gap-2">
               <StatCard label="会话" value={overview ? `${overview.sessions}` : '—'} />
@@ -166,12 +166,12 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
           {/* Per-model */}
           {models.length > 0 && (
             <section>
-              <h4 className="flex items-center gap-1.5 font-semibold text-[#20232a] mb-2">
-                <Database className="w-3.5 h-3.5 text-[#4a638b]" /> 按模型（首 token / 延迟 / 缓存）
+              <h4 className="flex items-center gap-1.5 font-semibold text-primary mb-2">
+                <Database className="w-3.5 h-3.5 text-accent" /> 按模型（首 token / 延迟 / 缓存）
               </h4>
-              <div className="rounded-xl bg-white border border-[#e6e0d6] overflow-hidden">
+              <div className="rounded-xl bg-white border border-hairline overflow-hidden">
                 <table className="w-full text-[11px]">
-                  <thead className="bg-[#f6f3ee] text-[#717782]">
+                  <thead className="bg-well text-secondary">
                     <tr>
                       <th className="text-left px-3 py-1.5 font-medium">模型</th>
                       <th className="text-right px-3 py-1.5 font-medium">调用</th>
@@ -184,12 +184,12 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                   </thead>
                   <tbody>
                     {models.map((m) => (
-                      <tr key={`${m.provider}/${m.model}`} className="border-t border-[#f0ece5]">
-                        <td className="px-3 py-1.5 font-mono text-[#3a3f45]">
+                      <tr key={`${m.provider}/${m.model}`} className="border-t border-hairline-2">
+                        <td className="px-3 py-1.5 font-mono text-primary">
                           {m.provider}/{m.model}
                         </td>
                         <td className="text-right px-3 py-1.5">{m.calls}</td>
-                        <td className={`text-right px-3 py-1.5 ${m.errors > 0 ? 'text-[#b83838]' : ''}`}>{m.errors}</td>
+                        <td className={`text-right px-3 py-1.5 ${m.errors > 0 ? 'text-red-dark' : ''}`}>{m.errors}</td>
                         <td className="text-right px-3 py-1.5 font-mono">{fmtMs(m.avgFirstTokenMs)}</td>
                         <td className="text-right px-3 py-1.5 font-mono">{fmtMs(m.avgMs)}</td>
                         <td className="text-right px-3 py-1.5 font-mono">{pct(m.cacheHitRate)}</td>
@@ -205,10 +205,10 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
           {/* Cache detail */}
           {cache.length > 0 && (
             <section>
-              <h4 className="font-semibold text-[#20232a] mb-2">缓存明细</h4>
-              <div className="rounded-xl bg-white border border-[#e6e0d6] overflow-hidden">
+              <h4 className="font-semibold text-primary mb-2">缓存明细</h4>
+              <div className="rounded-xl bg-white border border-hairline overflow-hidden">
                 <table className="w-full text-[11px]">
-                  <thead className="bg-[#f6f3ee] text-[#717782]">
+                  <thead className="bg-well text-secondary">
                     <tr>
                       <th className="text-left px-3 py-1.5 font-medium">模型</th>
                       <th className="text-right px-3 py-1.5 font-medium">输入</th>
@@ -219,8 +219,8 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                   </thead>
                   <tbody>
                     {cache.map((c) => (
-                      <tr key={`${c.provider}/${c.model}`} className="border-t border-[#f0ece5]">
-                        <td className="px-3 py-1.5 font-mono text-[#3a3f45]">
+                      <tr key={`${c.provider}/${c.model}`} className="border-t border-hairline-2">
+                        <td className="px-3 py-1.5 font-mono text-primary">
                           {c.provider}/{c.model}
                         </td>
                         <td className="text-right px-3 py-1.5 font-mono">{fmtTokens(c.inputTokens)}</td>
@@ -238,11 +238,11 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
           {/* Session drill-down */}
           <section>
             <div className="flex items-center justify-between mb-2">
-              <h4 className="font-semibold text-[#20232a]">会话下钻</h4>
+              <h4 className="font-semibold text-primary">会话下钻</h4>
               <select
                 value={selectedSessionId}
                 onChange={(e) => handleSelectSession(e.target.value)}
-                className="px-2 py-1 rounded-lg bg-white border border-[#e2ddd3] text-xs text-[#3a3f45] max-w-[320px]"
+                className="px-2 py-1 rounded-lg bg-white border border-hairline text-xs text-primary max-w-[320px]"
               >
                 <option value="">选择会话…</option>
                 {sessions.map((s) => (
@@ -254,11 +254,11 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
             </div>
 
             {!selectedSessionId ? (
-              <div className="px-3 py-4 rounded-xl border border-dashed border-[#e2ddd3] text-center text-[#8a919e]">
+              <div className="px-3 py-4 rounded-xl border border-dashed border-hairline text-center text-secondary">
                 选择会话查看每轮的首 token 耗时 / token 消耗 / 记忆检索耗时
               </div>
             ) : turns.length === 0 ? (
-              <div className="px-3 py-4 rounded-xl border border-dashed border-[#e2ddd3] text-center text-[#8a919e]">
+              <div className="px-3 py-4 rounded-xl border border-dashed border-hairline text-center text-secondary">
                 该会话暂无 telemetry 轮次记录
               </div>
             ) : (
@@ -266,35 +266,35 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                 {turnStats.map(({ t, firstTtft, input, output, cached, cacheRate }) => (
                   <details
                     key={t.turnId}
-                    className="group rounded-xl bg-white border border-[#e6e0d6] open:shadow-sm"
+                    className="group rounded-xl bg-white border border-hairline open:shadow-sm"
                   >
                     <summary className="px-3 py-2 cursor-pointer list-none flex items-center gap-2">
-                      <span className="font-mono text-[10px] text-[#a0a6b0]">{t.turnId.slice(0, 8)}…</span>
-                      <span className="flex-1 text-[#8a919e] truncate">
+                      <span className="font-mono text-[10px] text-tertiary">{t.turnId.slice(0, 8)}…</span>
+                      <span className="flex-1 text-secondary truncate">
                         {t.startedAt?.slice(11, 19) ?? '—'} · {t.status}
                         {t.terminationReason ? ` (${t.terminationReason})` : ''}
                       </span>
-                      <span className="font-mono text-[11px] text-[#4a5f82]">TTFT {fmtMs(firstTtft)}</span>
-                      <span className="font-mono text-[11px] text-[#3a3f45]">耗时 {fmtMs(t.durationMs)}</span>
-                      <span className="font-mono text-[11px] text-[#717782]">
+                      <span className="font-mono text-[11px] text-accent">TTFT {fmtMs(firstTtft)}</span>
+                      <span className="font-mono text-[11px] text-primary">耗时 {fmtMs(t.durationMs)}</span>
+                      <span className="font-mono text-[11px] text-secondary">
                         in {fmtTokens(input)} / out {fmtTokens(output)}
                       </span>
-                      <span className="font-mono text-[11px] text-[#b07419]">
+                      <span className="font-mono text-[11px] text-orange-dark">
                         命中率 {pct(cacheRate)}
                       </span>
-                      <span className="font-mono text-[11px] text-[#a0a6b0]">
+                      <span className="font-mono text-[11px] text-tertiary">
                         cache {cached > 0 ? fmtTokens(cached) : '0'}
                       </span>
                     </summary>
                     <div className="px-3 pb-2 space-y-1.5">
                       {/* Memory retrieval latency */}
                       {t.memoryRetrievals.length > 0 && (
-                        <div className="text-[11px] text-[#717782]">
+                        <div className="text-[11px] text-secondary">
                           {t.memoryRetrievals.map((m, i) => (
                             <div key={i} className="flex items-center gap-2 py-0.5">
-                              <span className="text-[#a0a6b0]">记忆检索</span>
-                              <span className="font-mono text-[#4a5f82]">{fmtMs(m.durationMs)}</span>
-                              <span className="text-[#a0a6b0]">
+                              <span className="text-tertiary">记忆检索</span>
+                              <span className="font-mono text-accent">{fmtMs(m.durationMs)}</span>
+                              <span className="text-tertiary">
                                 命中 {m.selectedCount ?? 0} 条 · {m.routerKind ?? '—'}
                               </span>
                             </div>
@@ -303,9 +303,9 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                       )}
                       {/* Model attempts */}
                       {t.attempts.length > 0 && (
-                        <div className="rounded-lg bg-[#f8f6f2] border border-[#eee9e0] overflow-hidden">
+                        <div className="rounded-lg bg-well border border-hairline-2 overflow-hidden">
                           <table className="w-full text-[10px]">
-                            <thead className="bg-[#f1ede6] text-[#8a919e]">
+                            <thead className="bg-well text-secondary">
                               <tr>
                                 <th className="text-left px-2 py-1 font-medium">模型</th>
                                 <th className="text-right px-2 py-1 font-medium">TTFT</th>
@@ -319,15 +319,15 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                             </thead>
                             <tbody>
                               {t.attempts.map((a, i) => (
-                                <tr key={i} className="border-t border-[#eee9e0]">
-                                  <td className="px-2 py-1 font-mono text-[#3a3f45]">
+                                <tr key={i} className="border-t border-hairline-2">
+                                  <td className="px-2 py-1 font-mono text-primary">
                                     {a.provider}/{a.model}
                                   </td>
                                   <td className="text-right px-2 py-1 font-mono">{fmtMs(a.firstTokenMs)}</td>
                                   <td className="text-right px-2 py-1 font-mono">{fmtMs(a.durationMs)}</td>
                                   <td className="text-right px-2 py-1 font-mono">{fmtTokens(a.inputTokens)}</td>
                                   <td className="text-right px-2 py-1 font-mono">{fmtTokens(a.cachedInputTokens)}</td>
-                                  <td className="text-right px-2 py-1 font-mono text-[#b07419]">
+                                  <td className="text-right px-2 py-1 font-mono text-orange-dark">
                                     {pct(
                                       a.inputTokens != null && a.inputTokens > 0
                                         ? (a.cachedInputTokens ?? 0) / a.inputTokens
@@ -336,7 +336,7 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                                   </td>
                                   <td className="text-right px-2 py-1 font-mono">{fmtTokens(a.outputTokens)}</td>
                                   <td className="px-2 py-1">
-                                    <span className={a.status === 'error' ? 'text-[#b83838]' : 'text-[#5b626c]'}>
+                                    <span className={a.status === 'error' ? 'text-red-dark' : 'text-secondary'}>
                                       {a.status ?? '—'}
                                       {a.errorClass ? ` (${a.errorClass})` : ''}
                                     </span>
@@ -357,8 +357,8 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
           {/* Doctor / health */}
           {doctor && (
             <section>
-              <h4 className="flex items-center gap-1.5 font-semibold text-[#20232a] mb-2">
-                <Stethoscope className="w-3.5 h-3.5 text-[#4a638b]" /> 诊断
+              <h4 className="flex items-center gap-1.5 font-semibold text-primary mb-2">
+                <Stethoscope className="w-3.5 h-3.5 text-accent" /> 诊断
               </h4>
               <div className="flex flex-wrap gap-2">
                 <StatCard label="open turns" value={`${doctor.openTurns}`} hint="未完成（崩溃候选）" />
@@ -368,10 +368,10 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                 <StatCard label="indeterminate" value={`${doctor.indeterminateTools}`} />
               </div>
               {doctor.errors.length > 0 && (
-                <div className="mt-2 rounded-xl bg-white border border-[#e6e0d6] overflow-hidden">
-                  <div className="px-3 py-1.5 bg-[#f6f3ee] text-[#717782] font-medium">近期 error 事件</div>
+                <div className="mt-2 rounded-xl bg-white border border-hairline overflow-hidden">
+                  <div className="px-3 py-1.5 bg-well text-secondary font-medium">近期 error 事件</div>
                   {doctor.errors.map((e, i) => (
-                    <div key={i} className="px-3 py-1 border-t border-[#f0ece5] font-mono text-[10px] text-[#b83838]">
+                    <div key={i} className="px-3 py-1 border-t border-hairline-2 font-mono text-[10px] text-red-dark">
                       {e.occurredAt.slice(0, 19)} · {e.kind}
                       {e.callId ? ` · ${e.callId.slice(0, 8)}` : ''}
                     </div>
@@ -383,12 +383,12 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 bg-white border-t border-[#ece6dc] flex items-center justify-between">
-          <span className="text-[11px] text-[#8a919e]">数据来自 serve 进程实时写入的 telemetry.db，轮次结束后自动刷新。</span>
+        <div className="px-5 py-3 bg-white border-t border-hairline flex items-center justify-between">
+          <span className="text-[11px] text-secondary">数据来自 serve 进程实时写入的 telemetry.db，轮次结束后自动刷新。</span>
           <button
             onClick={load}
             disabled={loading}
-            className="px-3 py-1.5 rounded-full bg-white border border-[#e2ddd3] text-[#525964] text-xs flex items-center gap-1.5 hover:bg-[#f7f5f0] disabled:opacity-50"
+            className="px-3 py-1.5 rounded-full bg-white border border-hairline text-secondary text-xs flex items-center gap-1.5 hover:bg-black/[0.05] disabled:opacity-50"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} /> 刷新
           </button>

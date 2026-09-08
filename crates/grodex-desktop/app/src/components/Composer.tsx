@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, KeyboardEvent } from 'react';
 import {
-  Send,
+  ArrowUp,
   Square,
   Sparkles,
   ChevronDown,
@@ -163,24 +163,24 @@ export const Composer: React.FC<ComposerProps> = ({
       {isRunning && steerSuggestion && (
         <div
           id="steer-suggestion-banner"
-          className="mb-2 p-2.5 px-3.5 rounded-xl bg-[#eef2f9] border border-[#d2e0f7] shadow-2xs flex items-center justify-between gap-3 text-xs"
+          className="mb-2 p-2.5 px-3.5 rounded-xl bg-accent-soft border border-accent-soft shadow-2xs flex items-center justify-between gap-3 text-xs"
         >
-          <div className="flex items-center gap-2 text-[#2a4060]">
-            <Zap className="w-4 h-4 text-[#c77f16] shrink-0" />
+          <div className="flex items-center gap-2 text-accent">
+            <Zap className="w-4 h-4 text-orange shrink-0" />
             <span className="font-medium">{steerSuggestion.message}</span>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <button
               id="adopt-steer-btn"
               onClick={() => onAdoptSteer(steerSuggestion)}
-              className="px-3 py-1 rounded-lg bg-[#4f46e5] hover:bg-[#4338ca] text-white font-medium text-xs transition-colors shadow-2xs"
+              className="px-3 py-1 rounded-lg bg-accent hover:bg-accent-hover text-white font-medium text-xs transition-colors shadow-2xs"
             >
               采纳建议
             </button>
             <button
               id="dismiss-steer-btn"
               onClick={onDismissSteer}
-              className="px-2.5 py-1 rounded-lg hover:bg-[#dfeaf8] text-[#63738b] hover:text-[#2a4060] text-xs transition-colors"
+              className="px-2.5 py-1 rounded-lg hover:bg-accent-soft text-secondary hover:text-accent text-xs transition-colors"
             >
               忽略
             </button>
@@ -192,9 +192,9 @@ export const Composer: React.FC<ComposerProps> = ({
       {showSlashMenu && filteredSlashCommands.length > 0 && (
         <div
           id="slash-command-palette"
-          className="absolute bottom-28 left-10 mb-2 w-80 rounded-2xl border border-[#e2e2e6] bg-white shadow-xl overflow-hidden z-40"
+          className="absolute bottom-28 left-10 mb-2 w-80 rounded-2xl border border-hairline bg-white shadow-xl overflow-hidden z-40"
         >
-          <div className="px-3.5 py-2 bg-[#f8f8fa] border-b border-[#ececed] text-[10px] font-sans uppercase text-[#7a818c] font-semibold tracking-wider flex items-center justify-between">
+          <div className="px-3.5 py-2 bg-well border-b border-hairline text-[10px] font-sans uppercase text-secondary font-semibold tracking-wider flex items-center justify-between">
             <span>快捷指令</span>
             <span>↑↓ 切换 · ↵ 选择</span>
           </div>
@@ -206,16 +206,16 @@ export const Composer: React.FC<ComposerProps> = ({
                 onClick={() => executeSlashCommand(cmd)}
                 className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-left text-xs transition-colors ${
                   idx === selectedSlashIndex
-                    ? 'bg-[#eef2f9] text-[#243550] font-medium border border-[#cbd8eb]'
-                    : 'text-[#4b515a] hover:bg-[#f7f5f0]'
+                    ? 'bg-accent-soft text-primary font-medium border border-accent-soft'
+                    : 'text-secondary hover:bg-black/[0.05]'
                 }`}
               >
-                <span className="p-1.5 rounded-lg bg-[#f0ede6] text-[#4a5f82]">
+                <span className="p-1.5 rounded-lg bg-well text-accent">
                   {cmd.icon}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <div className="font-mono font-semibold text-[#2b3036]">{cmd.label}</div>
-                  <div className="text-[11px] text-[#717782] truncate">{cmd.description}</div>
+                  <div className="font-mono font-semibold text-primary">{cmd.label}</div>
+                  <div className="text-[11px] text-secondary truncate">{cmd.description}</div>
                 </div>
               </button>
             ))}
@@ -224,7 +224,7 @@ export const Composer: React.FC<ComposerProps> = ({
       )}
 
       {/* Main Composer Box - TRAE rounded white card */}
-      <div className="rounded-2xl border border-[#e2e2e6] bg-white shadow-xs p-3.5 transition-all focus-within:border-[#4f46e5] focus-within:ring-2 focus-within:ring-[#4f46e5]/10">
+      <div className="rounded-2xl border border-hairline bg-white shadow-xs p-3.5 transition-all focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/10">
         <textarea
           ref={textareaRef}
           id="composer-textarea"
@@ -235,35 +235,35 @@ export const Composer: React.FC<ComposerProps> = ({
           onCompositionEnd={() => (composingRef.current = false)}
           rows={2}
           placeholder={isRunning ? "Grodex 正在执行中… 您可以追加指令或点击停止。" : "帮你编写代码、调试 Bug、优化性能等开发工作，交付生产级代码产物。（输入 / 呼出快捷指令）"}
-          className="w-full resize-none bg-transparent text-sm text-[#20242c] placeholder-[#9aa0a9] focus:outline-none font-sans leading-relaxed"
+          className="w-full resize-none bg-transparent text-sm text-primary placeholder-tertiary focus:outline-none font-sans leading-relaxed"
         />
 
         {/* Action Toolbar inside Card */}
-        <div className="flex items-center justify-between pt-2.5 mt-1 border-t border-[#f2f2f4]">
+        <div className="flex items-center justify-between pt-2.5 mt-1 border-t border-hairline-2">
           {/* Left Controls: +, 手动审批, Model pill */}
           <div className="flex items-center gap-2">
             <button
               onClick={onOpenDiff}
-              className="p-1 rounded-md hover:bg-[#f2f2f5] text-[#555a64] transition-colors"
+              className="p-1 rounded-md hover:bg-well text-secondary transition-colors"
               title="查看工作区代码差异"
             >
               <FileCode className="w-4 h-4" />
             </button>
 
             {/* 手动审批 pill */}
-            <div className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-[#f6f6f8] hover:bg-[#ececee] text-xs text-[#3a3f47] cursor-pointer transition-colors">
-              <ShieldCheck className="w-3.5 h-3.5 text-[#656b77]" />
+            <div className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-well hover:bg-black/[0.05] text-xs text-primary cursor-pointer transition-colors">
+              <ShieldCheck className="w-3.5 h-3.5 text-secondary" />
               <span className="font-medium text-xs">手动审批</span>
-              <ChevronDown className="w-3 h-3 text-[#8a909c]" />
+              <ChevronDown className="w-3 h-3 text-tertiary" />
             </div>
 
             {/* Model pill — read-only, reflects the real configured model */}
             <div
               id="composer-model-pill"
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#f6f6f8] border border-[#ebebed] text-xs text-[#6d28d9] font-medium"
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-well border border-hairline text-xs text-accent font-medium"
               title={`当前模型：${modelName || '未知'}（由 ~/.grodex/config.toml 决定）`}
             >
-              <span className="w-2 h-2 rounded-full bg-[#7c3aed]" />
+              <span className="w-2 h-2 rounded-full bg-accent" />
               <span className="truncate max-w-[140px]">{modelName || '模型未配置'}</span>
             </div>
           </div>
@@ -275,14 +275,14 @@ export const Composer: React.FC<ComposerProps> = ({
               <button
                 id="composer-mode-selector-btn"
                 onClick={() => setIsModeOpen(!isModeOpen)}
-                className="flex items-center gap-1 text-xs text-[#525762] hover:text-[#1d2026] cursor-pointer font-medium px-2 py-1 rounded-md hover:bg-[#f2f2f5] transition-colors"
+                className="flex items-center gap-1 text-xs text-secondary hover:text-primary cursor-pointer font-medium px-2 py-1 rounded-md hover:bg-well transition-colors"
               >
                 <span>{selectedMode} Mode</span>
-                <ChevronDown className="w-3 h-3 text-[#8c929e]" />
+                <ChevronDown className="w-3 h-3 text-tertiary" />
               </button>
 
               {isModeOpen && (
-                <div className="absolute bottom-full right-0 mb-2 w-36 rounded-xl border border-[#e2e2e6] bg-white shadow-xl py-1.5 z-30 text-xs">
+                <div className="absolute bottom-full right-0 mb-2 w-36 rounded-xl border border-hairline bg-white shadow-xl py-1.5 z-30 text-xs">
                   {(['Auto', 'Plan', 'Build', 'Review'] as const).map((mode) => (
                     <button
                       key={mode}
@@ -292,8 +292,8 @@ export const Composer: React.FC<ComposerProps> = ({
                       }}
                       className={`w-full px-3.5 py-1.5 text-left transition-colors ${
                         selectedMode === mode
-                          ? 'bg-[#f5f3ff] text-[#6d28d9] font-semibold'
-                          : 'text-[#4b515a] hover:bg-[#f7f7f8]'
+                          ? 'bg-accent-soft text-accent font-semibold'
+                          : 'text-secondary hover:bg-well'
                       }`}
                     >
                       {mode === 'Auto' ? '自动 (Auto)' : mode === 'Plan' ? '规划 (Plan)' : mode === 'Build' ? '构建 (Build)' : '审查 (Review)'}
@@ -303,12 +303,12 @@ export const Composer: React.FC<ComposerProps> = ({
               )}
             </div>
 
-            {/* Stop or Send Button (Purple TRAE soundwave / pill style) */}
+            {/* Stop or Send Button */}
             {isRunning ? (
               <button
                 id="composer-stop-btn"
                 onClick={onStop}
-                className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-medium text-xs flex items-center gap-1.5 transition-transform active:scale-95 shadow-2xs"
+                className="px-3 py-1.5 rounded-full bg-red hover:bg-red/90 text-white font-medium text-xs flex items-center gap-1.5 transition-all active:scale-95 shadow-sm"
                 title="停止当前任务"
               >
                 <Square className="w-3 h-3 fill-current" />
@@ -319,14 +319,10 @@ export const Composer: React.FC<ComposerProps> = ({
                 id="composer-send-btn"
                 onClick={handleSubmit}
                 disabled={!inputText.trim()}
-                className="w-8 h-8 rounded-lg bg-[#4f46e5] hover:bg-[#4338ca] disabled:opacity-40 disabled:hover:bg-[#4f46e5] text-white flex items-center justify-center transition-transform active:scale-95 shadow-2xs"
+                className="w-8 h-8 rounded-full bg-accent hover:bg-accent-hover disabled:opacity-40 disabled:hover:bg-accent text-white flex items-center justify-center transition-all active:scale-95 shadow-sm"
                 title="发送消息"
               >
-                <div className="flex items-center gap-0.5">
-                  <span className="w-0.5 h-2.5 bg-white rounded-full animate-pulse" />
-                  <span className="w-0.5 h-4 bg-white rounded-full" />
-                  <span className="w-0.5 h-2.5 bg-white rounded-full animate-pulse" />
-                </div>
+                <ArrowUp className="w-4 h-4" strokeWidth={2.5} />
               </button>
             )}
           </div>
@@ -334,16 +330,16 @@ export const Composer: React.FC<ComposerProps> = ({
       </div>
 
       {/* Directory and status indicators below card */}
-      <div className="flex items-center justify-between px-1.5 mt-2 text-xs text-[#707682]">
+      <div className="flex items-center justify-between px-1.5 mt-2 text-xs text-secondary">
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-1 cursor-pointer hover:text-[#20242c]">
+          <div className="flex items-center gap-1 cursor-pointer hover:text-primary">
             <span>本地</span>
-            <ChevronDown className="w-3 h-3 text-[#9aa0a9]" />
+            <ChevronDown className="w-3 h-3 text-tertiary" />
           </div>
           <span>•</span>
-          <div className="flex items-center gap-1 cursor-pointer hover:text-[#20242c] font-mono">
+          <div className="flex items-center gap-1 cursor-pointer hover:text-primary font-mono">
             <span>grodex</span>
-            <ChevronDown className="w-3 h-3 text-[#9aa0a9]" />
+            <ChevronDown className="w-3 h-3 text-tertiary" />
           </div>
         </div>
 

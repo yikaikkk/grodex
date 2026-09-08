@@ -43,16 +43,16 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
 
   if (MOCK_DIFF_FILES.length === 0) {
     return (
-      <div id="diff-viewer-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#21262d]/40 backdrop-blur-xs">
-        <div className="w-full max-w-lg rounded-3xl bg-white shadow-2xl border border-[#e2ddd3] p-8 text-center">
-          <FileCode className="w-8 h-8 mx-auto text-[#9aa0aa]" />
-          <p className="mt-3 text-sm font-semibold text-[#2b3036]">暂无结构化代码变更</p>
-          <p className="mt-1 text-xs text-[#717782]">
+      <div id="diff-viewer-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+        <div className="w-full max-w-lg rounded-2xl bg-white shadow-2xl border border-hairline p-8 text-center">
+          <FileCode className="w-8 h-8 mx-auto text-tertiary" />
+          <p className="mt-3 text-sm font-semibold text-primary">暂无结构化代码变更</p>
+          <p className="mt-1 text-xs text-secondary">
             结构化 diff 视图将由后续协议扩展提供（edit 结果会附带 diff 对象）。
           </p>
           <button
             onClick={onClose}
-            className="mt-4 px-4 py-2 rounded-full bg-[#f4efe8] hover:bg-[#ece6dc] text-[#525964] text-xs font-medium"
+            className="mt-4 px-4 py-2 rounded-full bg-well hover:bg-black/[0.05] text-secondary text-xs font-medium"
           >
             关闭
           </button>
@@ -80,45 +80,45 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   };
 
   return (
-    <div id="diff-viewer-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#21262d]/40 backdrop-blur-xs animate-in fade-in duration-150">
+    <div id="diff-viewer-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm animate-in fade-in duration-150">
       <div
         id="diff-viewer-panel"
-        className="w-full max-w-6xl h-[88vh] rounded-3xl border border-[#ded8cd] bg-[#faf9f7] shadow-2xl flex flex-col overflow-hidden"
+        className="w-full max-w-6xl h-[88vh] rounded-2xl border border-hairline bg-canvas shadow-2xl flex flex-col overflow-hidden"
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 bg-[#ffffff] border-b border-[#ece6dc]">
+        <div className="flex items-center justify-between px-6 py-4 bg-white border-b border-hairline">
           <div className="flex items-center gap-3">
-            <div className="p-2 rounded-2xl bg-[#fef8ea] text-[#b07419] border border-[#f5dfb4]">
+            <div className="p-2 rounded-2xl bg-orange-soft text-orange-dark border border-orange-soft">
               <FileCode className="w-4 h-4" />
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h2 className="text-sm font-bold text-[#2b3036]">审查工作区代码变更</h2>
-                <span className="text-[11px] px-2.5 py-0.5 rounded-full bg-[#f2ede4] text-[#656c78] font-mono font-medium">
+                <h2 className="text-sm font-bold text-primary">审查工作区代码变更</h2>
+                <span className="text-[11px] px-2.5 py-0.5 rounded-full bg-well text-secondary font-mono font-medium">
                   {MOCK_DIFF_FILES.length} 个文件被修改
                 </span>
               </div>
-              <div className="flex items-center gap-3 text-[11px] text-[#717782] mt-0.5">
-                <span className="flex items-center gap-1 font-mono text-[#575e6a]">
-                  <GitCommit className="w-3 h-3 text-[#9aa0aa]" />
+              <div className="flex items-center gap-3 text-[11px] text-secondary mt-0.5">
+                <span className="flex items-center gap-1 font-mono text-secondary">
+                  <GitCommit className="w-3 h-3 text-tertiary" />
                   基础快照: {activeFile.baseSnapshot}
                 </span>
                 <span>•</span>
-                <span className="font-mono text-[#575e6a]">触发来源: {activeFile.toolCallOrigin}</span>
+                <span className="font-mono text-secondary">触发来源: {activeFile.toolCallOrigin}</span>
               </div>
             </div>
           </div>
 
           {/* Controls */}
           <div className="flex items-center gap-2">
-            <div className="flex items-center p-0.5 rounded-full bg-[#f4efe8] border border-[#e5dfd4]">
+            <div className="flex items-center p-0.5 rounded-full bg-well border border-hairline">
               <button
                 id="diff-mode-split-btn"
                 onClick={() => setViewMode('split')}
                 className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-full transition-all ${
                   viewMode === 'split'
-                    ? 'bg-[#ffffff] text-[#2c3138] shadow-xs'
-                    : 'text-[#6b727d] hover:text-[#2c3138]'
+                    ? 'bg-white text-primary shadow-xs'
+                    : 'text-secondary hover:text-primary'
                 }`}
               >
                 <Columns className="w-3.5 h-3.5" />
@@ -129,8 +129,8 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                 onClick={() => setViewMode('unified')}
                 className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-full transition-all ${
                   viewMode === 'unified'
-                    ? 'bg-[#ffffff] text-[#2c3138] shadow-xs'
-                    : 'text-[#6b727d] hover:text-[#2c3138]'
+                    ? 'bg-white text-primary shadow-xs'
+                    : 'text-secondary hover:text-primary'
                 }`}
               >
                 <List className="w-3.5 h-3.5" />
@@ -141,16 +141,16 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             <button
               id="copy-diff-patch-btn"
               onClick={handleCopyPatch}
-              className="p-2 rounded-full bg-[#ffffff] hover:bg-[#f5f1ea] text-[#616874] hover:text-[#2b3036] border border-[#ded8cd] transition-colors shadow-xs"
+              className="p-2 rounded-full bg-white hover:bg-well text-secondary hover:text-primary border border-hairline transition-colors shadow-xs"
               title="复制 Git 补丁内容"
             >
-              {copied ? <Check className="w-4 h-4 text-[#256e2c]" /> : <Copy className="w-4 h-4 text-[#616874]" />}
+              {copied ? <Check className="w-4 h-4 text-green-dark" /> : <Copy className="w-4 h-4 text-secondary" />}
             </button>
 
             <button
               id="close-diff-viewer-btn"
               onClick={onClose}
-              className="p-2 rounded-full hover:bg-[#f0ece5] text-[#717782] hover:text-[#2b3036] transition-colors ml-1"
+              className="p-2 rounded-full hover:bg-black/[0.05] text-secondary hover:text-primary transition-colors ml-1"
             >
               <X className="w-5 h-5" />
             </button>
@@ -158,8 +158,8 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         </div>
 
         {/* Files Navigation Tabs */}
-        <div className="flex items-center gap-1.5 px-5 py-2.5 bg-[#f6f3ec] border-b border-[#ece6dc] overflow-x-auto text-xs">
-          <Layers className="w-3.5 h-3.5 text-[#8b929e] mr-1 shrink-0" />
+        <div className="flex items-center gap-1.5 px-5 py-2.5 bg-canvas border-b border-hairline overflow-x-auto text-xs">
+          <Layers className="w-3.5 h-3.5 text-tertiary mr-1 shrink-0" />
           {MOCK_DIFF_FILES.map((file) => {
             const isActive = file.id === activeFile.id;
             return (
@@ -169,17 +169,17 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                 onClick={() => setActiveFileId(file.id)}
                 className={`flex items-center gap-2 px-3.5 py-1.5 rounded-full font-mono text-xs transition-colors shrink-0 ${
                   isActive
-                    ? 'bg-[#ffffff] text-[#2c323a] border border-[#ded8cd] font-semibold shadow-xs'
-                    : 'text-[#69707c] hover:bg-[#eee9df] hover:text-[#33383f]'
+                    ? 'bg-white text-primary border border-hairline font-semibold shadow-xs'
+                    : 'text-secondary hover:bg-black/[0.05] hover:text-primary'
                 }`}
               >
                 <span>{file.filename}</span>
                 <span className="flex items-center gap-1 text-[11px] font-bold">
                   {file.additions > 0 && (
-                    <span className="text-[#256e2c]">+{file.additions}</span>
+                    <span className="text-green-dark">+{file.additions}</span>
                   )}
                   {file.deletions > 0 && (
-                    <span className="text-[#b83838]">-{file.deletions}</span>
+                    <span className="text-red-dark">-{file.deletions}</span>
                   )}
                 </span>
               </button>
@@ -188,13 +188,13 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         </div>
 
         {/* Diff Content */}
-        <div className="flex-1 overflow-auto p-5 bg-[#faf9f7] font-mono text-xs leading-relaxed">
+        <div className="flex-1 overflow-auto p-5 bg-canvas font-mono text-xs leading-relaxed">
           {viewMode === 'unified' ? (
             /* Unified Diff View */
-            <div className="rounded-2xl border border-[#e2ddd3] overflow-hidden bg-[#ffffff] shadow-xs">
+            <div className="rounded-2xl border border-hairline overflow-hidden bg-white shadow-xs">
               {activeFile.hunks.map((hunk, hIdx) => (
                 <div key={hIdx}>
-                  <div className="px-4 py-1.5 bg-[#f5f1ea] text-[#6b727e] border-b border-[#e5dfd5] text-[11px] select-none font-semibold">
+                  <div className="px-4 py-1.5 bg-well text-secondary border-b border-hairline text-[11px] select-none font-semibold">
                     @@ -{hunk.oldStart},{hunk.oldLines} +{hunk.newStart},{hunk.newLines} @@
                   </div>
                   {hunk.content.map((line, lIdx) => (
@@ -202,19 +202,19 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                       key={lIdx}
                       className={`flex items-start px-2 py-0.5 ${
                         line.type === 'add'
-                          ? 'bg-[#eef8ef] text-[#1c6422]'
+                          ? 'bg-green-soft text-green-dark'
                           : line.type === 'delete'
-                          ? 'bg-[#fdf0f0] text-[#b83838] line-through opacity-85'
-                          : 'text-[#383e46] hover:bg-[#faf7f2]'
+                          ? 'bg-red-soft text-red-dark line-through opacity-85'
+                          : 'text-primary hover:bg-well'
                       }`}
                     >
-                      <span className="w-8 text-right select-none text-[#9aa0aa] text-[11px] pr-2 shrink-0">
+                      <span className="w-8 text-right select-none text-tertiary text-[11px] pr-2 shrink-0">
                         {line.oldLineNo || ''}
                       </span>
-                      <span className="w-8 text-right select-none text-[#9aa0aa] text-[11px] pr-2 shrink-0">
+                      <span className="w-8 text-right select-none text-tertiary text-[11px] pr-2 shrink-0">
                         {line.newLineNo || ''}
                       </span>
-                      <span className="w-4 select-none text-[#717782] text-center shrink-0">
+                      <span className="w-4 select-none text-secondary text-center shrink-0">
                         {line.type === 'add' ? '+' : line.type === 'delete' ? '-' : ' '}
                       </span>
                       <span className="flex-1 whitespace-pre">{line.text}</span>
@@ -225,32 +225,32 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             </div>
           ) : (
             /* Split / Side-by-Side Diff View */
-            <div className="rounded-2xl border border-[#e2ddd3] overflow-hidden bg-[#ffffff] shadow-xs">
+            <div className="rounded-2xl border border-hairline overflow-hidden bg-white shadow-xs">
               {activeFile.hunks.map((hunk, hIdx) => {
                 return (
                   <div key={hIdx}>
-                    <div className="grid grid-cols-2 bg-[#f5f1ea] border-b border-[#e5dfd5] text-[11px] text-[#555c66] select-none divide-x divide-[#e5dfd5] font-semibold">
+                    <div className="grid grid-cols-2 bg-well border-b border-hairline text-[11px] text-secondary select-none divide-x divide-hairline font-semibold">
                       <div className="px-4 py-1.5">变更前代码 ({activeFile.baseSnapshot})</div>
-                      <div className="px-4 py-1.5 text-[#256e2c]">变更后工作树</div>
+                      <div className="px-4 py-1.5 text-green-dark">变更后工作树</div>
                     </div>
 
-                    <div className="divide-y divide-[#f0ece5]">
+                    <div className="divide-y divide-hairline-2">
                       {hunk.content.map((line, lIdx) => (
-                        <div key={lIdx} className="grid grid-cols-2 divide-x divide-[#e8e3da]">
+                        <div key={lIdx} className="grid grid-cols-2 divide-x divide-hairline">
                           {/* Left / Old Side */}
                           <div
                             className={`flex items-start px-2 py-0.5 ${
                               line.type === 'delete'
-                                ? 'bg-[#fdf0f0] text-[#b83838]'
+                                ? 'bg-red-soft text-red-dark'
                                 : line.type === 'add'
-                                ? 'bg-[#faf8f4] opacity-20'
-                                : 'text-[#383e46]'
+                                ? 'bg-canvas opacity-20'
+                                : 'text-primary'
                             }`}
                           >
-                            <span className="w-7 text-right select-none text-[#9aa0aa] text-[11px] pr-2 shrink-0">
+                            <span className="w-7 text-right select-none text-tertiary text-[11px] pr-2 shrink-0">
                               {line.oldLineNo || ''}
                             </span>
-                            <span className="w-4 select-none text-[#717782] text-center shrink-0">
+                            <span className="w-4 select-none text-secondary text-center shrink-0">
                               {line.type === 'delete' ? '-' : ''}
                             </span>
                             <span className="flex-1 whitespace-pre overflow-x-hidden">
@@ -262,16 +262,16 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                           <div
                             className={`flex items-start px-2 py-0.5 ${
                               line.type === 'add'
-                                ? 'bg-[#eef8ef] text-[#1c6422]'
+                                ? 'bg-green-soft text-green-dark'
                                 : line.type === 'delete'
-                                ? 'bg-[#faf8f4] opacity-20'
-                                : 'text-[#383e46]'
+                                ? 'bg-canvas opacity-20'
+                                : 'text-primary'
                             }`}
                           >
-                            <span className="w-7 text-right select-none text-[#9aa0aa] text-[11px] pr-2 shrink-0">
+                            <span className="w-7 text-right select-none text-tertiary text-[11px] pr-2 shrink-0">
                               {line.newLineNo || ''}
                             </span>
-                            <span className="w-4 select-none text-[#256e2c] text-center shrink-0">
+                            <span className="w-4 select-none text-green-dark text-center shrink-0">
                               {line.type === 'add' ? '+' : ''}
                             </span>
                             <span className="flex-1 whitespace-pre overflow-x-hidden">

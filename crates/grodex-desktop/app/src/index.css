@@ -1,7 +1,89 @@
 @import "tailwindcss";
 
-/* Typography plugin: the demo's `prose …` classes style chat markdown. */
+/* Typography plugin: the `prose …` classes style chat markdown. */
 @plugin "@tailwindcss/typography";
+
+/* ─────────────────────────────────────────────────────────────────────
+   Apple-native design tokens (macOS Sequoia / Tahoe)
+   Material + hairline + system accents, defined once so every component
+   shares one color system instead of scattering arbitrary hex values.
+   ───────────────────────────────────────────────────────────────────── */
+@theme {
+  /* Canvas & materials */
+  --color-canvas: #f5f5f7;
+  --color-canvas-2: #ebebf0;
+  --color-card: #ffffff;
+  --color-well: #f0f0f3;
+
+  /* Hairline borders (sub-pixel neutral grays) */
+  --color-hairline: #00000014; /* rgba(0,0,0,0.08) */
+  --color-hairline-2: #0000000a; /* rgba(0,0,0,0.04) */
+
+  /* Text labels */
+  --color-primary: #1d1d1f;
+  --color-secondary: #86868b;
+  --color-tertiary: #aeaeb2;
+
+  /* System blue accent */
+  --color-accent: #007aff;
+  --color-accent-hover: #0071e3;
+  --color-accent-soft: #007aff1a; /* ~10% tint */
+
+  /* Semantic system colors */
+  --color-green: #34c759;
+  --color-green-dark: #248a3d;
+  --color-green-soft: #34c7591f;
+  --color-orange: #ff9500;
+  --color-orange-dark: #b25000;
+  --color-orange-soft: #ff95001f;
+  --color-red: #ff3b30;
+  --color-red-dark: #d70015;
+  --color-red-soft: #ff3b301a;
+
+  /* Terminal */
+  --color-terminal: #1e1e24;
+  --color-terminal-line: #d1d1d6;
+  --color-terminal-muted: #8e8e93;
+  --color-terminal-green: #5fbf77;
+  --color-terminal-red: #f27d8a;
+  --color-terminal-yellow: #e5c07b;
+  --color-terminal-blue: #7cb3ff;
+
+  /* Apple ease curve for sheets / drawers */
+  --ease-apple: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "SF Pro", "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
+}
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  * {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    background-color: var(--color-canvas);
+    color: var(--color-primary);
+    font-family: var(--font-sans);
+    user-select: none;
+    overflow: hidden;
+  }
+
+  ::selection {
+    background-color: rgba(0, 122, 255, 0.22);
+  }
+
+  code, pre, kbd, samp {
+    font-family: var(--font-mono);
+  }
+}
 
 @layer components {
   /* Keep markdown inside chat bubbles inside the bubble (no overflow),
@@ -23,35 +105,10 @@
   }
 }
 
-@layer base {
-  :root {
-    color-scheme: light;
-  }
-  
-  body {
-    background-color: #faf9f7;
-    color: #3a3f45;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
-    user-select: none;
-    overflow: hidden;
-  }
-
-  code, pre, kbd, samp {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  }
-}
-
-/* Paper-like subtle background texture gradient */
-.bg-paper-warm {
-  background-color: #faf9f7;
-  background-image: radial-gradient(at 0% 0%, rgba(245, 240, 230, 0.4) 0px, transparent 50%),
-                    radial-gradient(at 100% 100%, rgba(238, 242, 246, 0.4) 0px, transparent 50%);
-}
-
-/* Custom soft scrollbars */
+/* Neutral macOS scrollbars — hairline thumb, transparent track. */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 7px;
+  height: 7px;
 }
 
 ::-webkit-scrollbar-track {
@@ -59,12 +116,16 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(160, 155, 145, 0.25);
+  background: rgba(0, 0, 0, 0.14);
   border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(140, 135, 125, 0.45);
+  background: rgba(0, 0, 0, 0.28);
+  background-clip: content-box;
+  border: 2px solid transparent;
 }
 
 @keyframes cursor-blink {
@@ -76,3 +137,12 @@
   animation: cursor-blink 1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
 
+/* Gentle breathing glow for live elements (Apple Intelligence style). */
+@keyframes breathe {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+
+.animate-breathe {
+  animation: breathe 2.2s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}

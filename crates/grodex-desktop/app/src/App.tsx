@@ -594,7 +594,7 @@ export default function App() {
   const onDiffUnavailable = () => showNotice('结构化 diff 查看将在后续协议扩展中提供');
 
   return (
-    <div id="grodex-desktop-root" className="h-screen w-screen flex flex-col bg-[#faf9f7] text-[#3a3f45] overflow-hidden font-sans antialiased">
+    <div id="grodex-desktop-root" className="h-screen w-screen flex flex-col bg-canvas text-primary overflow-hidden font-sans antialiased">
       {/* Top Application Header */}
       <Header
         session={activeSession}
@@ -605,24 +605,24 @@ export default function App() {
         onOpenObservability={() => setIsObservabilityOpen(true)}
       />
 
-      {/* Transient banners (compaction / notices) */}
+      {/* Floating toast (notice / compaction) — overlays, never shifts layout */}
       {(isCompacting || notice) && (
-        <div className="px-4 flex items-center justify-center bg-transparent -mt-1 relative z-10 pointer-events-none">
+        <div className="fixed top-14 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 pointer-events-none">
           {notice && (
             <div
-              className={`mt-1 px-3 py-1.5 rounded-full text-xs shadow-sm border pointer-events-auto ${
+              className={`px-3.5 py-1.5 rounded-full text-xs shadow-md border backdrop-blur-xl bg-white/90 pointer-events-auto ${
                 notice.kind === 'error'
-                  ? 'bg-[#fdf0f0] text-[#b83838] border-[#f6cfcf]'
+                  ? 'text-red-dark border-red-soft'
                   : notice.kind === 'log'
-                  ? 'bg-[#f6f6f8] text-[#5b626c] border-[#e2e2e6]'
-                  : 'bg-[#eef2f9] text-[#2a4060] border-[#d2e0f7]'
+                  ? 'text-secondary border-hairline'
+                  : 'text-accent border-accent-soft'
               }`}
             >
               {notice.message}
             </div>
           )}
           {isCompacting && (
-            <div className="mt-1 ml-2 px-3 py-1.5 rounded-full text-xs bg-[#fef8ea] text-[#935f12] border border-[#f5dfb4] shadow-sm pointer-events-auto flex items-center gap-1.5">
+            <div className="px-3.5 py-1.5 rounded-full text-xs bg-orange-soft text-orange-dark border border-orange-soft shadow-md backdrop-blur-xl pointer-events-auto flex items-center gap-1.5">
               <Loader2 className="w-3 h-3 animate-spin" /> 会话压缩中…
             </div>
           )}
@@ -630,7 +630,7 @@ export default function App() {
       )}
 
       {/* Main Workspace Body */}
-      <div className="flex-1 flex min-h-0 overflow-hidden bg-[#f4f4f6]">
+      <div className="flex-1 flex min-h-0 overflow-hidden bg-canvas">
         {/* Left Sessions Sidebar */}
         <Sidebar
           sessions={sessions}
@@ -648,7 +648,7 @@ export default function App() {
         {/* Center: Main Floating White Canvas */}
         <main
           id="main-timeline-area"
-          className={`flex-1 flex flex-col min-w-0 bg-white rounded-2xl border border-[#e5e5e8] shadow-xs relative overflow-hidden transition-all ${
+          className={`flex-1 flex flex-col min-w-0 bg-card rounded-2xl border border-hairline shadow-sm relative overflow-hidden transition-all ${
             isAgentTreeOpen ? 'my-2 ml-2 sm:my-2.5 sm:ml-2.5 mr-1 sm:mr-1.5' : 'm-2 sm:m-2.5'
           }`}
         >
@@ -706,35 +706,35 @@ export default function App() {
 
       {/* Indeterminate (crash-recovery) resolution modal */}
       {indeterminate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#21262d]/40 backdrop-blur-xs">
-          <div className="w-full max-w-md rounded-3xl bg-white shadow-2xl border border-[#e2ddd3] overflow-hidden">
-            <div className="px-6 py-4 bg-[#fdf9f2] border-b border-[#ece6dc] flex items-center gap-2.5">
-              <AlertTriangle className="w-5 h-5 text-[#b07419]" />
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl border border-hairline overflow-hidden">
+            <div className="px-6 py-4 bg-orange-soft border-b border-hairline flex items-center gap-2.5">
+              <AlertTriangle className="w-5 h-5 text-orange-dark" />
               <div>
-                <h3 className="text-sm font-bold text-[#2b3036]">工具结果未知（崩溃恢复）</h3>
-                <p className="text-[11px] text-[#717782] font-mono">{indeterminate.tool_name}</p>
+                <h3 className="text-sm font-bold text-primary">工具结果未知（崩溃恢复）</h3>
+                <p className="text-[11px] text-secondary font-mono">{indeterminate.tool_name}</p>
               </div>
             </div>
-            <div className="p-6 text-xs text-[#434952] space-y-4">
+            <div className="p-6 text-xs text-primary space-y-4">
               <p className="leading-relaxed">
                 {indeterminate.message || '会话在工具执行中被中断，无法确认该副作用是否已生效。请根据磁盘实际情况裁决：'}
               </p>
               <div className="flex flex-col gap-2">
                 <button
                   onClick={() => handleResolveIndeterminate(indeterminate.call_id, 'succeeded')}
-                  className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#eef8ef] text-[#1c6422] border border-[#cbe4cf] font-medium text-left"
+                  className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-green-soft text-green-dark border border-green-soft font-medium text-left"
                 >
                   <Check className="w-4 h-4" /> 已成功执行（副作用已生效）
                 </button>
                 <button
                   onClick={() => handleResolveIndeterminate(indeterminate.call_id, 'failed')}
-                  className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#fdf0f0] text-[#b83838] border border-[#f6cfcf] font-medium text-left"
+                  className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-red-soft text-red-dark border border-red-soft font-medium text-left"
                 >
                   <XCircle className="w-4 h-4" /> 失败/未生效
                 </button>
                 <button
                   onClick={() => handleResolveIndeterminate(indeterminate.call_id, 'retry')}
-                  className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#f4efe8] text-[#525964] border border-[#e4ded5] font-medium text-left"
+                  className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-well text-secondary border border-hairline font-medium text-left"
                 >
                   <RotateCcw className="w-4 h-4" /> 丢弃本次调用，让模型重试
                 </button>
@@ -746,17 +746,17 @@ export default function App() {
 
       {/* Delete-session confirmation dialog */}
       {confirmDelete && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#21262d]/40 backdrop-blur-xs">
-          <div className="w-full max-w-sm rounded-3xl bg-white shadow-2xl border border-[#e2ddd3] overflow-hidden">
-            <div className="px-6 py-4 bg-[#fdf2f2] border-b border-[#f3d9d9] flex items-center gap-2.5">
-              <AlertTriangle className="w-5 h-5 text-[#b83838]" />
-              <h3 className="text-sm font-bold text-[#2b3036]">删除会话</h3>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl bg-white shadow-2xl border border-hairline overflow-hidden">
+            <div className="px-6 py-4 bg-red-soft border-b border-red-soft flex items-center gap-2.5">
+              <AlertTriangle className="w-5 h-5 text-red-dark" />
+              <h3 className="text-sm font-bold text-primary">删除会话</h3>
             </div>
-            <div className="p-6 text-xs text-[#434952] space-y-4">
+            <div className="p-6 text-xs text-primary space-y-4">
               <p>
                 确定删除会话「{confirmDelete.title}」？
                 <br />
-                <span className="font-mono text-[#8a919e]">
+                <span className="font-mono text-secondary">
                   ~/.grodex/sessions/{confirmDelete.sessionId}
                 </span>
                 <br />
@@ -765,13 +765,13 @@ export default function App() {
               <div className="flex items-center justify-end gap-2">
                 <button
                   onClick={() => setConfirmDelete(null)}
-                  className="px-4 py-2 rounded-full bg-[#f4efe8] hover:bg-[#ece6dc] text-[#525964] text-xs font-medium"
+                  className="px-4 py-2 rounded-full bg-well hover:bg-black/[0.05] text-secondary text-xs font-medium"
                 >
                   取消
                 </button>
                 <button
                   onClick={() => performDeleteSession(confirmDelete.sessionId)}
-                  className="px-5 py-2 rounded-full bg-[#b83838] hover:bg-[#a02f2f] text-white text-xs font-medium flex items-center gap-1.5"
+                  className="px-5 py-2 rounded-full bg-red hover:bg-red text-white text-xs font-medium flex items-center gap-1.5"
                 >
                   <Trash2 className="w-3.5 h-3.5" /> 确认删除
                 </button>
@@ -783,11 +783,11 @@ export default function App() {
 
       {/* Directory picker dialog (window.prompt unavailable in Tauri) */}
       {isDirDialogOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#21262d]/40 backdrop-blur-xs">
-          <div className="w-full max-w-md rounded-3xl bg-white shadow-2xl border border-[#e2ddd3] overflow-hidden">
-            <div className="px-6 py-4 bg-[#f8f8fa] border-b border-[#e5e5e8]">
-              <h3 className="text-sm font-bold text-[#2b3036]">选择工作目录</h3>
-              <p className="text-[11px] text-[#717782] mt-0.5">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl border border-hairline overflow-hidden">
+            <div className="px-6 py-4 bg-well border-b border-hairline">
+              <h3 className="text-sm font-bold text-primary">选择工作目录</h3>
+              <p className="text-[11px] text-secondary mt-0.5">
                 输入要运行 grodex 的项目绝对路径
               </p>
             </div>
@@ -805,7 +805,7 @@ export default function App() {
                   }
                 }}
                 placeholder="/Users/you/dev/my-project"
-                className="w-full p-3 rounded-xl bg-white border border-[#e2e2e6] font-mono text-xs text-[#2b3036] focus:outline-none focus:border-[#4f46e5]"
+                className="w-full p-3 rounded-xl bg-white border border-hairline font-mono text-xs text-primary focus:outline-none focus:border-accent"
               />
               <div className="flex items-center justify-end gap-2">
                 <button
@@ -814,13 +814,13 @@ export default function App() {
                     dirResolveRef.current('');
                     dirResolveRef.current = () => {};
                   }}
-                  className="px-4 py-2 rounded-full bg-[#f4efe8] hover:bg-[#ece6dc] text-[#525964] text-xs font-medium"
+                  className="px-4 py-2 rounded-full bg-well hover:bg-black/[0.05] text-secondary text-xs font-medium"
                 >
                   取消
                 </button>
                 <button
                   onClick={submitDirDialog}
-                  className="px-5 py-2 rounded-full bg-[#4f46e5] hover:bg-[#4338ca] text-white text-xs font-medium"
+                  className="px-5 py-2 rounded-full bg-accent hover:bg-accent-hover text-white text-xs font-medium"
                 >
                   确定
                 </button>

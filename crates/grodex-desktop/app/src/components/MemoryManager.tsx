@@ -8,11 +8,11 @@ interface MemoryManagerProps {
 }
 
 const STATUS_COLOR: Record<string, string> = {
-  active: 'bg-[#eef8ef] text-[#1c6422] border-[#cbe4cf]',
-  candidate: 'bg-[#fef8ea] text-[#935f12] border-[#f5dfb4]',
-  superseded: 'bg-[#f4efe8] text-[#6b6f78] border-[#e4ded3]',
-  conflicted: 'bg-[#fdf0f0] text-[#b83838] border-[#f6cfcf]',
-  orphaned: 'bg-[#f2f2f5] text-[#5b626c] border-[#e2e2e6]',
+  active: 'bg-green-soft text-green-dark border-green-soft',
+  candidate: 'bg-orange-soft text-orange-dark border-orange-soft',
+  superseded: 'bg-well text-secondary border-hairline',
+  conflicted: 'bg-red-soft text-red-dark border-red-soft',
+  orphaned: 'bg-well text-secondary border-hairline',
 };
 
 export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) => {
@@ -74,31 +74,31 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#21262d]/40 backdrop-blur-xs">
-      <div className="w-full max-w-3xl h-[86vh] rounded-3xl bg-[#faf9f7] border border-[#e2ddd3] shadow-2xl flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+      <div className="w-full max-w-3xl h-[86vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="px-5 py-3.5 bg-white border-b border-[#ece6dc] flex items-center justify-between">
+        <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <div className="p-1.5 rounded-xl bg-[#eef2f9] text-[#4a5f82] border border-[#dce5f2]">
+            <div className="p-1.5 rounded-xl bg-accent-soft text-accent border border-accent-soft">
               <Wrench className="w-4 h-4" />
             </div>
             <div>
-              <h3 className="text-sm font-bold text-[#2b3036]">记忆管理</h3>
-              <p className="text-[11px] text-[#717782]">
+              <h3 className="text-sm font-bold text-primary">记忆管理</h3>
+              <p className="text-[11px] text-secondary">
                 {units.length} 条记忆 · {conflicts.length} 条冲突（~/.grodex/memory.db）
               </p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-full hover:bg-[#f0ece5] text-[#717782] transition-colors"
+            className="p-1.5 rounded-full hover:bg-black/[0.05] text-secondary transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
         {notice && (
-          <div className="px-5 py-2 bg-[#eef2f9] text-[#2a4060] text-xs flex items-center gap-2 border-b border-[#d2e0f7]">
+          <div className="px-5 py-2 bg-accent-soft text-accent text-xs flex items-center gap-2 border-b border-accent-soft">
             <Check className="w-3.5 h-3.5" /> {notice}
           </div>
         )}
@@ -108,24 +108,24 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
           {/* Conflicts */}
           <section>
             <div className="flex items-center justify-between mb-2">
-              <h4 className="flex items-center gap-1.5 font-semibold text-[#20232a]">
-                <AlertTriangle className="w-3.5 h-3.5 text-[#b07419]" /> 冲突（pending 将自动按“说法时间新者胜”裁决）
+              <h4 className="flex items-center gap-1.5 font-semibold text-primary">
+                <AlertTriangle className="w-3.5 h-3.5 text-orange-dark" /> 冲突（pending 将自动按“说法时间新者胜”裁决）
               </h4>
             </div>
             {conflicts.length === 0 ? (
-              <div className="px-3 py-4 rounded-xl border border-dashed border-[#e2ddd3] text-center text-[#8a919e]">
+              <div className="px-3 py-4 rounded-xl border border-dashed border-hairline text-center text-secondary">
                 暂无冲突
               </div>
             ) : (
               <div className="space-y-1.5">
                 {conflicts.map((c) => (
-                  <div key={c.conflictId} className="px-3 py-2 rounded-xl bg-white border border-[#e6e0d6] flex items-center justify-between gap-2">
+                  <div key={c.conflictId} className="px-3 py-2 rounded-xl bg-white border border-hairline flex items-center justify-between gap-2">
                     <div className="min-w-0">
-                      <div className="font-mono text-[11px] text-[#3a3f45] truncate">
+                      <div className="font-mono text-[11px] text-primary truncate">
                         {c.leftMemoryId.slice(0, 10)}… ⇄ {c.rightMemoryId.slice(0, 10)}…
-                        <span className="ml-2 text-[#8a919e]">[{c.relation}] {c.status}</span>
+                        <span className="ml-2 text-secondary">[{c.relation}] {c.status}</span>
                       </div>
-                      {c.reason && <div className="text-[11px] text-[#717782] truncate">{c.reason}</div>}
+                      {c.reason && <div className="text-[11px] text-secondary truncate">{c.reason}</div>}
                     </div>
                   </div>
                 ))}
@@ -136,32 +136,32 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
           {/* Units */}
           <section>
             <div className="flex items-center justify-between mb-2">
-              <h4 className="font-semibold text-[#20232a]">记忆条目</h4>
-              <span className="text-[#8a919e] text-[11px]">删除 = 标记 orphaned，不再被检索</span>
+              <h4 className="font-semibold text-primary">记忆条目</h4>
+              <span className="text-secondary text-[11px]">删除 = 标记 orphaned，不再被检索</span>
             </div>
             {units.length === 0 ? (
-              <div className="px-3 py-4 rounded-xl border border-dashed border-[#e2ddd3] text-center text-[#8a919e]">
+              <div className="px-3 py-4 rounded-xl border border-dashed border-hairline text-center text-secondary">
                 暂无记忆条目
               </div>
             ) : (
               <div className="space-y-1.5">
                 {units.map((u) => (
-                  <div key={u.id} className="px-3 py-2 rounded-xl bg-white border border-[#e6e0d6] flex items-center justify-between gap-3">
+                  <div key={u.id} className="px-3 py-2 rounded-xl bg-white border border-hairline flex items-center justify-between gap-3">
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                         {badge(u.status)}
-                        <span className="font-mono text-[11px] text-[#4a5f82]">{u.kind}</span>
-                        <span className="font-mono text-[10px] text-[#8a919e]">{u.scope}</span>
-                        <span className="font-mono text-[10px] text-[#a0a6b0]">{u.id.slice(0, 12)}…</span>
+                        <span className="font-mono text-[11px] text-accent">{u.kind}</span>
+                        <span className="font-mono text-[10px] text-secondary">{u.scope}</span>
+                        <span className="font-mono text-[10px] text-tertiary">{u.id.slice(0, 12)}…</span>
                       </div>
-                      <div className="text-[12px] text-[#383d44] whitespace-pre-wrap leading-snug line-clamp-3">
+                      <div className="text-[12px] text-primary whitespace-pre-wrap leading-snug line-clamp-3">
                         {u.content}
                       </div>
                     </div>
                     <button
                       onClick={() => handleDelete(u.id)}
                       disabled={u.status === 'orphaned'}
-                      className="p-1.5 rounded-lg text-[#8a909c] hover:text-[#b83838] hover:bg-[#fdf0f0] shrink-0 disabled:opacity-40"
+                      className="p-1.5 rounded-lg text-tertiary hover:text-red-dark hover:bg-red-soft shrink-0 disabled:opacity-40"
                       title="删除（orphaned）"
                     >
                       <Trash2 className="w-4 h-4" />
@@ -174,20 +174,20 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 bg-white border-t border-[#ece6dc] flex items-center justify-between">
-          <span className="text-[11px] text-[#8a919e]">删除不会立刻从磁盘移除（保留审计），会停止被检索。</span>
+        <div className="px-5 py-3 bg-white border-t border-hairline flex items-center justify-between">
+          <span className="text-[11px] text-secondary">删除不会立刻从磁盘移除（保留审计），会停止被检索。</span>
           <div className="flex items-center gap-2">
             <button
               onClick={load}
               disabled={loading}
-              className="px-3 py-1.5 rounded-full bg-white border border-[#e2ddd3] text-[#525964] text-xs flex items-center gap-1.5 hover:bg-[#f7f5f0]"
+              className="px-3 py-1.5 rounded-full bg-white border border-hairline text-secondary text-xs flex items-center gap-1.5 hover:bg-black/[0.05]"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} /> 刷新
             </button>
             <button
               onClick={handleMaintenance}
               disabled={running}
-              className="px-3 py-1.5 rounded-full bg-[#4f46e5] hover:bg-[#4338ca] text-white text-xs flex items-center gap-1.5"
+              className="px-3 py-1.5 rounded-full bg-accent hover:bg-accent-hover text-white text-xs flex items-center gap-1.5"
             >
               <Wrench className={`w-3.5 h-3.5 ${running ? 'animate-spin' : ''}`} /> 执行治理/合并
             </button>
