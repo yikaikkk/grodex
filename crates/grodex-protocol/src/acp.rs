@@ -146,6 +146,9 @@ pub enum Command {
     ResumeSession(ResumeSessionCommand),
     /// Resolve an Indeterminate tool call discovered during crash recovery.
     ResolveIndeterminate(ResolveIndeterminateCommand),
+    /// Fetch a turn's net diff body by `diff_id` (lazy-load from the blob
+    /// store; the `DiffAvailable` event only carried the summary).
+    GetDiff(GetDiffCommand),
 }
 
 /// The client's resolution of an approval ticket.
@@ -207,6 +210,26 @@ pub struct ResolveIndeterminateCommand {
     pub resolution: IndeterminateResolution,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+}
+
+/// GetDiff command — client lazy-loads a turn's net diff body by `diff_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetDiffCommand {
+    pub command_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
+    pub session_id: String,
+    pub diff_id: String,
+}
+
+/// One file's net change in a `DiffPayload` (mirrors the blob-stored
+/// `DiffFile`, but is a protocol type to avoid a cross-crate dependency).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffFilePayload {
+    pub path: String,
+    pub change_type: String,
+    pub before_content: Option<String>,
+    pub after_content: Option<String>,
 }
 
 // ── Legacy approval types (kept for backward compat) ──────────────
@@ -446,6 +469,24 @@ pub enum UpdateContent {
         call_id: String,
         tool_name: String,
         message: String,
+    },
+
+    // ── Structured diff (Design Doc 22) ──────────────────────────
+    /// A turn's net diff was finalized. Summary only — the body is fetched
+    /// via `Command::GetDiff`.
+    DiffAvailable {
+        diff_id: String,
+        turn_id: String,
+        changed_files: usize,
+        added_lines: usize,
+        removed_lines: usize,
+        paths: Vec<String>,
+    },
+    /// Response to `GetDiff`: the full net diff body.
+    DiffPayload {
+        diff_id: String,
+        format: String,
+        files: Vec<DiffFilePayload>,
     },
 }
 

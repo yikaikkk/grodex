@@ -38,6 +38,8 @@ pub enum BlobOwnerKind {
     MemoryEvidence,
     /// The session itself (cascade-delete removes these).
     Session,
+    /// A turn's net diff (released when the owning session is deleted).
+    Diff,
 }
 
 /// Why the reference exists (finer-grained than the owner kind; kept for
@@ -54,6 +56,8 @@ pub enum BlobRefKind {
     EvidenceCitation,
     /// Session-scoped attachment.
     SessionAttachment,
+    /// A turn's net diff body (`application/vnd.grodex.diff+json`).
+    DiffBody,
 }
 
 /// One row of the `blob_refs` projection.

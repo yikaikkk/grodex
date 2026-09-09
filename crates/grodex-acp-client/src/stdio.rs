@@ -1,8 +1,60 @@
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
+
+/// Single-line payload cap. Snapshot frames for a mid-sized session can
+/// easily exceed the old 1MB hard limit; 16MB is a generous ceiling that
+/// still protects against genuinely malformed/runaway lines (memory
+/// fail-closed). Enforced at read time by [`read_line_limited`] so a
+/// `\n`-less stdout can't force a huge allocation before the check.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Sent by the reader thread instead of an over-limit line; `poll_event`
+/// routes it to `pending_logs` rather than JSON-parsing it.
+const TRUNCATED_LINE_MARKER: &str = "[transport] line too long";
+
+/// Read one `\n`-terminated line, capping the buffered length at `limit`
+/// bytes. When a line exceeds the cap, the excess is discarded up to (and
+/// including) the newline and [`TRUNCATED_LINE_MARKER`] is returned instead of
+/// the full line. `Ok(None)` only at EOF with nothing buffered.
+fn read_line_limited<R: BufRead>(reader: &mut R, limit: usize) -> std::io::Result<Option<String>> {
+    let mut line: Vec<u8> = Vec::with_capacity(4096);
+    let mut truncated = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break; // EOF
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        let (chunk, consume) = match newline {
+            Some(idx) => (&available[..idx], idx + 1),
+            None => (available, available.len()),
+        };
+        if !truncated {
+            let remaining = limit.saturating_sub(line.len());
+            if chunk.len() <= remaining {
+                line.extend_from_slice(chunk);
+            } else {
+                line.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+            }
+        }
+        reader.consume(consume);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if truncated {
+        Ok(Some(TRUNCATED_LINE_MARKER.to_string()))
+    } else if line.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+    }
+}
 
 use anyhow::{anyhow, Context, Result};
 use grodex_protocol::acp::{Command as AcpCommand, EventEnvelope, SessionSnapshotPayload};
@@ -35,7 +87,7 @@ pub struct StdioClient {
     /// extras were silently dropped into `pending_logs`, which caused
     /// `TurnComplete` to be lost and the "⏳ streaming…" indicator to
     /// stick forever.
-    event_queue: Vec<EventEnvelope>,
+    event_queue: VecDeque<EventEnvelope>,
     /// Highest event seq number we've consumed (returned from poll_event).
     /// Used to send `ClientFrame::Ack` so the agent can release backpressure.
     /// Without ACKs, the agent's `inflight = seq - client_last_consumed`
@@ -69,36 +121,33 @@ impl StdioClient {
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("无法获取子进程 stdout"))?;
         let stderr = child.stderr.take();
 
-        // Background thread: read stdout lines → channel (non-blocking try_recv)
+        // Background thread: read stdout lines → channel (non-blocking try_recv).
+        // Lines are capped at MAX_LINE_BYTES at read time (see read_line_limited).
         let (stdout_tx, stdout_rx) = mpsc::channel::<String>();
-        let stdout_reader = BufReader::new(stdout);
-        std::thread::spawn(move || {
-            for line in stdout_reader.lines() {
-                match line {
-                    Ok(l) => {
-                        if stdout_tx.send(l).is_err() {
-                            break;
-                        }
+        let mut stdout_reader = BufReader::new(stdout);
+        std::thread::spawn(move || loop {
+            match read_line_limited(&mut stdout_reader, MAX_LINE_BYTES) {
+                Ok(Some(l)) => {
+                    if stdout_tx.send(l).is_err() {
+                        break;
                     }
-                    Err(_) => break,
                 }
+                Ok(None) | Err(_) => break,
             }
         });
 
-        // Background thread: read stderr lines → channel
+        // Background thread: read stderr lines → channel (same cap).
         let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
         if let Some(stderr) = stderr {
-            let stderr_reader = BufReader::new(stderr);
-            std::thread::spawn(move || {
-                for line in stderr_reader.lines() {
-                    match line {
-                        Ok(l) => {
-                            if stderr_tx.send(l).is_err() {
-                                break;
-                            }
+            let mut stderr_reader = BufReader::new(stderr);
+            std::thread::spawn(move || loop {
+                match read_line_limited(&mut stderr_reader, MAX_LINE_BYTES) {
+                    Ok(Some(l)) => {
+                        if stderr_tx.send(l).is_err() {
+                            break;
                         }
-                        Err(_) => break,
                     }
+                    Ok(None) | Err(_) => break,
                 }
             });
         }
@@ -115,7 +164,7 @@ impl StdioClient {
             inflight_events: 0,
             rtt_ms: None,
             protocol_errors: Vec::new(),
-            event_queue: Vec::new(),
+            event_queue: VecDeque::new(),
             last_consumed_seq: 0,
             ack_dirty: false,
         })
@@ -163,6 +212,16 @@ impl StdioClient {
         Ok(())
     }
 
+    /// Whether the agent subprocess is still running. Used by frontends to
+    /// detect a dead `grodex serve` before it wedges a `send_acp_command`
+    /// write against a closed stdin pipe. Reaping the exit status here is
+    /// safe: [`Child::try_wait`] returns `Ok(Some(_))` repeatedly once the
+    /// child has exited, so the `Drop` impl's graceful-shutdown loop still
+    /// observes `exited` correctly.
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
     pub fn poll_event(&mut self, _timeout: Duration) -> Option<EventEnvelope> {
         // Drain stderr lines (non-blocking).
         while let Ok(line) = self.stderr_rx.try_recv() {
@@ -184,27 +243,21 @@ impl StdioClient {
             if line.is_empty() {
                 continue;
             }
-            // Single-line payload cap. Snapshot frames for a mid-sized
-            // session can easily exceed the old 1MB hard limit: e.g. 1k
-            // events with a few KB of reasoning each → 1-5MB JSON.
-            // 16 MB is a generous ceiling that still protects us against
-            // genuinely malformed/runaway lines (memory fail-closed).
-            const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
-            if line.len() > MAX_LINE_BYTES {
-                self.pending_logs
-                    .push(format!("[transport] line too long: {} bytes (max {MAX_LINE_BYTES})", line.len()));
+            // Reader-thread truncation marker — route to logs, never JSON-parse.
+            if line.starts_with(TRUNCATED_LINE_MARKER) {
+                self.pending_logs.push(line.to_string());
                 continue;
             }
             match serde_json::from_str::<ServerFrame>(line) {
                 Ok(frame) => {
                     if let Some(env) = self.handle_server_frame(frame) {
-                        self.event_queue.push(env);
+                        self.event_queue.push_back(env);
                     }
                 }
                 Err(_) => {
                     if let Ok(env) = serde_json::from_str::<EventEnvelope>(line) {
                         self.inflight_events = self.inflight_events.saturating_sub(1);
-                        self.event_queue.push(env);
+                        self.event_queue.push_back(env);
                     } else {
                         self.pending_logs.push(format!(
                             "无法解析 stdout 行: {}",
@@ -217,8 +270,7 @@ impl StdioClient {
 
         // Return the next queued event (FIFO order preserves causal
         // sequencing: TextDelta before TurnComplete).
-        if let Some(env) = self.event_queue.first().cloned() {
-            self.event_queue.remove(0);
+        if let Some(env) = self.event_queue.pop_front() {
             // Track highest seq for ACK. The agent uses
             // `inflight = next_seq - client_last_consumed` for
             // backpressure; without ACKs it grows unboundedly and the

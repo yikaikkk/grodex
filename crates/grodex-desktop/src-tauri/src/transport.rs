@@ -41,8 +41,12 @@ pub enum ControlMsg {
         cwd: PathBuf,
         reply: mpsc::Sender<Result<bool, String>>,
     },
-    /// Stop the worker thread (app teardown).
-    Shutdown,
+    /// Stop the worker thread (app teardown). `ack` is signalled once the
+    /// agent child has been gracefully shut down (stdin EOF → drain → reap),
+    /// so the caller can wait for convergence instead of orphaning `serve`.
+    Shutdown {
+        ack: Option<mpsc::Sender<()>>,
+    },
 }
 
 /// Resolve the `grodex` binary path. Precedence:
@@ -97,17 +101,32 @@ pub fn run_agent_worker(
 ) {
     let bin_str = bin.to_string_lossy().to_string();
     let mut client: Option<StdioClient> = None;
+    // The canonical workspace the live agent is bound to. Guards against
+    // cross-workspace reuse: a session whose journal lives in project B must
+    // never run tools/sandbox rooted in project A.
+    let mut active_cwd: Option<PathBuf> = None;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(16)) {
-            Ok(ControlMsg::Shutdown) => break,
+            Ok(ControlMsg::Shutdown { ack }) => {
+                // Drop the client so StdioClient's graceful shutdown runs
+                // (stdin EOF → serve drains → SIGKILL fallback), then ack.
+                drop(client.take());
+                active_cwd = None;
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+                break;
+            }
             Ok(ControlMsg::Respawn { cwd, reply }) => {
                 // Dropping the old client triggers StdioClient's graceful
                 // shutdown (stdin EOF → serve drains → SIGKILL fallback).
                 drop(client.take());
+                active_cwd = None;
                 match spawn_serve(&bin_str, &cwd) {
                     Ok(c) => {
                         client = Some(c);
+                        active_cwd = Some(cwd.clone());
                         let _ = reply.send(Ok(()));
                         emit_log(
                             &app,
@@ -124,13 +143,22 @@ pub fn run_agent_worker(
                 }
             }
             Ok(ControlMsg::EnsureRunning { cwd, reply }) => {
-                if client.is_some() {
-                    // Already running — no respawn needed.
+                // Respawn unless a live agent is already bound to this exact
+                // canonical workspace. A dead child or a different cwd both
+                // force a respawn (cross-workspace safety + crash self-heal).
+                let alive_and_bound = match client.as_mut() {
+                    Some(c) => c.is_alive() && active_cwd.as_ref() == Some(&cwd),
+                    None => false,
+                };
+                if alive_and_bound {
                     let _ = reply.send(Ok(false));
                 } else {
+                    drop(client.take());
+                    active_cwd = None;
                     match spawn_serve(&bin_str, &cwd) {
                         Ok(c) => {
                             client = Some(c);
+                            active_cwd = Some(cwd.clone());
                             let _ = reply.send(Ok(true));
                             emit_log(
                                 &app,
@@ -147,13 +175,34 @@ pub fn run_agent_worker(
                 }
             }
             Ok(ControlMsg::Command { cmd, reply }) => {
-                let res = match client.as_mut() {
-                    Some(c) => c.send_acp_command(&cmd).map_err(|e| e.to_string()),
-                    None => Err(
-                        "agent 进程尚未启动：请先新建任务并选择工作目录".to_string(),
-                    ),
+                eprintln!("[desktop] received command: type={:?}", std::mem::discriminant(&cmd));
+                // If the child died, drop it (so the next EnsureRunning
+                // respawns) and surface a clear error instead of writing to a
+                // broken stdin pipe.
+                let dead = match client.as_mut() {
+                    Some(c) => !c.is_alive(),
+                    None => false,
                 };
-                let _ = reply.send(res);
+                if dead {
+                    eprintln!("[desktop] agent dead, dropping client");
+                    drop(client.take());
+                    active_cwd = None;
+                    let _ = reply
+                        .send(Err("agent 进程已退出，请重新打开会话以重启".to_string()));
+                } else {
+                    let res = match client.as_mut() {
+                        Some(c) => {
+                            eprintln!("[desktop] sending acp command to agent");
+                            let r = c.send_acp_command(&cmd).map_err(|e| e.to_string());
+                            eprintln!("[desktop] send_acp_command result: {:?}", r.as_ref().map(|_| "ok").map_err(|e| e.as_str()));
+                            r
+                        }
+                        None => Err(
+                            "agent 进程尚未启动：请先新建任务并选择工作目录".to_string(),
+                        ),
+                    };
+                    let _ = reply.send(res);
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -161,15 +210,26 @@ pub fn run_agent_worker(
 
         // Drain whatever the agent produced since the last tick.
         if let Some(c) = client.as_mut() {
+            let mut evt_count = 0;
             loop {
                 match c.poll_event(Duration::ZERO) {
                     Some(env) => {
+                        evt_count += 1;
+                        if evt_count <= 3 {
+                            let dbg = format!("{:?}", env.content);
+                            let type_name = dbg.split('(').next().unwrap_or("?");
+                            eprintln!("[desktop] emitting acp_event seq={} type={}", env.seq, type_name);
+                        }
                         let _ = app.emit("acp_event", &env);
                     }
                     None => break,
                 }
             }
+            if evt_count > 3 {
+                eprintln!("[desktop] ... and {} more events this tick", evt_count - 3);
+            }
             for snap in c.take_snapshots() {
+                eprintln!("[desktop] emitting acp_snapshot items={}", snap.items.len());
                 let _ = app.emit("acp_snapshot", &snap);
             }
             for line in c.take_pending_logs() {
@@ -201,7 +261,12 @@ pub fn normalize_workspace(raw: &str) -> Result<PathBuf, String> {
     if !expanded.is_dir() {
         return Err(format!("不是有效目录: {}", expanded.display()));
     }
-    Ok(expanded)
+    // Canonicalize so a workspace has one stable identity regardless of
+    // relative path / `..` / symlink spelling. This is what makes the
+    // cross-workspace comparison in the worker reliable.
+    expanded
+        .canonicalize()
+        .map_err(|e| format!("无法解析工作目录 {}: {e}", expanded.display()))
 }
 
 /// Send a control message and wait (blocking) for the worker's reply.

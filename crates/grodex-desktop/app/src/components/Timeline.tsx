@@ -7,6 +7,10 @@ import { ToolCard } from './ToolCard';
 interface TimelineProps {
   items: TimelineItem[];
   onOpenDiff: (diffId: string) => void;
+  /** Opaque value bumped each time the timeline is rebuilt from a snapshot for
+   * the active session — on change, jump to the bottom (opening a session
+   * must not require the user to scroll down). */
+  scrollToKey?: number;
 }
 
 type Row =
@@ -166,10 +170,19 @@ function ThinkingFrame({
   );
 }
 
-export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff }) => {
+export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff, scrollToKey }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const pageStuckRef = useRef(false); // true = user scrolled UP (pauses follow)
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // A session's history was (re)loaded: reset any "scrolled up" pause and jump
+  // straight to the newest content. Uses instant scroll (no long animation).
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || items.length === 0) return;
+    pageStuckRef.current = false;
+    el.scrollTop = el.scrollHeight;
+  }, [scrollToKey]);
 
   // Page smart-follow:
   //  - while anything is live (thinking streaming / tool running / assistant

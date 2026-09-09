@@ -12,7 +12,7 @@ use crate::capability_manager::{CapabilityManager, TurnCapabilityOverlay};
 use crate::chat_state::ChatStateHandle;
 use crate::context::state_capsule::StateCapsule;
 use crate::context::CompactionManager;
-use crate::step::{classify_step, StepDisposition, TurnMetricsSummary, TurnOutcome};
+use crate::step::{classify_step, DiffSummary, StepDisposition, TurnMetricsSummary, TurnOutcome};
 use tracing::Instrument;
 use crate::turn::{StepResult, TurnContext};
 use grodex_capability::id::{CapabilityId, CapabilityKind};
@@ -99,6 +99,10 @@ struct ToolExecCtx {
     /// error result is returned (the underlying tool future is dropped,
     /// which for async tools cancels the pending operation).
     tool_timeout_secs: u64,
+    /// Diff tracker shared across every tool call in the turn. Each tool
+    /// feeds its applied-change delta here; `run()` aggregates + persists the
+    /// net diff at turn end. `None` in unit contexts without diff tracking.
+    diff_tracker: Option<Arc<std::sync::Mutex<grodex_tools::TurnDiffTracker>>>,
 }
 
 /// Manages one Turn from start to finish.
@@ -466,6 +470,11 @@ impl TurnCoordinator {
         // 可观测(设计文档 09 §19.1):Turn 计时与指标累加。
         let turn_started = std::time::Instant::now();
         let mut metrics = TurnMetrics::default();
+
+        // Diff: per-turn net-change aggregation. Tools feed their applied
+        // deltas via `ToolExecCtx`; this turn's net diff is persisted at the
+        // end of `run()`.
+        let diff_tracker = Arc::new(std::sync::Mutex::new(grodex_tools::TurnDiffTracker::new()));
 
         // ── Approval notification forwarder ───────────────────────────
         // Drains `approval_rx` (fed by `PermissionManager::check()` when
@@ -1108,6 +1117,7 @@ impl TurnCoordinator {
                             blob_store: self.blob_store.clone(),
                             session_id: turn_ctx.session_id.to_string(),
                             tool_timeout_secs: self.tool_timeout_secs,
+                            diff_tracker: Some(diff_tracker.clone()),
                         };
                         let op_id_for_result = op_id_str.clone();
                         // §19.2 Tool call span(父=Turn span;Step span 待
@@ -1380,6 +1390,7 @@ impl TurnCoordinator {
                                         cancels: metrics.cancels,
                                         repair_injections: metrics.repair_injections,
                                     },
+                                    diff: None,
                                 };
                             }
                         }
@@ -1691,6 +1702,56 @@ impl TurnCoordinator {
             "final_answer"
         };
 
+        // ── Diff: aggregate + persist the turn's net file changes ──────
+        // The full diff body goes to the content-addressed blob store; the
+        // journal only records a `DiffAvailable` summary (diff_id + stats).
+        // The summary is returned in `TurnOutcome` so the supervisor can emit
+        // a reliable `DiffAvailable` event (NOT the stream, which is aborted
+        // the moment `run()` returns and could drop a last-chance fragment).
+        let mut diff: Option<DiffSummary> = None;
+        let net = {
+            let guard = diff_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.net_changes()
+        };
+        if let Some(changes) = net {
+            if !changes.is_empty() {
+                let doc = grodex_tools::DiffDocument::from_net_changes(&changes);
+                if let Some(store) = self.blob_store.as_ref() {
+                    let (blob_ref, _hash) = store
+                        .store_owned(
+                            doc.to_json_bytes(),
+                            grodex_tools::DIFF_MIME.to_string(),
+                            grodex_tools::BlobOwnerKind::Diff,
+                            turn_ctx.session_id.to_string(),
+                            grodex_tools::BlobRefKind::DiffBody,
+                            None,
+                        )
+                        .await;
+                    let paths: Vec<String> =
+                        doc.files.iter().map(|f| f.path.clone()).collect();
+                    if let Some(ref writer) = self.rollout {
+                        let _ = writer
+                            .write_diff_available(
+                                turn_ctx.turn_id,
+                                &blob_ref.blob_id,
+                                doc.changed_files,
+                                doc.added_lines,
+                                doc.removed_lines,
+                                &paths,
+                            )
+                            .await;
+                    }
+                    diff = Some(DiffSummary {
+                        diff_id: blob_ref.blob_id,
+                        changed_files: doc.changed_files,
+                        added_lines: doc.added_lines,
+                        removed_lines: doc.removed_lines,
+                        paths,
+                    });
+                }
+            }
+        }
+
         TurnOutcome {
             steps,
             final_text,
@@ -1707,6 +1768,7 @@ impl TurnCoordinator {
                 repair_injections: metrics.repair_injections,
                 duration_ms: turn_started.elapsed().as_millis() as u64,
             },
+            diff,
         }
     }
 
@@ -2510,8 +2572,21 @@ async fn execute_single_tool(
                 exec_future.await
             };
             match output {
-                Ok(output) => {
+                Ok(mut output) => {
                     tracing::info!("tool executed successfully");
+                    // Diff capture: strip the applied-change delta out of the
+                    // tool result BEFORE the output reaches the model, so the
+                    // model never sees the old/new file contents. The delta is
+                    // later fed to the per-turn diff tracker (blob + rollout).
+                    let delta = grodex_tools::strip_applied_delta(&mut output);
+                    if let Some(d) = &delta {
+                        tracing::debug!(
+                            changes = d.changes.len(),
+                            exact = d.exact,
+                            tool = %name,
+                            "captured applied-change delta"
+                        );
+                    }
                     let content = output.to_string();
                     // T5: early offload oversized results before they
                     // enter the channel, so the receiver loop and all
@@ -2526,6 +2601,14 @@ async fn execute_single_tool(
                         call_id,
                     )
                     .await;
+                    // Feed the captured delta into the turn's diff tracker.
+                    if let Some(d) = delta.as_ref() {
+                        if let Some(t) = ctx.diff_tracker.as_ref() {
+                            if let Ok(mut guard) = t.lock() {
+                                guard.apply(d);
+                            }
+                        }
+                    }
                     ContextItem::ToolResult {
                         call_id,
                         content,

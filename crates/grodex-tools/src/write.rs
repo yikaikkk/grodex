@@ -1,8 +1,9 @@
 //! WriteFileTool — creates or overwrites a file.
 
 use crate::common::{
-    BuiltInTool, ChangedResource, ChangeType, ModelContent, PreparedCall, Retryability,
-    SideEffectHint, StaleFile, StaleSuggestion, ToolResultEnvelope, ToolStatus, TruncationInfo,
+    AppliedChangeDelta, BuiltInTool, ChangedResource, ChangeType, ModelContent, PreparedCall,
+    Retryability, SideEffectHint, StaleFile, StaleSuggestion, ToolResultEnvelope, ToolStatus,
+    TruncationInfo,
 };
 use async_trait::async_trait;
 use grodex_core::error::GrodexError;
@@ -113,7 +114,7 @@ impl ToolRuntime for WriteFileTool {
 
         // 把 exists / hash-check 读 / 原子写 / SHA-256 等阻塞操作移到
         // spawn_blocking 线程池，并经全局 Semaphore 限流（T3）。
-        let result = crate::blocking::run_blocking_io(move || -> Result<WriteFileOutput, GrodexError> {
+        let result = crate::blocking::run_blocking_io(move || -> Result<(WriteFileOutput, AppliedChangeDelta), GrodexError> {
             // T6 大内容输入预算：单次写入不得超过硬上限，防止一次性
             // 写入超大文件撑爆内存与磁盘。需写更大文件请用 append=true
             // 分块写入。
@@ -127,6 +128,17 @@ impl ToolRuntime for WriteFileTool {
             }
 
             let file_existed = std::path::Path::new(&args.path).exists();
+
+            // Diff capture: read the pre-write content (bounded) for the
+            // delta's `before_content`. Only meaningful when overwriting an
+            // existing file; creates have no "before".
+            let before_content = if file_existed {
+                std::fs::read_to_string(&args.path)
+                    .ok()
+                    .and_then(|s| crate::common::captured_content(&s))
+            } else {
+                None
+            };
 
             // File version fence (applies to both overwrite and append:
             // in append mode it guards the *existing* pre-append content).
@@ -144,10 +156,10 @@ impl ToolRuntime for WriteFileTool {
                 }
             }
 
-            if args.append {
+            let (result, after_content, exact) = if args.append {
                 // T6 追加模式：分块构建大文件。直接 append 新字节（不
                 // 重写整文件），fsync 持久化，再流式哈希整文件得到
-                // content_hash。
+                // content_hash。追加不重读整文件，diff 退化为非精确。
                 use std::io::Write;
                 {
                     let mut f = std::fs::OpenOptions::new()
@@ -160,41 +172,66 @@ impl ToolRuntime for WriteFileTool {
                     let _ = f.sync_all();
                 }
                 let content_hash = stream_hash_file(&args.path)?;
-                let result = WriteFileOutput {
-                    path: args.path,
-                    bytes_written: args.content.len() as u64,
-                    file_existed,
-                    content_hash,
-                    append: true,
+                (
+                    WriteFileOutput {
+                        path: args.path,
+                        bytes_written: args.content.len() as u64,
+                        file_existed,
+                        content_hash,
+                        append: true,
+                    },
+                    None,
+                    false,
+                )
+            } else {
+                // 原子写（T7）：tempfile + fsync + atomic rename，崩溃时
+                // 目标文件要么完整旧、要么完整新，绝不半写。
+                crate::fsutil::atomic_write(std::path::Path::new(&args.path), args.content.as_bytes())
+                    .map_err(|e| GrodexError::ToolExecution(format!("cannot write {}: {e}", args.path)))?;
+
+                // T9：content_hash 只算一次。
+                let content_hash = {
+                    let mut h = Sha256::new();
+                    h.update(args.content.as_bytes());
+                    format!("{:x}", h.finalize())
                 };
-                return Ok(result);
-            }
-
-            // 原子写（T7）：tempfile + fsync + atomic rename，崩溃时
-            // 目标文件要么完整旧、要么完整新，绝不半写。
-            crate::fsutil::atomic_write(std::path::Path::new(&args.path), args.content.as_bytes())
-                .map_err(|e| GrodexError::ToolExecution(format!("cannot write {}: {e}", args.path)))?;
-
-            // T9：content_hash 只算一次（旧实现这里也是一次，但与
-            // atomic_write 的临时文件写入不重复，保持单次）。
-            let content_hash = {
-                let mut h = Sha256::new();
-                h.update(args.content.as_bytes());
-                format!("{:x}", h.finalize())
-            };
-            let result = WriteFileOutput {
-                path: args.path,
-                bytes_written: args.content.len() as u64,
-                file_existed,
-                content_hash,
-                append: false,
+                (
+                    WriteFileOutput {
+                        path: args.path,
+                        bytes_written: args.content.len() as u64,
+                        file_existed,
+                        content_hash,
+                        append: false,
+                    },
+                    crate::common::captured_content(&args.content),
+                    true,
+                )
             };
 
-            Ok(result)
+            let resource_id = format!(
+                "fs://{}",
+                crate::fsutil::canonicalize(std::path::Path::new(&result.path)).display()
+            );
+            let delta = AppliedChangeDelta {
+                changes: vec![ChangedResource {
+                    resource_id,
+                    display_path: std::path::PathBuf::from(&result.path),
+                    change_type: if file_existed { ChangeType::Updated } else { ChangeType::Created },
+                    before_hash: None,
+                    after_hash: Some(result.content_hash.clone()),
+                    before_content,
+                    after_content,
+                }],
+                exact,
+            };
+
+            Ok((result, delta))
         })
         .await?;
 
-        serde_json::to_value(result).map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
+        let (result, delta) = result;
+        let output = serde_json::to_value(result).map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))?;
+        Ok(crate::common::with_applied_delta(output, delta))
     }
 }
 
@@ -379,6 +416,8 @@ impl BuiltInTool for WriteFileTool {
             change_type,
             before_hash: before_hash_for_changed,
             after_hash: Some(prepared.after_hash.clone()),
+            before_content: None,
+            after_content: None,
         }];
 
         let model_text = format!(

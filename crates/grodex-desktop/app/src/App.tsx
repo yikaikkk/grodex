@@ -19,6 +19,7 @@ import { SettingsModal } from './components/SettingsModal';
 import { EmptyState } from './components/EmptyState';
 import { MemoryManager } from './components/MemoryManager';
 import { ObservabilityPanel } from './components/ObservabilityPanel';
+import { DiffViewer } from './components/DiffViewer';
 import { AlertTriangle, RotateCcw, XCircle, Check, Loader2, Trash2 } from 'lucide-react';
 
 interface IndeterminateReq {
@@ -56,7 +57,17 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [isMemoryOpen, setIsMemoryOpen] = useState<boolean>(false);
   const [isObservabilityOpen, setIsObservabilityOpen] = useState<boolean>(false);
+  const [lastDiffId, setLastDiffId] = useState<string | null>(null);
+  const [isDiffOpen, setIsDiffOpen] = useState<boolean>(false);
   const [settings, setSettings] = useState<SettingsState>(makeDefaultSettings);
+  // Bumped whenever the timeline for the ACTIVE session is (re)built from a
+  // snapshot — the Timeline scrolls to the bottom so opening a session never
+  // requires the user to scroll down manually.
+  const [timelineReveal, setTimelineReveal] = useState(0);
+  // Ref mirroring activeSessionId so event-bus handlers (registered once per
+  // effect, with a possibly stale closure) can always read the current id.
+  const activeIdRef = useRef(activeSessionId);
+  activeIdRef.current = activeSessionId;
 
   // App-owned dialogs (window.confirm / window.prompt are unavailable in the
   // Tauri webview, so confirmation + directory input must be in-app UI).
@@ -114,6 +125,17 @@ export default function App() {
             timestamp: data.timestamp,
           },
         ],
+      }));
+    });
+
+    // Rollback for an optimistic user bubble whose Prompt failed at transport
+    // (see `sendPrompt`): remove it so the UI doesn't show an unsent message.
+    const unsubUserMsgFailed = eventBus.on('userMessageFailed', (data: any) => {
+      setTimelines((prev) => ({
+        ...prev,
+        [activeSessionId]: (prev[activeSessionId] || []).filter(
+          (it) => it.id !== data.id
+        ),
       }));
     });
 
@@ -260,6 +282,9 @@ export default function App() {
     const unsubSnapshot = eventBus.on('sessionSnapshot', (payload: any) => {
       const sid = payload.sessionId;
       if (!sid) return;
+      // History for the session the user is looking at just finished loading —
+      // tell the Timeline to jump to the bottom.
+      if (sid === activeIdRef.current) setTimelineReveal((k) => k + 1);
       setTimelines((prev) => ({ ...prev, [sid]: payload.items as TimelineItem[] }));
       // Make sure a row exists for a resumed session that wasn't listed yet.
       setSessions((prev) => {
@@ -314,9 +339,16 @@ export default function App() {
       setIndeterminate(payload as IndeterminateReq);
     });
 
+    // A turn's net diff finalized — remember the latest diff id (do NOT
+    // auto-open the viewer; the user opens it via the toolbar button).
+    const unsubDiffAvailable = eventBus.on('diffAvailable', (payload: any) => {
+      if (payload?.diffId) setLastDiffId(payload.diffId);
+    });
+
     return () => {
       unsubSessionState();
       unsubUserMsg();
+      unsubUserMsgFailed();
       unsubThinking();
       unsubAssistantText();
       unsubToolStarted();
@@ -330,6 +362,7 @@ export default function App() {
       unsubNotice();
       unsubCompact();
       unsubIndeterminate();
+      unsubDiffAvailable();
     };
   }, [activeSessionId, workspace]);
 
@@ -462,6 +495,7 @@ export default function App() {
     // freshly minted id from the client (not the stale closure value).
     let sid = activeSessionId;
     let createdNew = false;
+    let optimisticId: string | undefined;
     if (!sid) {
       const ok = await prepareSessionForTurn();
       if (!ok) return;
@@ -474,11 +508,12 @@ export default function App() {
       // and set the sidebar title HERE, against the real sid.
       const firstLine = text.split('\n').map((l) => l.trim()).find((l) => l.length > 0) || text;
       const stamp = new Date().toLocaleTimeString();
+      optimisticId = `msg_${Date.now()}`;
       setTimelines((prev) => ({
         ...prev,
         [sid]: [
           ...(prev[sid] || []),
-          { id: `msg_${Date.now()}`, type: 'user', content: text, timestamp: stamp },
+          { id: optimisticId, type: 'user', content: text, timestamp: stamp },
         ],
       }));
       setSessions((prev) =>
@@ -515,6 +550,14 @@ export default function App() {
     try {
       await acp.sendPrompt(text, createdNew ? { skipUserBubble: true } : undefined);
     } catch (e: any) {
+      // Roll back the optimistic bubble added above for a brand-new session,
+      // so a failed transport never leaves a phantom user message behind.
+      if (createdNew && optimisticId) {
+        setTimelines((prev) => ({
+          ...prev,
+          [sid]: (prev[sid] || []).filter((it) => it.id !== optimisticId),
+        }));
+      }
       showNotice(`发送失败：${e?.message || e}`, 'error');
       setIsRunning(false);
     }
@@ -591,7 +634,13 @@ export default function App() {
   };
 
   const noopSteerAdopt = () => showNotice('此版本未提供干预建议');
-  const onDiffUnavailable = () => showNotice('结构化 diff 查看将在后续协议扩展中提供');
+  const handleOpenDiff = () => {
+    if (lastDiffId) {
+      setIsDiffOpen(true);
+    } else {
+      showNotice('当前会话还没有文件变更');
+    }
+  };
 
   return (
     <div id="grodex-desktop-root" className="h-screen w-screen flex flex-col bg-canvas text-primary overflow-hidden font-sans antialiased">
@@ -660,7 +709,11 @@ export default function App() {
             />
           ) : (
             <>
-              <Timeline items={currentTimeline} onOpenDiff={onDiffUnavailable} />
+              <Timeline
+                items={currentTimeline}
+                onOpenDiff={handleOpenDiff}
+                scrollToKey={timelineReveal}
+              />
 
               <Composer
                 onSend={(text) => handleSendPrompt(text)}
@@ -675,7 +728,7 @@ export default function App() {
                 steerSuggestion={null}
                 onAdoptSteer={noopSteerAdopt}
                 onDismissSteer={() => {}}
-                onOpenDiff={onDiffUnavailable}
+                onOpenDiff={handleOpenDiff}
                 onResumeCrashed={() => showNotice('崩溃恢复：从任务列表重新打开该会话即可续接')}
                 onClearTimeline={() =>
                   setTimelines((prev) => ({ ...prev, [activeSessionId]: [] }))
@@ -855,6 +908,13 @@ export default function App() {
         onClose={() => setIsObservabilityOpen(false)}
         sessions={sessions}
         activeSessionId={activeSessionId}
+      />
+
+      {/* Structured diff viewer (lazy-loads by diff_id, opened on demand) */}
+      <DiffViewer
+        isOpen={isDiffOpen}
+        onClose={() => setIsDiffOpen(false)}
+        diffId={lastDiffId}
       />
     </div>
   );

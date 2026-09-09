@@ -51,12 +51,19 @@ fn main() {
         .expect("error while building grodex desktop");
 
     app.run(|app_handle, event| {
-        // On exit, tell the worker to stop so the spawned `grodex serve`
-        // child is shut down gracefully (not orphaned).
+        // On exit, tell the worker to stop and WAIT for it to gracefully
+        // converge (stdin EOF → serve drains → SIGKILL fallback) so the
+        // spawned `grodex serve` child is not orphaned and rollout/telemetry
+        // get a chance to finalize. The wait is bounded so a hung agent can't
+        // block app exit forever.
         if matches!(event, RunEvent::Exit) {
             if let Some(state) = app_handle.try_state::<TransportState>() {
                 if let Ok(tx) = state.0.lock() {
-                    let _ = tx.send(transport::ControlMsg::Shutdown);
+                    let (ack_tx, ack_rx) = mpsc::channel::<()>();
+                    let _ = tx.send(transport::ControlMsg::Shutdown {
+                        ack: Some(ack_tx),
+                    });
+                    let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
                 }
             }
         }

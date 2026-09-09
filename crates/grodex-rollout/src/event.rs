@@ -201,6 +201,15 @@ pub enum RolloutEventType {
     ///               cache_creation_tokens, output_tokens,
     ///               reasoning_tokens, total_tokens, estimated }
     ModelAttemptFinished,
+    /// A turn's net file changes were finalized into a content-addressed
+    /// blob. The journal keeps only the summary + `diff_id`; the full diff
+    /// lives in the blob store (never inlined here). Schema:
+    ///   - diff_id: str          (sha256 blob id)
+    ///   - changed_files: usize
+    ///   - added_lines: usize
+    ///   - removed_lines: usize
+    ///   - paths: [str]
+    DiffAvailable,
 }
 
 /// Sensitivity classification for an event.

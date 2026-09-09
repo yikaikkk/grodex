@@ -651,6 +651,25 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
             let env = EventEnvelope::wrap(seq, session_id, content);
             Some(ServerFrame::Event(env))
         }
+        LoopSessionEvent::DiffAvailable {
+            diff_id,
+            turn_id,
+            changed_files,
+            added_lines,
+            removed_lines,
+            paths,
+        } => {
+            let content = UpdateContent::DiffAvailable {
+                diff_id,
+                turn_id,
+                changed_files,
+                added_lines,
+                removed_lines,
+                paths,
+            };
+            let env = EventEnvelope::wrap(seq, session_id, content);
+            Some(ServerFrame::Event(env))
+        }
         LoopSessionEvent::SubagentProgress(p) => {
             // Flatten the structured loop event into the ACP wire form.
                         let (id, label, phase, detail, ok) = match p {
@@ -763,6 +782,7 @@ async fn route_command(
         AcpCommand::ResolveApproval(r) => Some(r.command_id.clone()),
         AcpCommand::ResumeSession(r) => Some(r.command_id.clone()),
         AcpCommand::ResolveIndeterminate(r) => Some(r.command_id.clone()),
+        AcpCommand::GetDiff(g) => Some(g.command_id.clone()),
     };
 
     if let Some(ref idem_key) = match &cmd {
@@ -772,6 +792,7 @@ async fn route_command(
         AcpCommand::ResolveApproval(r) => r.idempotency_key.as_ref(),
         AcpCommand::ResumeSession(r) => r.idempotency_key.as_ref(),
         AcpCommand::ResolveIndeterminate(r) => r.idempotency_key.as_ref(),
+        AcpCommand::GetDiff(_) => None,
     } {
         let now = Instant::now();
         if idem_cache.contains_with_ttl_reclaim(idem_key, now) {
@@ -1262,6 +1283,40 @@ async fn route_command(
                     content: ri.content,
                 })
                 .await
+        }
+        AcpCommand::GetDiff(gd) => {
+            // Lazy-load the diff body from the temp blob store and emit it.
+            let path = std::env::temp_dir()
+                .join("grodex-blobs")
+                .join(format!("{}.blob", gd.diff_id));
+            match tokio::fs::read(&path).await {
+                Err(_) => Err(format!("diff blob not found: {}", gd.diff_id)),
+                Ok(bytes) => match serde_json::from_slice::<grodex_tools::DiffDocument>(&bytes) {
+                    Err(e) => Err(format!("diff blob parse failed: {e}")),
+                    Ok(doc) => {
+                        let files = doc
+                            .files
+                            .into_iter()
+                            .map(|f| grodex_protocol::acp::DiffFilePayload {
+                                path: f.path,
+                                change_type: f.change_type,
+                                before_content: f.before_content,
+                                after_content: f.after_content,
+                            })
+                            .collect();
+                        let content = UpdateContent::DiffPayload {
+                            diff_id: gd.diff_id.clone(),
+                            format: doc.format,
+                            files,
+                        };
+                        let env = EventEnvelope::wrap(*seq, session_id, content);
+                        match write_frame(stdout, &ServerFrame::Event(env)).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                },
+            }
         }
     };
 
@@ -1890,6 +1945,7 @@ async fn run_interactive_with(
                     break;
                 }
                 Some(LoopSessionEvent::TurnStarted { .. }) => {}
+                Some(LoopSessionEvent::DiffAvailable { .. }) => {}
                 Some(LoopSessionEvent::SnapshotReady { .. }) | Some(LoopSessionEvent::ApprovalResolved { .. }) => {}
                 // ── Approval requested: the REPL resolves it inline —
                 // print the tool + args, read a one-line decision. Empty
@@ -2461,6 +2517,12 @@ fn summarize_payload(
             let tool = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
             let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
             format!("app-only tool={tool} reason={reason}")
+        }
+        DiffAvailable => {
+            let files = payload.get("changed_files").and_then(|v| v.as_u64()).unwrap_or(0);
+            let added = payload.get("added_lines").and_then(|v| v.as_u64()).unwrap_or(0);
+            let removed = payload.get("removed_lines").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("diff {files} files (+{added}/-{removed})")
         }
     }
 }

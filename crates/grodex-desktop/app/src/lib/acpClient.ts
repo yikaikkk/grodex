@@ -56,6 +56,26 @@ interface AcpContent {
   item_type?: string;
   snapshot?: AcpSnapshot;
   tool_call?: unknown;
+  diff_id?: string;
+  changed_files?: number;
+  added_lines?: number;
+  removed_lines?: number;
+  paths?: string[];
+  format?: string;
+  files?: DiffFilePayload[];
+}
+
+interface DiffFilePayload {
+  path: string;
+  change_type: string;
+  before_content: string | null;
+  after_content: string | null;
+}
+
+export interface DiffPayload {
+  diff_id: string;
+  format: string;
+  files: DiffFilePayload[];
 }
 
 interface AcpSnapshotItem {
@@ -126,6 +146,30 @@ const DEFAULT_PERMISSIONS: SettingsState['permissions'] = {
 let clientSessionId = uid();
 let wireSessionId = uid(); // syntactically valid UUID sent in commands
 let inited = false;
+// True right after `newSession`: we minted a placeholder id and are waiting
+// for the first inbound event to reveal the real rollout session id. Only in
+// this state may an inbound event reconcile the send target — an arbitrary
+// stale envelope (from a previous agent/session) must NOT rewrite it.
+let expectReconcile = false;
+// The session id we abandoned on the most recent `newSession` (respawn).
+// A stale event from the just-replaced serve carries this id; it must NOT be
+// allowed to hijack the fresh-session reconcile (see reconcile guard below).
+let lastLeftSessionId: string | null = null;
+
+// Per-session progress: highest consumed seq + last known capability
+// generation. Powers catch-up reconnect (#5) and generation fencing (#6/#7).
+const sessionState = new Map<string, { lastSeq: number; generation?: number }>();
+
+function trackSession(sid: string, seq?: number, generation?: number) {
+  const st = sessionState.get(sid) ?? { lastSeq: 0, generation: undefined };
+  if (seq != null && seq > st.lastSeq) st.lastSeq = seq;
+  if (generation != null) st.generation = generation;
+  sessionState.set(sid, st);
+}
+
+function currentGeneration(): number | undefined {
+  return sessionState.get(wireSessionId)?.generation;
+}
 
 let asst = { id: '', buf: '' };
 let activeTurn = false;
@@ -354,12 +398,25 @@ function snapshotToTimeline(snap: AcpSnapshot): TimelineItem[] {
 
 function onEvent(envelope: AcpEnvelope) {
   const realSid = envelope.session_id;
-  if (wireSessionId !== realSid) {
+  if (expectReconcile && realSid !== wireSessionId && realSid !== lastLeftSessionId) {
+    // Fresh session: reconcile the minted placeholder to the real id. The
+    // `!== lastLeftSessionId` guard rejects a stale tail event from the serve
+    // we just replaced (it would otherwise hijack the reconcile and point the
+    // send target at a session the live serve is NOT bound to).
     const from = clientSessionId;
     wireSessionId = realSid;
     clientSessionId = realSid;
+    expectReconcile = false;
+    lastLeftSessionId = null;
     eventBus.emit('sessionReady', { from, to: realSid });
+  } else if (realSid !== wireSessionId) {
+    // Stale event from a different session (old agent / pre-switch tail) —
+    // drop it so it can't pollute the current session or claw the send
+    // target back to a prior session.
+    return;
   }
+
+  trackSession(realSid, envelope.seq, envelope.generation);
 
   const c: AcpContent = envelope.content;
   switch (c.type) {
@@ -590,21 +647,63 @@ function onEvent(envelope: AcpEnvelope) {
       });
       break;
     }
+    case 'DiffAvailable': {
+      eventBus.emit('diffAvailable', {
+        sessionId: realSid,
+        diffId: c.diff_id,
+        turnId: c.turn_id,
+        changedFiles: c.changed_files,
+        addedLines: c.added_lines,
+        removedLines: c.removed_lines,
+        paths: c.paths,
+      });
+      break;
+    }
+    case 'DiffPayload': {
+      const diffId = c.diff_id || '';
+      const pending = pendingDiffs.get(diffId);
+      if (pending) {
+        pendingDiffs.delete(diffId);
+        pending.resolve({
+          diff_id: diffId,
+          format: c.format || '',
+          files: (c.files || []).map((f) => ({
+            path: f.path,
+            change_type: f.change_type,
+            before_content: f.before_content,
+            after_content: f.after_content,
+          })),
+        });
+      }
+      break;
+    }
     default:
-      // SessionLifecycle / legacy ItemAborted / ItemReplacement etc. — no UI
-      // effect needed yet.
+      // Unknown / legacy ACP event (SessionLifecycle / ItemAborted /
+      // ItemReplacement / future cancellation acks). Log it so protocol
+      // drift is observable instead of silently swallowed; no UI effect yet.
+      console.warn('[acp] unknown event type:', c.type);
       break;
   }
 }
 
 function onSnapshot(snap: AcpSnapshot) {
-  if (snap.session_id) {
-    clientSessionId = snap.session_id;
-    wireSessionId = snap.session_id;
+  const realSid = snap.session_id;
+  if (realSid && expectReconcile && realSid !== wireSessionId && realSid !== lastLeftSessionId) {
+    // Fresh session: reconcile the minted placeholder to the real id.
+    clientSessionId = realSid;
+    wireSessionId = realSid;
+    expectReconcile = false;
+    lastLeftSessionId = null;
   }
+  // A snapshot carries its own session_id and is the sole source of the
+  // timeline on resume — ALWAYS route it by that id. Never drop it: unlike
+  // streamed events (routed via the active-session closure), a snapshot for
+  // a different session is routed into that session's own bucket, harmless
+  // when it is not the active view.
+  trackSession(realSid, snap.last_seq, snap.generation);
   resetStreaming();
   eventBus.emit('sessionSnapshot', {
-    sessionId: snap.session_id || clientSessionId,
+    sessionId: realSid || clientSessionId,
     items: snapshotToTimeline(snap),
   });
 }
@@ -693,9 +792,10 @@ export async function sendPrompt(
   opts?: { skipUserBubble?: boolean }
 ): Promise<void> {
   resetStreaming();
+  const msgId = `msg_${uid()}`;
   if (!opts?.skipUserBubble) {
     eventBus.emit('userMessage', {
-      id: `msg_${uid()}`,
+      id: msgId,
       content: text,
       timestamp: clockTime(),
     });
@@ -709,9 +809,25 @@ export async function sendPrompt(
     type: 'Prompt',
     command_id: uid(),
     session_id: wireSessionId,
+    expected_generation: currentGeneration(),
     text,
   };
-  await sendWire(cmd);
+  try {
+    await sendWire(cmd);
+  } catch (e) {
+    // Transport failure: the message never reached the agent. Roll back the
+    // optimistic bubble + running state so the UI never shows a message that
+    // was not accepted (a retry would otherwise duplicate it).
+    if (!opts?.skipUserBubble) {
+      eventBus.emit('userMessageFailed', { id: msgId });
+    }
+    eventBus.emit('sessionStateChanged', {
+      status: 'completed',
+      isRunning: false,
+      sessionId: clientSessionId,
+    });
+    throw e;
+  }
 }
 
 /** Stop a cancel/error: mark any tool still running/awaiting as failed so its
@@ -737,14 +853,22 @@ function finalizeAllRunningTools(reason: string) {
 }
 
 export async function stop(): Promise<void> {
-  const cmd = withSession({ type: 'Cancel', command_id: uid() });
+  const cmd = withSession({
+    type: 'Cancel',
+    command_id: uid(),
+    expected_generation: currentGeneration(),
+  });
   await sendWire(cmd);
-  finalizeAllRunningTools('已停止');
+  // Stop the running-tool timers but do NOT force-complete the turn: the
+  // agent will emit TurnComplete (reason `cancelled`) which finalizes the
+  // session. Until that ack, the session is `cancelling` — never falsely
+  // `completed`, so a side effect still in flight isn't mis-reported as done.
+  finalizeAllRunningTools('已取消');
   finalizeAssistant();
   endThoughtBurst();
   resetStreaming();
   eventBus.emit('sessionStateChanged', {
-    status: 'completed',
+    status: 'cancelling',
     isRunning: false,
     sessionId: clientSessionId,
   });
@@ -765,20 +889,35 @@ export async function resumeSession(sessionId: string): Promise<void> {
   if (sessionId === clientSessionId) return;
   clientSessionId = sessionId;
   wireSessionId = sessionId;
+  expectReconcile = false;
   resetStreaming();
+  // Send the tracked cursor + generation so the backend can fence stale
+  // resumes and detect gaps. `snapshot_then_live` stays the safe full-rebuild
+  // mode; `catch_up` (incremental) is a later optimization once a real
+  // reconnect flow exists.
+  const st = sessionState.get(sessionId);
   const cmd = {
     type: 'ResumeSession',
     command_id: uid(),
     session_id: sessionId,
-    resume_from: { last_consumed_seq: 0, mode: 'snapshot_then_live' },
+    resume_from: {
+      last_consumed_seq: st?.lastSeq ?? 0,
+      mode: 'snapshot_then_live',
+    },
+    expected_generation: st?.generation,
   };
   await sendWire(cmd);
 }
 
 /** Start a brand-new session in `cwd` (respawns `grodex serve`). */
 export async function newSession(cwd: string): Promise<void> {
+  // Remember the session we are abandoning: its serve is about to be
+  // replaced, and any of its tail events still in flight to the webview must
+  // not be mistaken for the new serve's session during reconcile.
+  lastLeftSessionId = wireSessionId;
   clientSessionId = uid();
   wireSessionId = uid();
+  expectReconcile = true;
   resetStreaming();
   tools.clear();
   argsBuf.clear();
@@ -833,6 +972,7 @@ export async function resolveApproval(
   const cmd = {
     type: 'ResolveApproval',
     command_id: uid(),
+    expected_generation: currentGeneration(),
     ticket_id: approvalId,
     resolution,
     issued_by: 'grodex-desktop',
@@ -849,6 +989,7 @@ export async function resolveIndeterminate(
   const cmd = {
     type: 'ResolveIndeterminate',
     command_id: uid(),
+    expected_generation: currentGeneration(),
     call_id: callId,
     resolution,
   };
@@ -1065,4 +1206,36 @@ export function defaultPermissions(): SettingsState['permissions'] {
 
 export function currentSessionId(): string {
   return clientSessionId;
+}
+
+// ── Structured diff lazy-loading ───────────────────────────────────────
+
+const pendingDiffs = new Map<string, { resolve: (p: DiffPayload) => void }>();
+
+/** Fetch a turn's net diff body by `diff_id` (resolves on `DiffPayload`). */
+export async function getDiff(diffId: string): Promise<DiffPayload> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingDiffs.delete(diffId);
+      reject(new Error('diff 加载超时'));
+    }, 10000);
+    pendingDiffs.set(diffId, {
+      resolve: (p) => {
+        clearTimeout(timer);
+        resolve(p);
+      },
+    });
+    const cmd = {
+      type: 'GetDiff',
+      command_id: uid(),
+      session_id: wireSessionId,
+      diff_id: diffId,
+      expected_generation: currentGeneration(),
+    };
+    sendWire(cmd).catch((e) => {
+      clearTimeout(timer);
+      pendingDiffs.delete(diffId);
+      reject(e);
+    });
+  });
 }

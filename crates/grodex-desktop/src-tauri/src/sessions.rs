@@ -17,6 +17,16 @@ use crate::transport::sessions_dir;
 /// Bounds IO on very long sessions (a summary only needs the head).
 const SCAN_LIMIT: usize = 6000;
 
+/// Journal event types that indicate a real conversation. A session whose
+/// journal contains none of these is "boot-only" (SessionStarted and nothing
+/// else) and is safe to auto-purge.
+const CONTENT_EVENT_TYPES: [&str; 4] = [
+    "UserInputAccepted",
+    "ModelItemProduced",
+    "ToolExecutionStarted",
+    "ToolResultCommitted",
+];
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
@@ -161,8 +171,43 @@ fn first_line(text: &str) -> Option<&str> {
     text.lines().map(|l| l.trim()).find(|l| !l.is_empty())
 }
 
-/// Remove session dirs that only contain an empty/SessionStarted-only journal
-/// (phantom dirs left by a `grodex serve` boot that never saw a conversation).
+/// Strict check: a journal is a legitimate "boot-only" (purgeable) session
+/// only when every non-empty line parses as valid JSON carrying a known
+/// `event_type` AND none of them is a content event. Any parse failure,
+/// missing `event_type`, or I/O error returns `false` — fail-closed so a
+/// corrupted or future-schema journal is never mistaken for "empty".
+fn journal_is_boot_only(journal: &PathBuf) -> bool {
+    let Ok(file) = std::fs::File::open(journal) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut any_event = false;
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            return false; // I/O error mid-read — preserve
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false; // corrupted JSON — preserve
+        };
+        let Some(et) = v.get("event_type").and_then(|x| x.as_str()) else {
+            return false; // missing/unknown schema — preserve
+        };
+        any_event = true;
+        if CONTENT_EVENT_TYPES.contains(&et) {
+            return false; // real conversation — keep
+        }
+    }
+    any_event
+}
+
+/// Remove session dirs that only contain an empty or strictly-verified
+/// SessionStarted-only journal (phantom dirs left by a `grodex serve` boot
+/// that never saw a conversation). Corrupted / unknown-schema / unreadable
+/// journals are preserved, never deleted.
 /// Returns how many were removed.
 pub fn purge_empty_sessions() -> usize {
     let root = sessions_dir();
@@ -181,8 +226,8 @@ pub fn purge_empty_sessions() -> usize {
             Ok(_) => false,
             Err(_) => false, // no journal yet — leave it
         };
-        let no_content = !empty && summarize_journal(&journal, "x").is_none();
-        if empty || no_content {
+        let boot_only = !empty && journal_is_boot_only(&journal);
+        if empty || boot_only {
             if std::fs::remove_dir_all(&dir).is_ok() {
                 removed += 1;
             }
@@ -238,6 +283,24 @@ pub fn session_dir(id: &str) -> Result<PathBuf, String> {
 /// Permanently delete a session's rollout directory (journal + blobs).
 pub fn delete_session(id: &str) -> Result<(), String> {
     let dir = session_dir(id)?;
+    let journal = dir.join("rollout.jsonl");
+    // Guard against deleting a session another process (CLI / a second
+    // Desktop / a stale agent) may still be actively writing: refuse when the
+    // journal was modified in the last minute. This is a heuristic — a full
+    // cross-process session-store lock belongs to the unified fact-source
+    // work, but this closes the common "delete mid-write" window.
+    if let Ok(meta) = std::fs::metadata(&journal) {
+        if let Ok(modified) = meta.modified() {
+            let age = std::time::SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default();
+            if age.as_secs() < 60 {
+                return Err(
+                    "该会话可能仍在使用中（journal 刚刚更新），请稍后再删除".to_string(),
+                );
+            }
+        }
+    }
     std::fs::remove_dir_all(&dir)
         .map_err(|e| format!("删除会话目录失败 ({}): {e}", dir.display()))
 }

@@ -221,6 +221,16 @@ pub enum SessionEvent {
     /// transient "会话压缩中…" indicator while started and clears it on
     /// finished/failed.
     CompactionStatus { phase: String },
+    /// A turn's net diff was finalized — maps to ACP DiffAvailable.
+    /// Summary only; the body is fetched lazily via `GetDiff`.
+    DiffAvailable {
+        diff_id: String,
+        turn_id: String,
+        changed_files: usize,
+        added_lines: usize,
+        removed_lines: usize,
+        paths: Vec<String>,
+    },
     /// The session has shut down.
     Shutdown,
     /// A snapshot is ready for the client (in response to `ResumeSession`

@@ -1,4 +1,4 @@
-export type SessionStatus = 'running' | 'completed' | 'awaiting_approval' | 'crashed_recoverable';
+export type SessionStatus = 'running' | 'completed' | 'awaiting_approval' | 'crashed_recoverable' | 'cancelling';
 
 export type ToolStatus = 'pending' | 'running' | 'finished' | 'failed' | 'awaiting_approval';
 

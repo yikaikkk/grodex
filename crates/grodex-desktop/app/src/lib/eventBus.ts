@@ -6,6 +6,7 @@
 export type ACPEventType =
   | 'sessionStateChanged'
   | 'userMessage'
+  | 'userMessageFailed'
   | 'thinkingDelta'
   | 'assistantTextDelta'
   | 'toolStarted'
@@ -19,6 +20,7 @@ export type ACPEventType =
   | 'systemNotice' // one-line info/log entry (from ACP Info)
   | 'indeterminateRequested' // crash-recovery decision modal
   | 'compactionStatus' // context-compaction indicator
+  | 'diffAvailable' // a turn's net diff summary is ready to view
   | 'sessionReady'; // fresh respawn reconciled to a real rollout session id
 
 export type ACPEventHandler = (payload: any) => void;

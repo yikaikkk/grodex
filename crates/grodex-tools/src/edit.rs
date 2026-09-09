@@ -5,9 +5,9 @@
 //! (to avoid ambiguous edits).
 
 use crate::common::{
-    BuiltInTool, ChangedResource, ChangeType, FileSnapshot, FileType, LineEnding, ModelContent,
-    PreparedCall, Retryability, SideEffectHint, StaleFile, StaleSuggestion, ToolResultEnvelope,
-    ToolStatus, TruncationInfo,
+    AppliedChangeDelta, BuiltInTool, ChangedResource, ChangeType, FileSnapshot, FileType,
+    LineEnding, ModelContent, PreparedCall, Retryability, SideEffectHint, StaleFile,
+    StaleSuggestion, ToolResultEnvelope, ToolStatus, TruncationInfo,
 };
 use async_trait::async_trait;
 use grodex_core::error::GrodexError;
@@ -171,7 +171,7 @@ impl ToolRuntime for EditTool {
 
         // 把整文件读 / hash fence / replace / 原子写等阻塞操作移到
         // spawn_blocking 线程池，并经全局 Semaphore 限流（T3）。
-        let result = crate::blocking::run_blocking_io(move || -> Result<EditOutput, GrodexError> {
+        let result = crate::blocking::run_blocking_io(move || -> Result<(EditOutput, AppliedChangeDelta), GrodexError> {
         let content = std::fs::read_to_string(&args.path)
             .map_err(|e| GrodexError::ToolExecution(format!("cannot read {}: {e}", args.path)))?;
 
@@ -241,7 +241,8 @@ impl ToolRuntime for EditTool {
                 lines_after: new_content.lines().count(),
                 no_op: content == new_content,
             };
-            return Ok(result);
+            let delta = edit_delta(&result.path, &content, &new_content, &result.content_hash_after);
+            return Ok((result, delta));
         }
 
         // ── Single edit mode (backward-compatible) ──
@@ -298,11 +299,39 @@ impl ToolRuntime for EditTool {
             no_op: content == new_content,
         };
 
-        Ok(result)
+        let delta = edit_delta(&result.path, &content, &new_content, &result.content_hash_after);
+        Ok((result, delta))
         })
         .await?;
 
-        serde_json::to_value(result).map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))
+        let (result, delta) = result;
+        let output = serde_json::to_value(result).map_err(|e| GrodexError::ToolExecution(format!("serialize: {e}")))?;
+        Ok(crate::common::with_applied_delta(output, delta))
+    }
+}
+
+/// Build the applied-change delta for a successful edit (before = pre-edit
+/// content, after = post-edit content, both bounded by the capture cap).
+fn edit_delta(
+    path: &str,
+    before: &str,
+    after: &str,
+    after_hash: &str,
+) -> AppliedChangeDelta {
+    AppliedChangeDelta {
+        changes: vec![ChangedResource {
+            resource_id: format!(
+                "fs://{}",
+                crate::fsutil::canonicalize(std::path::Path::new(path)).display()
+            ),
+            display_path: std::path::PathBuf::from(path),
+            change_type: ChangeType::Updated,
+            before_hash: None,
+            after_hash: Some(after_hash.to_string()),
+            before_content: crate::common::captured_content(before),
+            after_content: crate::common::captured_content(after),
+        }],
+        exact: true,
     }
 }
 
@@ -668,6 +697,8 @@ impl BuiltInTool for EditTool {
             change_type: ChangeType::Updated,
             before_hash: Some(prepared.before_hash.clone()),
             after_hash: Some(prepared.after_hash.clone()),
+            before_content: None,
+            after_content: None,
         }];
 
         let model_text = format!(

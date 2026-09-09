@@ -31,6 +31,7 @@ pub mod patch;
 pub mod process_io;
 pub mod read;
 pub mod read_artifact;
+pub mod turn_diff;
 pub mod web;
 pub mod registry;
 pub mod write;
@@ -40,11 +41,12 @@ pub use blob_store::{BlobRef, BlobStore, BoundedView, FileBlobStore, InMemoryBlo
 pub use cancel::{CancelPipeline, CancelRegistry, CancelResult, CancellationToken};
 pub use blocking::run_blocking_io;
 pub use common::{
-    ArtifactRef, AtomicityLevel, BuiltInTool, ChangedResource, ChangeType, ExecOutput, ExecStatus,
-    FileSnapshot, FileType, HashlineAnchor, HeadTailBuffer, LineEnding, ModelContent,
-    PatchFile, PatchHunk, PatchOperation, PatchPlan, PreparedCall, ProcessHandle, ProcessState,
-    ReadRange, ReadRender, Retryability, SideEffectHint, StaleFile, StaleSuggestion,
-    ToolResultEnvelope, ToolStatus, TruncationInfo, TruncationStrategy,
+    APPLIED_DELTA_KEY, AppliedChangeDelta, ArtifactRef, AtomicityLevel, BuiltInTool, ChangeType,
+    ChangedResource, ExecOutput, ExecStatus, FileSnapshot, FileType, HashlineAnchor,
+    HeadTailBuffer, LineEnding, ModelContent, PatchFile, PatchHunk, PatchOperation, PatchPlan,
+    PreparedCall, ProcessHandle, ProcessState, ReadRange, ReadRender, Retryability, SideEffectHint,
+    StaleFile, StaleSuggestion, ToolResultEnvelope, ToolStatus, TruncationInfo, TruncationStrategy,
+    captured_content, strip_applied_delta, with_applied_delta,
 };
 pub use edit::EditTool;
 pub use exec::{ExecTool, ResourceLimits};
@@ -57,5 +59,6 @@ pub use process_io::{ProcessIoTool, ProcessManager};
 pub use read::ReadFileTool;
 pub use read_artifact::ReadArtifactTool;
 pub use registry::ToolRegistry;
+pub use turn_diff::{DIFF_MIME, DiffDocument, DiffFile, TurnDiffTracker};
 pub use write::WriteFileTool;
 pub use web::{WebFetchArgs, WebFetchOutput, WebFetchTool};

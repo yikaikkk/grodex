@@ -50,6 +50,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
         return <span className="w-2 h-2 rounded-full bg-orange shrink-0" />;
       case 'crashed_recoverable':
         return <span className="w-2 h-2 rounded-full bg-red shrink-0" />;
+      case 'cancelling':
+        return <span className="w-2 h-2 rounded-full bg-tertiary animate-breathe shrink-0" />;
     }
   };
 

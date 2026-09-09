@@ -1179,6 +1179,8 @@ impl BuiltInTool for ExecTool {
                     change_type: ChangeType::Created,
                     before_hash: None,
                     after_hash: Some(format!("exit:{:?}", result.exit_code)),
+                    before_content: None,
+                    after_content: None,
                 }];
 
                 let model_text = format!(

@@ -4,8 +4,9 @@
 //! Unlike EditTool (string replace), this handles file creation, deletion, and moves.
 
 use crate::common::{
-    self, AtomicityLevel, BuiltInTool, ChangedResource, ChangeType, ModelContent, PatchPlan,
-    PreparedCall, Retryability, SideEffectHint, ToolResultEnvelope, ToolStatus, TruncationInfo,
+    self, AppliedChangeDelta, AtomicityLevel, BuiltInTool, ChangedResource, ChangeType,
+    ModelContent, PatchPlan, PreparedCall, Retryability, SideEffectHint, ToolResultEnvelope,
+    ToolStatus, TruncationInfo,
 };
 use async_trait::async_trait;
 use grodex_core::error::GrodexError;
@@ -122,35 +123,90 @@ impl ToolRuntime for ApplyPatchTool {
         // original file intact, never a half-written one.
         let mut txn = Txn::new();
         let mut results = Vec::new();
+        // Applied-change delta: capture old/new content per successful op.
+        let mut changed: Vec<ChangedResource> = Vec::new();
 
         for op in &args.operations {
             let result = match op {
                 PatchOperation::Create { path, content } => match txn.create(path, content) {
-                    Ok(()) => PatchOpResult { action: "create".into(), path: path.clone(), success: true, error: None },
+                    Ok(()) => {
+                        changed.push(ChangedResource {
+                            resource_id: patch_rid(path),
+                            display_path: PathBuf::from(path),
+                            change_type: ChangeType::Created,
+                            before_hash: None,
+                            after_hash: None,
+                            before_content: None,
+                            after_content: crate::common::captured_content(content),
+                        });
+                        PatchOpResult { action: "create".into(), path: path.clone(), success: true, error: None }
+                    }
                     Err(e) => PatchOpResult { action: "create".into(), path: path.clone(), success: false, error: Some(e) },
                 },
                 PatchOperation::Modify { path, content } => {
                     if !Path::new(path).exists() {
                         PatchOpResult { action: "modify".into(), path: path.clone(), success: false, error: Some("file does not exist".into()) }
                     } else {
+                        let before = std::fs::read_to_string(path)
+                            .ok()
+                            .and_then(|s| crate::common::captured_content(&s));
                         match txn.modify(path, content) {
-                            Ok(()) => PatchOpResult { action: "modify".into(), path: path.clone(), success: true, error: None },
+                            Ok(()) => {
+                                changed.push(ChangedResource {
+                                    resource_id: patch_rid(path),
+                                    display_path: PathBuf::from(path),
+                                    change_type: ChangeType::Updated,
+                                    before_hash: None,
+                                    after_hash: None,
+                                    before_content: before,
+                                    after_content: crate::common::captured_content(content),
+                                });
+                                PatchOpResult { action: "modify".into(), path: path.clone(), success: true, error: None }
+                            }
                             Err(e) => PatchOpResult { action: "modify".into(), path: path.clone(), success: false, error: Some(e) },
                         }
                     }
                 }
-                PatchOperation::Delete { path } => match txn.delete(path) {
-                    Ok(()) => PatchOpResult { action: "delete".into(), path: path.clone(), success: true, error: None },
-                    Err(e) => PatchOpResult { action: "delete".into(), path: path.clone(), success: false, error: Some(e) },
-                },
+                PatchOperation::Delete { path } => {
+                    let before = std::fs::read_to_string(path)
+                        .ok()
+                        .and_then(|s| crate::common::captured_content(&s));
+                    match txn.delete(path) {
+                        Ok(()) => {
+                            changed.push(ChangedResource {
+                                resource_id: patch_rid(path),
+                                display_path: PathBuf::from(path),
+                                change_type: ChangeType::Deleted,
+                                before_hash: None,
+                                after_hash: None,
+                                before_content: before,
+                                after_content: None,
+                            });
+                            PatchOpResult { action: "delete".into(), path: path.clone(), success: true, error: None }
+                        }
+                        Err(e) => PatchOpResult { action: "delete".into(), path: path.clone(), success: false, error: Some(e) },
+                    }
+                }
                 PatchOperation::Rename { old_path, new_path } => match txn.rename(old_path, new_path) {
-                    Ok(()) => PatchOpResult { action: "rename".into(), path: format!("{old_path} → {new_path}"), success: true, error: None },
+                    Ok(()) => {
+                        changed.push(ChangedResource {
+                            resource_id: patch_rid(new_path),
+                            display_path: PathBuf::from(format!("{old_path} → {new_path}")),
+                            change_type: ChangeType::Moved,
+                            before_hash: None,
+                            after_hash: None,
+                            before_content: None,
+                            after_content: None,
+                        });
+                        PatchOpResult { action: "rename".into(), path: format!("{old_path} → {new_path}"), success: true, error: None }
+                    }
                     Err(e) => PatchOpResult { action: "rename".into(), path: format!("{old_path} → {new_path}"), success: false, error: Some(e) },
                 },
             };
             let succeeded = result.success;
             results.push(result);
             // On the first failure: roll back every applied op and stop.
+            // The partial delta is discarded (rolled back = no net change).
             if !succeeded {
                 txn.rollback();
                 let output = PatchOutput {
@@ -169,8 +225,15 @@ impl ToolRuntime for ApplyPatchTool {
             total_files_affected: results.len(),
             operations: results,
         };
-        serde_json::to_value(output).map_err(|e| GrodexError::ToolExecution(format!("{e}")))
+        let delta = AppliedChangeDelta { changes: changed, exact: true };
+        let value = serde_json::to_value(output).map_err(|e| GrodexError::ToolExecution(format!("{e}")))?;
+        Ok(crate::common::with_applied_delta(value, delta))
     }
+}
+
+/// Canonical `fs://` resource id for a patch target path.
+fn patch_rid(path: &str) -> String {
+    format!("fs://{}", crate::fsutil::canonicalize(Path::new(path)).display())
 }
 
 // ── Atomic transaction helper ────────────────────────────────────────────
@@ -528,6 +591,8 @@ impl BuiltInTool for ApplyPatchTool {
                                 change_type: ChangeType::Created,
                                 before_hash: None,
                                 after_hash: after_hash_for_changed,
+                                before_content: None,
+                                after_content: None,
                             });
                             ("create", path.clone(), true, None)
                         }
@@ -550,6 +615,8 @@ impl BuiltInTool for ApplyPatchTool {
                                         change_type: ChangeType::Updated,
                                         before_hash,
                                         after_hash: after_hash_for_changed,
+                                        before_content: None,
+                                        after_content: None,
                                     });
                                     ("modify", path.clone(), true, None)
                                 }
@@ -567,6 +634,8 @@ impl BuiltInTool for ApplyPatchTool {
                                 change_type: ChangeType::Deleted,
                                 before_hash,
                                 after_hash: None,
+                                before_content: None,
+                                after_content: None,
                             });
                             ("delete", path.clone(), true, None)
                         }
@@ -582,6 +651,8 @@ impl BuiltInTool for ApplyPatchTool {
                                 change_type: ChangeType::Moved,
                                 before_hash,
                                 after_hash: after_hash_for_changed,
+                                before_content: None,
+                                after_content: None,
                             });
                             (
                                 "rename",

@@ -1705,6 +1705,23 @@ impl SessionSupervisor {
             }
         }
 
+        // Surface the turn's net diff to the frontend (reliable `event_tx`
+        // path — the stream handle is already aborted by now, so the diff
+        // summary travels out via the same channel as TurnCompleted).
+        if let Some(d) = &completion.outcome.diff {
+            let _ = self
+                .event_tx
+                .send(SessionEvent::DiffAvailable {
+                    diff_id: d.diff_id.clone(),
+                    turn_id: completion.turn_id.to_string(),
+                    changed_files: d.changed_files,
+                    added_lines: d.added_lines,
+                    removed_lines: d.removed_lines,
+                    paths: d.paths.clone(),
+                })
+                .await;
+        }
+
         // ── W4 memory extraction + proposal commit (post-turn) ──────
         //
         // Fail-open everywhere:

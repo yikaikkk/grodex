@@ -394,6 +394,69 @@ pub struct ChangedResource {
     /// Before/after snapshot reference (if the change is a file write).
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
+    /// Full old/new content for rendering a diff. `None` when the content
+    /// exceeds [`CHANGE_CONTENT_CAP_BYTES`] (diff degrades to stats-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_content: Option<String>,
+}
+
+/// Cap for capturing old/new file content into [`ChangedResource`]. Larger
+/// files keep only hashes — the diff tracker degrades gracefully instead of
+/// ballooning memory or duplicating huge contents.
+pub const CHANGE_CONTENT_CAP_BYTES: usize = 64 * 1024;
+
+/// Capture content only when it fits the cap; oversized content returns
+/// `None` (renderable=false).
+pub fn captured_content(content: &str) -> Option<String> {
+    if content.len() <= CHANGE_CONTENT_CAP_BYTES {
+        Some(content.to_string())
+    } else {
+        None
+    }
+}
+
+/// A set of applied file changes plus an exactness flag. `exact=false` when
+/// the set may be incomplete (e.g. an arbitrary `exec` may have mutated files
+/// the tracker couldn't observe). Built from per-tool [`ChangedResource`]s
+/// and aggregated into a per-turn net diff by the `TurnDiffTracker`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedChangeDelta {
+    pub changes: Vec<ChangedResource>,
+    #[serde(default)]
+    pub exact: bool,
+}
+
+/// Reserved key under which a tool's `ToolRuntime::execute` output JSON
+/// carries its [`AppliedChangeDelta`]. The agent loop extracts it for the
+/// diff tracker and strips it before the output enters the model context.
+pub const APPLIED_DELTA_KEY: &str = "_applied_delta";
+
+/// Embed `delta` into a tool output value under [`APPLIED_DELTA_KEY`].
+pub fn with_applied_delta(output: serde_json::Value, delta: AppliedChangeDelta) -> serde_json::Value {
+    let mut map = match output {
+        serde_json::Value::Object(m) => m,
+        other => {
+            let mut m = serde_json::Map::new();
+            m.insert("value".to_string(), other);
+            m
+        }
+    };
+    map.insert(
+        APPLIED_DELTA_KEY.to_string(),
+        serde_json::to_value(delta).unwrap_or(serde_json::Value::Null),
+    );
+    serde_json::Value::Object(map)
+}
+
+/// Strip (and return) the embedded delta from a tool output value.
+pub fn strip_applied_delta(output: &mut serde_json::Value) -> Option<AppliedChangeDelta> {
+    let serde_json::Value::Object(map) = output else {
+        return None;
+    };
+    let v = map.remove(APPLIED_DELTA_KEY)?;
+    serde_json::from_value(v).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

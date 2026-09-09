@@ -252,6 +252,7 @@ fn telemetry_kind(event_type: &RolloutEventType) -> &'static str {
         RolloutEventType::TurnStarted => tel_kind::TURN_STARTED,
         RolloutEventType::ModelAttemptStarted => tel_kind::MODEL_ATTEMPT_STARTED,
         RolloutEventType::ModelAttemptFinished => tel_kind::MODEL_ATTEMPT_FINISHED,
+        RolloutEventType::DiffAvailable => tel_kind::DIFF_AVAILABLE,
     }
 }
 
@@ -1121,6 +1122,37 @@ impl RolloutWriter {
             None,
             payload,
             true, // durable: only audit trail for app-initiated calls
+            SensitivityLevel::Normal,
+        )
+        .await
+    }
+
+    /// Record a turn's finalized net diff as a summary anchor. The full diff
+    /// lives in the blob store (never inlined here); the journal keeps only
+    /// the `diff_id` + line/file stats so the desktop can lazy-load the body.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_diff_available(
+        &self,
+        turn_id: TurnId,
+        diff_id: &str,
+        changed_files: usize,
+        added_lines: usize,
+        removed_lines: usize,
+        paths: &[String],
+    ) -> Result<u64, GrodexError> {
+        self.write(
+            RolloutEventType::DiffAvailable,
+            Some(turn_id),
+            None,
+            None,
+            serde_json::json!({
+                "diff_id": diff_id,
+                "changed_files": changed_files,
+                "added_lines": added_lines,
+                "removed_lines": removed_lines,
+                "paths": paths,
+            }),
+            false, // non-durable: the blob is the durable record
             SensitivityLevel::Normal,
         )
         .await

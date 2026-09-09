@@ -90,6 +90,8 @@ pub mod kind {
     // Out-of-band kinds (not journaled; emitted directly to the sink).
     pub const MEMORY_RETRIEVAL: &str = "memory_retrieval";
     pub const MCP_LIFECYCLE: &str = "mcp_lifecycle";
+    /// A turn's net diff was finalized (summary anchor; body lives in blob).
+    pub const DIFF_AVAILABLE: &str = "diff_available";
 }
 
 /// One telemetry observation. Journal-derived records use a

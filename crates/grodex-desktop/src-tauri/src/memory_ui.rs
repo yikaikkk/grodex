@@ -114,21 +114,24 @@ pub fn delete_memory(id: String) -> Result<(), String> {
 #[tauri::command]
 pub fn run_memory_maintenance() -> Result<MaintenanceReport, String> {
     let db = open_db()?;
+    // Governance returns a `GovernanceReport` (fail-open internally); its
+    // `errors` count is the real success signal, not a hard-coded `true`.
+    let gov = db.run_governance_pass(None, None);
+    let cons = db.run_consolidation_pass().is_ok();
+
+    // Re-read counts AFTER the passes so the report reflects the result of
+    // the maintenance just run (units may have been quarantined/purged,
+    // conflicts may have been auto-resolved).
     let units = db
         .list_all_memory_units()
         .map(|v| v.len())
         .unwrap_or(0);
     let conflicts_pending = db.list_pending_conflicts().map(|v| v.len()).unwrap_or(0);
 
-    // run_governance_pass returns a report (fail-open internally), so success
-    // is always true; consolidation returns a Result.
-    let _gov = db.run_governance_pass(None, None);
-    let cons = db.run_consolidation_pass().is_ok();
-
     Ok(MaintenanceReport {
         units,
         conflicts_pending,
-        governance_ok: true,
+        governance_ok: gov.errors == 0,
         consolidation_ok: cons,
     })
 }

@@ -758,6 +758,8 @@ impl BuiltInTool for ReadFileTool {
             change_type: ChangeType::Metadata,
             before_hash: prepared.content_hash.clone().into(),
             after_hash: prepared.content_hash.clone().into(),
+            before_content: None,
+            after_content: None,
         }];
 
         let model_text = format!(

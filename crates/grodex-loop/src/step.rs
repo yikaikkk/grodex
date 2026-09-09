@@ -38,6 +38,20 @@ pub struct TurnOutcome {
     /// Aggregate counters collected across the turn (journaled in
     /// TurnCompleted).
     pub metrics: TurnMetricsSummary,
+    /// The turn's finalized net diff (summary only; body lives in the blob
+    /// store). Surfaced to the frontend as an ACP `DiffAvailable` event.
+    pub diff: Option<DiffSummary>,
+}
+
+/// Summary of a turn's net diff — what the frontend needs to offer
+/// "查看变更" and lazy-load the full body by `diff_id`.
+#[derive(Debug, Clone, Default)]
+pub struct DiffSummary {
+    pub diff_id: String,
+    pub changed_files: usize,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    pub paths: Vec<String>,
 }
 
 /// Turn-level aggregate counters — the journaled form of the
