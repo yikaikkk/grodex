@@ -25,9 +25,17 @@ pub enum IndeterminateResolution {
 /// Commands sent to the SessionSupervisor from the frontend.
 pub enum SessionCommand {
     /// Start a new Turn with the given user input.
-    StartTurn { user_input: String },
+    StartTurn {
+        user_input: String,
+        /// Optional turn mode ("auto"|"plan"|"build"|"review"); None = Auto.
+        mode: Option<String>,
+    },
     /// Steer an in-progress Turn — modify the goal mid-execution.
-    Steer { user_input: String },
+    Steer {
+        user_input: String,
+        /// Optional turn mode for the new turn spawned by this steer.
+        mode: Option<String>,
+    },
     /// Hot-adopt a recompiled permission policy (config hot-reload).
     /// Fences in-flight leases by bumping the revocation epoch.
     AdoptPermissionPolicy { policy: grodex_permission::PermissionPolicy },
@@ -121,16 +129,18 @@ pub enum SessionCommand {
 impl std::fmt::Debug for SessionCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SessionCommand::StartTurn { user_input } => f
+            SessionCommand::StartTurn { user_input, mode } => f
                 .debug_struct("StartTurn")
                 .field("user_input_len", &user_input.len())
+                .field("mode", mode)
                 .finish(),
             SessionCommand::AdoptPermissionPolicy { .. } => f
                 .debug_struct("AdoptPermissionPolicy")
                 .finish(),
-            SessionCommand::Steer { user_input } => f
+            SessionCommand::Steer { user_input, mode } => f
                 .debug_struct("Steer")
                 .field("user_input_len", &user_input.len())
+                .field("mode", mode)
                 .finish(),
             SessionCommand::CancelTurn => write!(f, "CancelTurn"),
             SessionCommand::Shutdown => write!(f, "Shutdown"),

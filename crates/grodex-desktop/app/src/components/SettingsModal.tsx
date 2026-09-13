@@ -13,6 +13,7 @@ import {
   Globe,
   GitPullRequest,
   Save,
+  Loader2,
 } from 'lucide-react';
 import { PermissionRule, SettingsState, ToolName } from '../types';
 
@@ -20,7 +21,7 @@ interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   settings: SettingsState;
-  onSave: (newSettings: SettingsState) => void;
+  onSave: (newSettings: SettingsState) => Promise<void>;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -31,11 +32,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 }) => {
   const [currentSettings, setCurrentSettings] = useState<SettingsState>({ ...settings });
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
       setCurrentSettings({ ...settings });
       setToastMessage(null);
+      setIsSaving(false);
     }
   }, [isOpen, settings]);
 
@@ -62,13 +65,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }));
   };
 
-  const handleSave = () => {
-    onSave(currentSettings);
-    setToastMessage('配置已成功写入 ~/.grodex/config.toml');
-    setTimeout(() => {
-      setToastMessage(null);
-      onClose();
-    }, 1500);
+  const handleSave = async () => {
+    setIsSaving(true);
+    try {
+      await onSave(currentSettings);
+      setToastMessage('配置已成功写入 ~/.grodex/config.toml');
+      setIsSaving(false);
+      setTimeout(() => setToastMessage(null), 2000);
+    } catch (e: any) {
+      setToastMessage(`保存失败: ${e?.message || '未知错误'}`);
+      setIsSaving(false);
+      setTimeout(() => setToastMessage(null), 3000);
+    }
   };
 
   return (
@@ -259,10 +267,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <button
               id="save-settings-btn"
               onClick={handleSave}
-              className="px-5 py-2 rounded-full bg-accent hover:bg-accent-hover text-white text-xs font-medium flex items-center gap-1.5 transition-colors shadow-xs"
+              disabled={isSaving}
+              className="px-5 py-2 rounded-full bg-accent hover:bg-accent-hover text-white text-xs font-medium flex items-center gap-1.5 transition-colors shadow-xs disabled:opacity-70 disabled:hover:bg-accent"
             >
-              <Save className="w-3.5 h-3.5" />
-              保存配置
+              {isSaving ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Save className="w-3.5 h-3.5" />
+              )}
+              {isSaving ? '保存中...' : '保存配置'}
             </button>
           </div>
         </div>

@@ -4,32 +4,39 @@ import {
   Hand,
   ChevronDown,
   Mic,
-  Monitor,
   Folder,
   Smartphone,
   FileText,
   Dices,
   FileCode2,
-  Sparkles,
-  Cpu,
   ArrowUp,
 } from 'lucide-react';
 
+type TurnMode = 'Auto' | 'Plan' | 'Build' | 'Review';
+
 interface EmptyStateProps {
-  onSelectPrompt: (prompt: string) => void;
+  /** Send the prompt text + selected turn mode. */
+  onSend: (text: string, mode: TurnMode) => void;
   onRunDemo: () => void;
   /** Real configured model (avoid hard-coded demo labels). */
   modelName?: string;
+  /** Current workspace path (empty = not yet selected). */
+  workspace?: string;
+  /** Open the directory picker. */
+  onChangeWorkspace: () => void;
 }
 
 export const EmptyState: React.FC<EmptyStateProps> = ({
-  onSelectPrompt,
+  onSend,
   onRunDemo,
   modelName,
+  workspace,
+  onChangeWorkspace,
 }) => {
   const [inputText, setInputText] = useState('');
   const [approvalMode, setApprovalMode] = useState('手动审批');
-  const [executionMode, setExecutionMode] = useState('Auto Mode');
+  const [selectedMode, setSelectedMode] = useState<TurnMode>('Auto');
+  const [isModeOpen, setIsModeOpen] = useState(false);
   const composingRef = useRef(false);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -44,14 +51,14 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       if (inputText.trim()) {
-        onSelectPrompt(inputText.trim());
+        onSend(inputText.trim(), selectedMode);
       }
     }
   };
 
   const handleSend = () => {
     if (inputText.trim()) {
-      onSelectPrompt(inputText.trim());
+      onSend(inputText.trim(), selectedMode);
     } else {
       // If empty, launch demo
       onRunDemo();
@@ -120,13 +127,54 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
               <span className="w-2 h-2 rounded-full bg-accent" />
               <span className="truncate max-w-[120px]">{modelName || '模型未配置'}</span>
             </div>
+
+            {/* Workspace directory picker */}
+            <button
+              onClick={onChangeWorkspace}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-well hover:bg-black/[0.05] text-xs text-primary cursor-pointer transition-colors"
+              title={workspace || '点击选择工作目录'}
+            >
+              <Folder className="w-3.5 h-3.5 text-secondary" />
+              <span className="font-medium text-xs font-mono truncate max-w-[180px]">
+                {workspace ? workspace.split('/').filter(Boolean).pop() || workspace : '选择目录'}
+              </span>
+              <ChevronDown className="w-3 h-3 text-tertiary" />
+            </button>
           </div>
 
-          {/* Right options: Auto Mode, Mic, Purple Audio/Send Button */}
+          {/* Right options: Mode dropdown, Mic, Send Button */}
           <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1 text-xs text-secondary hover:text-primary cursor-pointer font-medium">
-              <span>{executionMode}</span>
-              <ChevronDown className="w-3 h-3 text-tertiary" />
+            {/* Mode Dropdown */}
+            <div className="relative">
+              <button
+                id="empty-state-mode-selector-btn"
+                onClick={() => setIsModeOpen(!isModeOpen)}
+                className="flex items-center gap-1 text-xs text-secondary hover:text-primary cursor-pointer font-medium px-2 py-1 rounded-md hover:bg-well transition-colors"
+              >
+                <span>{selectedMode} Mode</span>
+                <ChevronDown className="w-3 h-3 text-tertiary" />
+              </button>
+
+              {isModeOpen && (
+                <div className="absolute bottom-full right-0 mb-2 w-36 rounded-xl border border-hairline bg-white shadow-xl py-1.5 z-30 text-xs">
+                  {(['Auto', 'Plan', 'Build', 'Review'] as const).map((mode) => (
+                    <button
+                      key={mode}
+                      onClick={() => {
+                        setSelectedMode(mode);
+                        setIsModeOpen(false);
+                      }}
+                      className={`w-full px-3.5 py-1.5 text-left transition-colors ${
+                        selectedMode === mode
+                          ? 'bg-accent-soft text-accent font-semibold'
+                          : 'text-secondary hover:bg-well'
+                      }`}
+                    >
+                      {mode === 'Auto' ? '自动 (Auto)' : mode === 'Plan' ? '规划 (Plan)' : mode === 'Build' ? '构建 (Build)' : '审查 (Review)'}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             <button
@@ -149,27 +197,12 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
         </div>
       </div>
 
-      {/* Directory Pills below Card (本地 ˅, grodex ˅) */}
-      <div className="w-full max-w-2xl flex items-center gap-3 px-1 mt-2.5 text-xs text-secondary">
-        <div className="flex items-center gap-1.5 cursor-pointer hover:text-primary">
-          <Monitor className="w-3.5 h-3.5 text-tertiary" />
-          <span>本地</span>
-          <ChevronDown className="w-3 h-3 text-tertiary" />
-        </div>
-
-        <div className="flex items-center gap-1.5 cursor-pointer hover:text-primary">
-          <Folder className="w-3.5 h-3.5 text-tertiary" />
-          <span className="font-mono">grodex</span>
-          <ChevronDown className="w-3 h-3 text-tertiary" />
-        </div>
-      </div>
-
       {/* Quick Action Tag Pills (应用开发, 项目理解, 游戏创意, 工具脚本) */}
       <div className="flex items-center justify-center gap-2.5 mt-8 flex-wrap">
         {quickTags.map((tag, idx) => (
           <button
             key={idx}
-            onClick={() => onSelectPrompt(tag.prompt)}
+            onClick={() => onSend(tag.prompt, selectedMode)}
             className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg border border-hairline bg-white hover:bg-well hover:border-hairline text-xs text-primary transition-all shadow-2xs group"
           >
             {tag.icon}

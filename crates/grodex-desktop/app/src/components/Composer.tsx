@@ -13,6 +13,7 @@ import {
   FileCode,
   Trash2,
   Terminal,
+  Folder,
 } from 'lucide-react';
 import { SteerSuggestion } from '../types';
 
@@ -33,6 +34,8 @@ interface ComposerProps {
   onOpenDiff: () => void;
   onResumeCrashed?: () => void;
   onClearTimeline?: () => void;
+  /** Current working directory, shown in the status bar. */
+  workspace?: string;
 }
 
 interface SlashCommand {
@@ -64,6 +67,7 @@ export const Composer: React.FC<ComposerProps> = ({
   onResumeCrashed,
   onClearTimeline,
   modelName,
+  workspace,
 }) => {
   const [inputText, setInputText] = useState('');
   const [selectedMode, setSelectedMode] = useState<'Auto' | 'Plan' | 'Build' | 'Review'>('Auto');
@@ -329,20 +333,19 @@ export const Composer: React.FC<ComposerProps> = ({
         </div>
       </div>
 
-      {/* Directory and status indicators below card */}
+      {/* Status indicators below card */}
       <div className="flex items-center justify-between px-1.5 mt-2 text-xs text-secondary">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-1 cursor-pointer hover:text-primary">
-            <span>本地</span>
-            <ChevronDown className="w-3 h-3 text-tertiary" />
+        {workspace ? (
+          <div
+            className="flex items-center gap-1.5 text-[11px] font-mono text-tertiary truncate max-w-[60%]"
+            title={workspace}
+          >
+            <Folder className="w-3 h-3 flex-shrink-0" />
+            <span className="truncate">{workspace}</span>
           </div>
-          <span>•</span>
-          <div className="flex items-center gap-1 cursor-pointer hover:text-primary font-mono">
-            <span>grodex</span>
-            <ChevronDown className="w-3 h-3 text-tertiary" />
-          </div>
-        </div>
-
+        ) : (
+          <span />
+        )}
         <div className="flex items-center gap-3 text-[11px] font-mono">
           <span>{tokensUsed.toLocaleString()} 令牌</span>
           <span>•</span>

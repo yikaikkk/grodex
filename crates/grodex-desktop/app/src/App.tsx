@@ -9,6 +9,7 @@ import {
 } from './types';
 import * as acp from './lib/acpClient';
 import { eventBus } from './lib/eventBus';
+import { open as openDirectoryDialog } from '@tauri-apps/plugin-dialog';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { Timeline } from './components/Timeline';
@@ -379,14 +380,23 @@ export default function App() {
       const list = await acp.listSessions();
       if (cancelled) return;
       setSessions(list);
-      // Start on the blank "new task" page: do NOT auto-select the most recent
-      // session and do NOT spawn `grodex serve`. A session/process is only
-      // created lazily on the first real send or when the user opens one from
-      // the sidebar.
+      // Auto-resume the most-recently-updated session: spawn `grodex serve`
+      // in that session's workspace and resume it so the user lands on their
+      // latest conversation instead of a blank page. If there is no history,
+      // stay on the empty "new task" page and prompt for a workspace.
       const first = list[0];
       if (first) {
         const ws = first.workspace || '';
-        setWorkspace(ws);
+        if (ws) {
+          setWorkspace(ws);
+          try {
+            await acp.ensureAgent(ws);
+            await acp.resumeSession(first.id);
+            if (!cancelled) setActiveSessionId(first.id);
+          } catch (e: any) {
+            showNotice(`恢复上次会话失败：${e?.message || e}`, 'error');
+          }
+        }
       } else {
         showNotice('没有找到历史会话。点击「新建任务」选择一个工作目录开始。');
       }
@@ -399,13 +409,9 @@ export default function App() {
   // ── Actions ────────────────────────────────────────────────────────
   /** Resolve a workspace directory, prompting via an in-app dialog when the
    * current workspace is empty (window.prompt is unavailable in Tauri). */
-  const ensureWorkspacePath = (): Promise<string> => {
-    if (workspace) return Promise.resolve(workspace);
-    setDirInput('');
-    setIsDirDialogOpen(true);
-    return new Promise((resolve) => {
-      dirResolveRef.current = resolve;
-    });
+  const ensureWorkspacePath = async (): Promise<string> => {
+    if (workspace) return workspace;
+    return promptForWorkspace();
   };
 
   const submitDirDialog = () => {
@@ -416,15 +422,45 @@ export default function App() {
     dirResolveRef.current = () => {};
   };
 
+  /** Open the native macOS directory picker and resolve to the selected path.
+   * Falls back to the manual text-input dialog if the native dialog is
+   * unavailable (e.g. running outside the Tauri shell) or cancelled. */
+  const promptForWorkspace = async (): Promise<string> => {
+    try {
+      const selected = await openDirectoryDialog({
+        directory: true,
+        multiple: false,
+        title: '选择工作目录',
+      });
+      if (typeof selected === 'string' && selected.length > 0) {
+        setWorkspace(selected);
+        return selected;
+      }
+      // Cancelled by user → return current workspace (may be empty).
+      return workspace;
+    } catch {
+      // Native dialog unavailable (non-Tauri runtime) → fall back to text.
+      setDirInput('');
+      setIsDirDialogOpen(true);
+      return new Promise((resolve) => {
+        dirResolveRef.current = resolve;
+      });
+    }
+  };
+
   /** "新建任务" only switches to an empty page — it does NOT spawn a process
    * or create a session. A real session is only created on the first message
-   * (see prepareSessionForTurn), so an idle new page leaves no session. */
+   * (see prepareSessionForTurn), so an idle new page leaves no session.
+   * workspace MUST be cleared here so that ensureWorkspacePath() will pop up
+   * the directory picker on the next send instead of silently reusing the
+   * previous session's cwd. */
   const handleNewSession = async (): Promise<void> => {
     if (isRunning) await acp.stop();
     setPendingApprovals([]);
     setIndeterminate(null);
     setSubagents([]);
     setActiveSessionId('');
+    setWorkspace('');
     setNotice(null);
   };
 
@@ -489,7 +525,7 @@ export default function App() {
     }
   };
 
-  const handleSendPrompt = async (text: string) => {
+  const handleSendPrompt = async (text: string, mode: string = 'Auto') => {
     // No session yet → create one on the first real message only. Note:
     // `activeSessionId` state updates async, so AFTER prepare we must use the
     // freshly minted id from the client (not the stale closure value).
@@ -548,7 +584,10 @@ export default function App() {
       }
     }
     try {
-      await acp.sendPrompt(text, createdNew ? { skipUserBubble: true } : undefined);
+      await acp.sendPrompt(
+        text,
+        createdNew ? { skipUserBubble: true, mode } : { mode }
+      );
     } catch (e: any) {
       // Roll back the optimistic bubble added above for a brand-new session,
       // so a failed transport never leaves a phantom user message behind.
@@ -703,9 +742,11 @@ export default function App() {
         >
           {currentTimeline.length === 0 ? (
             <EmptyState
-              onSelectPrompt={(t) => handleSendPrompt(t)}
+              onSend={(t, mode) => handleSendPrompt(t, mode)}
               onRunDemo={handleNewSession}
               modelName={settings.model}
+              workspace={workspace}
+              onChangeWorkspace={promptForWorkspace}
             />
           ) : (
             <>
@@ -716,7 +757,7 @@ export default function App() {
               />
 
               <Composer
-                onSend={(text) => handleSendPrompt(text)}
+                onSend={(text, mode) => handleSendPrompt(text, mode)}
                 onStop={handleStop}
                 isRunning={isRunning}
                 activeSessionId={activeSession?.id || activeSessionId}
@@ -733,6 +774,7 @@ export default function App() {
                 onClearTimeline={() =>
                   setTimelines((prev) => ({ ...prev, [activeSessionId]: [] }))
                 }
+                workspace={activeSession?.workspace || workspace}
               />
             </>
           )}
@@ -891,7 +933,12 @@ export default function App() {
           settings={settings}
           onSave={async (s) => {
             setSettings(s);
-            showNotice('首版为只读展示：provider/model 来自 ~/.grodex/config.toml；工具权限由服务端 [rules] 决定');
+            try {
+              await acp.updateToolPermissions(s.permissions);
+              showNotice('工具权限已写入 ~/.grodex/config.toml，agent 已热加载');
+            } catch (e: any) {
+              showNotice(`工具权限写入失败：${e?.message || e}`, 'error');
+            }
           }}
         />
       )}

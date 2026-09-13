@@ -890,6 +890,7 @@ impl GrodexTui {
                                         idempotency_key: None,
                                         session_id: sid,
                                         text,
+                                        mode: None,
                                     })
                                 } else {
                                     Command::Prompt(SessionPrompt {
@@ -898,6 +899,7 @@ impl GrodexTui {
                                         idempotency_key: None,
                                         session_id: sid,
                                         text,
+                                        mode: None,
                                     })
                                 };
                                 if let Err(e) = self.transport.send_command(cmd) {

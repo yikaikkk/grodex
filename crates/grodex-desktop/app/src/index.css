@@ -99,6 +99,27 @@
     white-space: pre-wrap;
     word-break: break-word;
   }
+  /* GFM tables */
+  .md-body table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin: 0.5em 0;
+  }
+  .md-body th,
+  .md-body td {
+    border: 1px solid var(--color-hairline, #e5e7eb);
+    padding: 4px 8px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .md-body th {
+    background: var(--color-well, #f7f7f7);
+    font-weight: 600;
+  }
+  .md-body tr:nth-child(even) td {
+    background: rgba(0, 0, 0, 0.015);
+  }
   .bubble-wrap {
     overflow-wrap: anywhere;
     word-break: break-word;

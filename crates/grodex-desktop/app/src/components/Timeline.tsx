@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { Bot, Copy, Check, Clock, Cpu, Brain, ChevronDown, ChevronRight, Wrench } from 'lucide-react';
 import { TimelineItem, ToolItem } from '../types';
 import { ToolCard } from './ToolCard';
@@ -185,28 +186,16 @@ export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff, scrollToK
   }, [scrollToKey]);
 
   // Page smart-follow:
-  //  - while anything is live (thinking streaming / tool running / assistant
-  //    streaming) keep sticking to the bottom as new output arrives;
-  //  - for static changes, follow only when the user is already near bottom;
-  //  - if the user scrolled up, pause until they return to the bottom.
-  const isLive =
-    items.some(
-      (it) =>
-        (it.type === 'thinking' && it.isStreaming) ||
-        (it.type === 'tool' &&
-          (it.status === 'running' || it.status === 'awaiting_approval')) ||
-        (it.type === 'assistant' && it.isStreaming)
-    );
-
+  // Terminal-style auto-follow: only scroll to the bottom when the user
+  // is already near the bottom. If the user scrolled up to read history,
+  // never force them back down — even while content is actively streaming.
+  // The user must manually scroll back to the bottom to re-engage following.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    if (pageStuckRef.current && !isLive) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
-    if (nearBottom || isLive) {
-      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-    }
-  }, [items, isLive]);
+    if (pageStuckRef.current) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  }, [items]);
 
   const onPageScroll = () => {
     const el = containerRef.current;
@@ -258,7 +247,7 @@ export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff, scrollToK
         <div className="flex flex-col items-start flex-1 min-w-0">
           <div className="w-full relative rounded-2xl bg-white border border-hairline p-4.5 text-primary shadow-2xs text-sm leading-relaxed break-words">
             <div className="md-body prose prose-stone prose-sm max-w-none text-primary prose-headings:text-primary prose-headings:font-bold prose-p:leading-relaxed prose-pre:bg-well prose-pre:border prose-pre:border-hairline prose-pre:rounded-xl prose-pre:w-full prose-code:font-mono prose-code:text-primary prose-code:bg-well prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:border prose-code:border-hairline prose-strong:text-primary">
-              <ReactMarkdown>{item.content}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>
             </div>
             <div className="flex items-center justify-between mt-3.5 pt-2.5 border-t border-hairline-2 text-[11px] font-sans text-secondary gap-4">
               <div className="flex items-center gap-3">

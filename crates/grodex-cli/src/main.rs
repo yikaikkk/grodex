@@ -815,12 +815,14 @@ async fn route_command(
         AcpCommand::Prompt(p) => handle
             .send(SessionCommand::StartTurn {
                 user_input: p.text,
+                mode: p.mode,
             })
             .await,
         AcpCommand::Steer(st) => {
             handle
                 .send(SessionCommand::Steer {
                     user_input: st.text,
+                    mode: st.mode,
                 })
                 .await
         }
@@ -1896,7 +1898,7 @@ async fn run_interactive_with(
         }
 
         // Send the turn command.
-        if let Err(e) = handle.send(SessionCommand::StartTurn { user_input: input }).await {
+        if let Err(e) = handle.send(SessionCommand::StartTurn { user_input: input, mode: None }).await {
             eprintln!("error sending command: {e}");
             break;
         }

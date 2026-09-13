@@ -72,6 +72,11 @@ pub struct SessionPrompt {
     pub idempotency_key: Option<String>,
     pub session_id: SessionId,
     pub text: String,
+    /// Optional turn mode ("auto" | "plan" | "build" | "review").
+    /// When set, the agent injects a mode-specific instruction block
+    /// into the system prompt for this turn only. None/absent = Auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// Steer an in-progress Turn: the user adds/changes the goal while the
@@ -86,6 +91,9 @@ pub struct SessionSteer {
     pub idempotency_key: Option<String>,
     pub session_id: SessionId,
     pub text: String,
+    /// Optional turn mode for the new turn spawned by this steer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// Cancel the current operation.

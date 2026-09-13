@@ -349,6 +349,7 @@ mod tests {
                 idempotency_key: None,
                 session_id: s,
                 text: "hello".into(),
+                mode: None,
             },
             id: 1,
             meta: None,
@@ -366,6 +367,7 @@ mod tests {
                 idempotency_key: Some("idem-b".into()),
                 session_id: s2,
                 text: "hello".into(),
+                mode: None,
             },
             id: 2,
             meta: Some(acp::CommandMeta {

@@ -339,12 +339,27 @@ function snapshotToTimeline(snap: AcpSnapshot): TimelineItem[] {
       case 'tool_call': {
         let name = '';
         let args: Record<string, unknown> = {};
+        // Backend sends tool_call content as "{name}: {arguments}" (plain
+        // string, NOT valid JSON). Try JSON-parse first for forward compat,
+        // then fall back to splitting on the first ": ".
         try {
           const parsed = JSON.parse(it.content);
           name = parsed.name || '';
           args = parsed.arguments || {};
         } catch {
-          name = it.content;
+          const raw = it.content || '';
+          const colonIdx = raw.indexOf(': ');
+          if (colonIdx > 0) {
+            name = raw.slice(0, colonIdx).trim();
+            const argStr = raw.slice(colonIdx + 2).trim();
+            try {
+              args = JSON.parse(argStr);
+            } catch {
+              args = { raw: argStr };
+            }
+          } else {
+            name = raw;
+          }
         }
         // Snapshot tools are HISTORY — mark them finished so ToolCard never
         // starts a live elapsed counter just because the session was opened.
@@ -367,24 +382,36 @@ function snapshotToTimeline(snap: AcpSnapshot): TimelineItem[] {
       case 'tool_result': {
         let content = it.content;
         let isError = false;
-        let callId = id;
+        let callId: string | null = null;
         try {
           const parsed = JSON.parse(it.content);
           content = parsed.content ?? content;
           isError = !!parsed.is_error;
-          callId = parsed.call_id ?? id;
+          callId = parsed.call_id ?? null;
         } catch {
-          /* raw text */
+          /* raw text — backend sends plain text, not JSON */
         }
-        // Pair with the most recent open tool of the same kind.
-        const targetId = callId !== id && pendingTools.has(callId) ? callId : id;
-        const found = items.find((x) => x.id === targetId && x.type === 'tool');
+        // Pair with the matching tool_call. Try explicit call_id first; if
+        // that fails (backend doesn't emit item_id or call_id in snapshot),
+        // fall back to FIFO: the oldest pending tool_call gets this result.
+        let found: TimelineItem | undefined;
+        if (callId && pendingTools.has(callId)) {
+          found = pendingTools.get(callId);
+        } else if (pendingTools.size > 0) {
+          // FIFO: take the first entry (oldest pending tool_call).
+          const firstEntry = pendingTools.entries().next().value;
+          if (firstEntry) {
+            const [firstKey, firstTool] = firstEntry;
+            found = firstTool;
+            callId = firstKey;
+          }
+        }
         if (found && found.type === 'tool') {
           found.status = isError ? 'failed' : 'finished';
           found.elapsedSec = 0;
           found.resultSummary = content;
         }
-        pendingTools.delete(targetId);
+        if (callId) pendingTools.delete(callId);
         break;
       }
       default:
@@ -789,7 +816,7 @@ function withSession(fields: Record<string, unknown>): Record<string, unknown> {
 /** Send a user prompt and optimistically show the user bubble. */
 export async function sendPrompt(
   text: string,
-  opts?: { skipUserBubble?: boolean }
+  opts?: { skipUserBubble?: boolean; mode?: string }
 ): Promise<void> {
   resetStreaming();
   const msgId = `msg_${uid()}`;
@@ -805,13 +832,21 @@ export async function sendPrompt(
     isRunning: true,
     sessionId: clientSessionId,
   });
-  const cmd = {
+  // Only attach `mode` to the wire command when it is a non-empty value other
+  // than "Auto" — that keeps Auto turns wire-identical to the legacy shape so
+  // older agents that don't know the `mode` field are unaffected.
+  const mode =
+    opts?.mode && opts.mode.trim().length > 0 && opts.mode.toLowerCase() !== 'auto'
+      ? opts.mode.toLowerCase()
+      : undefined;
+  const cmd: Record<string, unknown> = {
     type: 'Prompt',
     command_id: uid(),
     session_id: wireSessionId,
     expected_generation: currentGeneration(),
     text,
   };
+  if (mode) cmd.mode = mode;
   try {
     await sendWire(cmd);
   } catch (e) {
@@ -877,6 +912,15 @@ export async function stop(): Promise<void> {
 /** Remove phantom (empty / no-conversation) session dirs. */
 export async function purgeEmptySessions(): Promise<number> {
   return invoke<number>('purge_empty_sessions');
+}
+
+/** Persist tool permission rules to ~/.grodex/config.toml [rules] section.
+ * The running agent's config watcher detects the write and hot-adopts the
+ * new PermissionPolicy. `permissions` maps tool name → "allow"|"ask"|"deny". */
+export async function updateToolPermissions(
+  permissions: Record<string, string>
+): Promise<void> {
+  await invoke<void>('update_tool_permissions', { permissions });
 }
 
 /** Ensure a `grodex serve` process exists (spawn in `cwd` only if none). */

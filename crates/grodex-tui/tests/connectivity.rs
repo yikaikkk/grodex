@@ -13,5 +13,6 @@ fn in_process_bridge_roundtrip_compiles() {
         idempotency_key: None,
         session_id: SessionId::new(),
         text: "hello".into(),
+        mode: None,
     }));
 }

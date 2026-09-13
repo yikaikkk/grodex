@@ -473,14 +473,14 @@ impl SessionSupervisor {
     )]
     async fn handle_command(&mut self, cmd: SessionCommand) -> bool {
         match cmd {
-            SessionCommand::StartTurn { user_input } => {
-                self.start_turn(user_input).await;
+            SessionCommand::StartTurn { user_input, mode } => {
+                self.start_turn(user_input, mode).await;
                 true
             }
-            SessionCommand::Steer { user_input } => {
+            SessionCommand::Steer { user_input, mode } => {
                 // Steer: cancel current turn, start new one with modified goal.
                 self.cancel_turn().await;
-                self.start_turn(user_input).await;
+                self.start_turn(user_input, mode).await;
                 true
             }
             SessionCommand::AdoptPermissionPolicy { policy } => {
@@ -1159,7 +1159,7 @@ impl SessionSupervisor {
         skip(self),
         fields(session_id = %self.session.id)
     )]
-    async fn start_turn(&mut self, user_input: String) {
+    async fn start_turn(&mut self, user_input: String, mode: Option<String>) {
         // Invariant #1/#2: at most one Turn is admitted at a time. The
         // session state machine rejects a second admit while one is running,
         // and the supervisor never holds an existing turn handle here.
@@ -1286,6 +1286,13 @@ impl SessionSupervisor {
                 self.cached_discovered_nodes.clone().unwrap_or_default(),
             )
             .with_static_context(static_memory);
+        // Turn-mode instruction (Auto/Plan/Build/Review). Injected as Zone C
+        // runtime instruction so it applies only to this turn and does not
+        // pollute the stable base prompt prefix (which would defeat provider
+        // prompt caching across turns with different modes).
+        if let Some(instr) = mode_instruction(mode.as_deref()) {
+            builder = builder.with_zone_c(instr);
+        }
         // Memory RAG results are VOLATILE (depend on the current user
         // input). They must NOT be baked into the system prompt — that
         // would change the request prefix every turn and defeat provider
@@ -2219,6 +2226,59 @@ fn is_subagent_tool_noise(name: &str) -> bool {
     ];
     let lower = name.to_lowercase();
     NOISE_PREFIX.iter().any(|p| lower.contains(p))
+}
+
+/// Render the per-turn mode instruction block injected as Zone C.
+///
+/// Returns `None` for Auto / unknown modes (no extra instruction = default
+/// behavior). The block is placed in Zone C (runtime instruction) so the
+/// stable base prompt prefix survives prompt caching across turns that
+/// switch between modes.
+fn mode_instruction(mode: Option<&str>) -> Option<String> {
+    let normalized = mode?.to_ascii_lowercase();
+    match normalized.as_str() {
+        "auto" => None,
+        "plan" => Some(
+            "## TURN MODE: PLAN\n\
+             You are operating in PLAN mode for this turn. Your output must be a \
+             concrete implementation plan ONLY.\n\n\
+             CONSTRAINTS:\n\
+             - Do NOT edit, write, or create any files.\n\
+             - Do NOT run shell commands that have side effects (build, install, git commit, etc).\n\
+             - You MAY use read-only tools (read_file, grep, glob) to inspect the codebase.\n\
+             - Produce a numbered, step-by-step plan with file paths and the specific change \
+             each step requires.\n\
+             - When the plan is complete, STOP. Do not begin implementation. Wait for the \
+             user to switch to Build mode or approve the plan."
+                .to_string(),
+        ),
+        "build" => Some(
+            "## TURN MODE: BUILD\n\
+             You are operating in BUILD mode for this turn. Execute the implementation \
+             using write/edit tools and shell commands as needed.\n\n\
+             CONSTRAINTS:\n\
+             - Work autonomously to completion: do not pause to ask 'shall I proceed?'.\n\
+             - Make all file edits and run all commands required to land the change.\n\
+             - Verify the result (build, tests) before declaring the turn complete."
+                .to_string(),
+        ),
+        "review" => Some(
+            "## TURN MODE: REVIEW\n\
+             You are operating in REVIEW mode for this turn. Review the code or change \
+             and provide feedback ONLY.\n\n\
+             CONSTRAINTS:\n\
+             - Do NOT edit, write, or modify any files.\n\
+             - Do NOT run shell commands that have side effects.\n\
+             - You MAY use read-only tools (read_file, grep, glob) to inspect the codebase.\n\
+             - Report issues grouped by severity (blocker / warning / nit), with file:line \
+             references and concrete suggested fixes. Do not apply the fixes yourself."
+                .to_string(),
+        ),
+        _ => {
+            tracing::warn!(mode = %normalized, "unknown turn mode; falling back to Auto");
+            None
+        }
+    }
 }
 
 fn tool_name_for_call_id(

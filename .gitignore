@@ -39,3 +39,9 @@ credentials.json
 *.log
 *.tmp
 .direnv/
+
+# ── Node / frontend build artifacts ─────────────────
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo

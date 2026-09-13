@@ -19,6 +19,7 @@ use tauri::{Manager, RunEvent};
 
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let (tx, rx) = mpsc::channel::<transport::ControlMsg>();
@@ -40,6 +41,7 @@ fn main() {
             commands::get_config,
             commands::delete_session,
             commands::purge_empty_sessions,
+            commands::update_tool_permissions,
             memory_ui::list_memories,
             memory_ui::delete_memory,
             memory_ui::run_memory_maintenance,

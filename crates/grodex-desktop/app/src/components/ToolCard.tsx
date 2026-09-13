@@ -204,7 +204,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ item, onOpenDiff, compact })
               <div className="text-[10px] uppercase font-sans text-secondary font-semibold tracking-wider mb-1">
                 工具返回结果
               </div>
-              <div className="p-3 rounded-xl bg-well border border-hairline text-xs text-primary font-mono leading-relaxed">
+              <div className="p-3 rounded-xl bg-well border border-hairline text-xs text-primary font-mono leading-relaxed overflow-x-auto max-h-80 overflow-y-auto whitespace-pre-wrap break-words">
                 {item.resultSummary}
               </div>
             </div>
