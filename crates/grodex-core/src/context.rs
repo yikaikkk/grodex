@@ -36,6 +36,10 @@ pub enum ContextItem {
         call_id: ToolCallId,
         content: String,
         is_error: bool,
+        /// Wall-clock execution duration in milliseconds. Persisted through
+        /// context restoration so resumed sessions can display it.
+        #[serde(default)]
+        duration_ms: Option<u64>,
     },
     /// Replacement for a window of compressed context items.
     CompactionSummary {
@@ -109,6 +113,7 @@ impl ContextItem {
                     call_id,
                     content,
                     is_error,
+                    ..
                 } => {
                     let tool_name = tool_names
                         .get(call_id)

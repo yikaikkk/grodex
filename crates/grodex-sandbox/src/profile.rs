@@ -46,7 +46,11 @@ impl ProfileStore {
                 read_only_paths: vec!["/".into()],
                 read_write_paths: vec![".".into()],
                 deny_paths: vec!["/etc".into(), "/System".into(), "~/.ssh".into()],
-                network_rules: vec![NetworkRule::AllowLocal],
+                // AllowLocal first (explicit), then Allow("*") so external
+                // hosts pass. Without the wildcard, can_connect falls through
+                // to the "no matching allow → deny" branch and blocks every
+                // non-local host — making web_fetch useless.
+                network_rules: vec![NetworkRule::AllowLocal, NetworkRule::Allow("*".into())],
                 allow_exec: true,
                 allow_fork: true,
             },
@@ -178,7 +182,10 @@ impl ProfileStore {
                     read_only_paths: vec!["/".into()],
                     read_write_paths: vec![".".into()],
                     deny_paths: vec![],
-                    network_rules: vec![NetworkRule::AllowLocal],
+                    network_rules: vec![
+                        NetworkRule::AllowLocal,
+                        NetworkRule::Allow("*".into()),
+                    ],
                     allow_exec: true,
                     allow_fork: true,
                 }

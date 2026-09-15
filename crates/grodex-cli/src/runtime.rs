@@ -40,6 +40,7 @@ use grodex_rollout::store::{FileRolloutStore, RolloutStore};
 use grodex_sampler::{ModelRoute, SamplingActor, SamplingClient, SamplingClientConfig};
 use grodex_sandbox::SandboxRuntimeClient;
 use grodex_subagent::supervisor::SubAgentConfig;
+use grodex_subagent::task::TaskBudget;
 use grodex_tools::{
     ApplyPatchTool, EditTool, ExecTool, GlobTool, GrepTool, LoadSkillTool, ReadArtifactTool,
     ReadFileTool, WebFetchTool, WriteFileTool,
@@ -761,20 +762,53 @@ impl SessionRuntimeBuilder {
             .filter(|v| *v > 0)
             .map(|v| v as usize);
 
+        // Sub-agent budget: max turns per task and turn timeout. Configurable
+        // via `[subagent]` in config.toml. Defaults: 20 turns, 600s timeout.
+        let subagent_cfg = cfg.get("subagent").and_then(|v| v.as_table());
+        let sub_max_turns = subagent_cfg
+            .and_then(|t| t.get("max_turns"))
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+            .map(|v| v as u32);
+        let sub_timeout_secs = subagent_cfg
+            .and_then(|t| t.get("turn_timeout_secs"))
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+            .map(|v| v as u64);
+        let sub_max_children = subagent_cfg
+            .and_then(|t| t.get("max_children"))
+            .and_then(|v| v.as_integer())
+            .filter(|v| *v > 0)
+            .map(|v| v as usize);
+        let sa_config = SubAgentConfig {
+            max_children: sub_max_children.unwrap_or(5),
+            default_timeout: std::time::Duration::from_secs(sub_timeout_secs.unwrap_or(600)),
+            persist_tasks: true,
+            default_max_turns: sub_max_turns.unwrap_or(20),
+        };
+        let sub_turn_timeout = std::time::Duration::from_secs(sub_timeout_secs.unwrap_or(600));
+
         // ── 7c. Parent-child collaboration protocol tools (Doc 12) ──
         // send_message / followup_task / wait_agent / mailbox_read /
         // list_agents / interrupt_agent. The session itself is the root
         // agent; followup TaskRuns execute through the DelegateTool above.
         // The host is created BEFORE the DelegateTool and shared with it,
         // so delegate children and protocol tools share ONE tree.
-        let protocol_host = Arc::new(grodex_loop::protocol_tools::ProtocolToolHost::new(
-            max_subagents_total.unwrap_or(16),
-            Default::default(),
-        ));
-        let mut delegate = DelegateTool::new(SubAgentConfig::default())
+        let protocol_host = Arc::new(
+            grodex_loop::protocol_tools::ProtocolToolHost::new(
+                max_subagents_total.unwrap_or(16),
+                Default::default(),
+            )
+            .with_default_budget(TaskBudget {
+                max_turns: Some(sub_max_turns.unwrap_or(20)),
+                max_duration_secs: Some(sub_timeout_secs.unwrap_or(600)),
+            }),
+        );
+        let mut delegate = DelegateTool::new(sa_config.clone())
             .with_sampling(sub_actor, model_config.clone())
             .with_progress_sender(subagent_progress_tx.clone())
             .with_limits(max_subagents.unwrap_or(0), max_subagents_total.unwrap_or(0))
+            .with_turn_timeout(sub_turn_timeout)
             // Sub-agents get read-only tools so analysis tasks can
             // actually inspect the codebase (bypasses the approval
             // round-trip — these have no side effects).
@@ -797,7 +831,7 @@ impl SessionRuntimeBuilder {
                  ReadArtifactTool::new().metadata().description),
             ]);
         if let Some(ref w) = writer {
-            delegate = delegate.with_writer(w.clone(), SubAgentConfig::default());
+            delegate = delegate.with_writer(w.clone(), sa_config.clone());
         }
         // P3 fix: sub-agent tool calls go through the shared permission
         // gate (deny rules apply; Ask fails closed inside a sub-agent).

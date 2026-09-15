@@ -296,7 +296,7 @@ impl ChatStateActor {
                 let _ = reply.send(());
             }
             ChatStateCommand::PushToolResult { call_id, content, is_error, reply } => {
-                let item = ContextItem::ToolResult { call_id, content, is_error };
+                let item = ContextItem::ToolResult { call_id, content, is_error, duration_ms: None };
                 self.state.push(item);
                 let _ = reply.send(());
             }

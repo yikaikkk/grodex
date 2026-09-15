@@ -211,7 +211,7 @@ impl ContextProjection {
                     ) {
                         let call_id = grodex_core::id::ToolCallId::from_string(cid).unwrap_or_default();
                         let is_error = event.payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                        items.push(ContextItem::ToolResult { call_id, content: content.to_string(), is_error });
+                        items.push(ContextItem::ToolResult { call_id, content: content.to_string(), is_error, duration_ms: None });
                     }
                 }
                 RolloutEventType::CompactionCommitted => {

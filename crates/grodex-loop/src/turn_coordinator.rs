@@ -939,6 +939,7 @@ impl TurnCoordinator {
                                     call_id,
                                     content: format!("Schema validation failed: {msg}"),
                                     is_error: true,
+                                    duration_ms: None,
                                 },
                                 index: CommitSequence::new(idx as u64),
                                 operation_id: None,
@@ -1037,6 +1038,7 @@ impl TurnCoordinator {
                                              before any side effect."
                                         ),
                                         is_error: true,
+                                        duration_ms: None,
                                     },
                                     index: CommitSequence::new(idx as u64),
                                     operation_id: Some(op_id_str.clone()),
@@ -1088,6 +1090,7 @@ impl TurnCoordinator {
                                          with a fresh capability snapshot."
                                     ),
                                     is_error: true,
+                                    duration_ms: None,
                                 },
                                 index: CommitSequence::new(idx as u64),
                                 operation_id: Some(op_id_str.clone()),
@@ -1189,6 +1192,11 @@ impl TurnCoordinator {
                     // step.
                     let mut tool_results: Vec<ToolExecResult> = Vec::new();
                     while let Some(mut tr) = result_rx.recv().await {
+                        // Stamp the measured duration onto the ToolResult so it
+                        // persists through context restoration and snapshot replay.
+                        if let ContextItem::ToolResult { duration_ms: dm, .. } = &mut tr.result {
+                            *dm = tr.duration_ms;
+                        }
                         // Offload oversized tool results to a temp file
                         // BEFORE anything else sees the content (journal,
                         // stream, chat_state, evidence) so every consumer
@@ -1301,6 +1309,7 @@ impl TurnCoordinator {
                                          as Indeterminate."
                                     ),
                                     is_error: true,
+                                    duration_ms: None,
                                 };
                             }
                         }
@@ -1313,6 +1322,7 @@ impl TurnCoordinator {
                                     call_id: call_id.to_string(),
                                     content: content.clone(),
                                     is_error: *is_error,
+                                    duration_ms: tr.duration_ms,
                                 });
                             }
                         }
@@ -2158,6 +2168,7 @@ async fn execute_single_tool(
                 call_id,
                 content: format!("Delegation denied: {e}"),
                 is_error: true,
+                duration_ms: None,
             };
         }
     }
@@ -2180,6 +2191,7 @@ async fn execute_single_tool(
                     call_id,
                     content: format!("Permission denied: {reason}"),
                     is_error: true,
+                    duration_ms: None,
                 };
             }
             PermissionResult::ApprovalRequired { ticket_id, decision_rx } => {
@@ -2212,6 +2224,7 @@ async fn execute_single_tool(
                                  to survive crash recovery."
                             ),
                             is_error: true,
+                            duration_ms: None,
                         };
                     }
                 }
@@ -2249,6 +2262,7 @@ async fn execute_single_tool(
                                          Refusing to execute without a durable lease record."
                                     ),
                                     is_error: true,
+                                    duration_ms: None,
                                 };
                             }
                         }
@@ -2264,6 +2278,7 @@ async fn execute_single_tool(
                             call_id,
                             content: "Approval required — not granted (denied, timed out, or cancelled)".into(),
                             is_error: true,
+                            duration_ms: None,
                         };
                     }
                 }
@@ -2306,6 +2321,7 @@ async fn execute_single_tool(
                 call_id,
                 content: format!("Journal write failed (ToolCallApproved): {e}"),
                 is_error: true,
+                duration_ms: None,
             };
         }
         if let Err(e) = writer
@@ -2325,6 +2341,7 @@ async fn execute_single_tool(
                 call_id,
                 content: format!("Journal write failed (ToolExecutionStarted, fail-closed): {e}"),
                 is_error: true,
+                duration_ms: None,
             };
         }
     }
@@ -2349,6 +2366,7 @@ async fn execute_single_tool(
                         "Narrow rejected: narrowed_args fail schema validation: {e}"
                     ),
                     is_error: true,
+                    duration_ms: None,
                 };
             }
         }
@@ -2367,6 +2385,7 @@ async fn execute_single_tool(
                             "Narrow rejected: narrowed_args denied by policy: {reason}"
                         ),
                         is_error: true,
+                        duration_ms: None,
                     };
                 }
                 PermissionResult::ApprovalRequired { .. } => {
@@ -2376,6 +2395,7 @@ async fn execute_single_tool(
                         call_id,
                         content: "Narrow rejected: narrowed_args require approval (nested approval not supported)".into(),
                         is_error: true,
+                        duration_ms: None,
                     };
                 }
             }
@@ -2400,6 +2420,7 @@ async fn execute_single_tool(
         call_id,
         content: format!("Sandbox: {reason}"),
         is_error: true,
+        duration_ms: None,
     };
 
     if name == "exec" {
@@ -2491,6 +2512,7 @@ async fn execute_single_tool(
                 call_id,
                 content: format!("Permission revalidation failed: {e}"),
                 is_error: true,
+                duration_ms: None,
             };
         }
     }
@@ -2502,6 +2524,7 @@ async fn execute_single_tool(
             call_id,
             content: "Permission lease already consumed or expired".into(),
             is_error: true,
+            duration_ms: None,
         };
     }
     // Write LeaseConsumed to journal — durable record that the
@@ -2522,6 +2545,7 @@ async fn execute_single_tool(
                      to prevent duplicate execution on crash recovery."
                 ),
                 is_error: true,
+                duration_ms: None,
             };
         }
     }
@@ -2565,6 +2589,7 @@ async fn execute_single_tool(
                                 ctx.tool_timeout_secs
                             ),
                             is_error: true,
+                            duration_ms: None,
                         };
                     }
                 }
@@ -2613,6 +2638,7 @@ async fn execute_single_tool(
                         call_id,
                         content,
                         is_error: false,
+                        duration_ms: None,
                     }
                 }
                 Err(e) => {
@@ -2621,6 +2647,7 @@ async fn execute_single_tool(
                         call_id,
                         content: format!("Error: {e}"),
                         is_error: true,
+                        duration_ms: None,
                     }
                 }
             }
@@ -2633,6 +2660,7 @@ async fn execute_single_tool(
                 call_id,
                 content: format!("Unknown tool: {name}"),
                 is_error: true,
+                duration_ms: None,
             }
         }
     }
@@ -2894,7 +2922,10 @@ fn build_model_request(
         tool_specs,
         tool_choice,
         parallel_tool_calls,
-        reasoning_request: None,
+        reasoning_request: Some(grodex_provider::canonical_request::ReasoningRequest {
+            effort: None,
+            summary: Some("auto".to_string()),
+        }),
         response_format: None,
         max_output_tokens: Some(max_output_tokens),
         provider_state_in: None,

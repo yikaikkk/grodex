@@ -18,14 +18,18 @@ pub struct SubAgentConfig {
     pub default_timeout: Duration,
     /// Whether to persist task state to rollout.
     pub persist_tasks: bool,
+    /// Default max turns per sub-agent task when no explicit budget is
+    /// provided. Configurable via `[subagent] max_turns`.
+    pub default_max_turns: u32,
 }
 
 impl Default for SubAgentConfig {
     fn default() -> Self {
         Self {
             max_children: 5,
-            default_timeout: Duration::from_secs(300),
+            default_timeout: Duration::from_secs(600),
             persist_tasks: true,
+            default_max_turns: 20,
         }
     }
 }
@@ -71,7 +75,7 @@ impl SubAgentSupervisor {
         budget: Option<TaskBudget>,
     ) -> Result<(AgentId, crate::task::TaskId), String> {
         let budget = budget.unwrap_or(TaskBudget {
-            max_turns: Some(5),
+            max_turns: Some(self.config.default_max_turns),
             max_duration_secs: Some(self.config.default_timeout.as_secs()),
         });
 

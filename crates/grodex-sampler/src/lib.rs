@@ -75,6 +75,8 @@ pub enum StreamFragment {
         call_id: String,
         content: String,
         is_error: bool,
+        /// Wall-clock duration of the tool execution in milliseconds.
+        duration_ms: Option<u64>,
     },
     /// A tool call needs user approval. Emitted by the TurnCoordinator
     /// when `PermissionManager::check()` returns `Ask` and a ticket lands

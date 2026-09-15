@@ -104,6 +104,13 @@ impl ProtocolToolHost {
         self.default_budget.clone()
     }
 
+    /// Override the default task budget (max_turns / max_duration_secs)
+    /// for followup tasks. Configurable via `[subagent]` in config.toml.
+    pub fn with_default_budget(mut self, budget: TaskBudget) -> Self {
+        self.default_budget = budget;
+        self
+    }
+
     /// Register a protocol-tracked child (node + mailbox) WITHOUT a
     /// TaskRun — for children whose execution happens elsewhere.
     pub fn spawn_child(&self, label: &str) -> Result<AgentId, String> {

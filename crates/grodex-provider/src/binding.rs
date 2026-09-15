@@ -105,7 +105,7 @@ impl ModelBinding {
             tokenizer_id: None,
             tokenizer_version: None,
             credential_lease_id: None,
-            reasoning_policy: ReasoningPolicy::None,
+            reasoning_policy: ReasoningPolicy::Visible,
             created_at: Utc::now(),
         }
     }

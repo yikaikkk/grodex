@@ -112,6 +112,11 @@ pub struct DelegateTool {
     /// Denied → refused, Ask → refused (a sub-agent cannot prompt for
     /// approval — fail-closed), Allowed → execute.
     permission: Option<Arc<Mutex<grodex_permission::PermissionManager>>>,
+    /// Hard deadline for a single sub-agent turn. Configurable via
+    /// `[subagent] turn_timeout_secs` in config.toml. On timeout the
+    /// child is cancelled and a failed Finished is emitted so the UI
+    /// never shows a permanently "running" node.
+    turn_timeout: std::time::Duration,
 }
 
 /// Long sub-agent reports are written to a temp file and only a
@@ -135,6 +140,7 @@ impl DelegateTool {
             max_total: 16,
             permission: None,
             protocol_host: None,
+            turn_timeout: std::time::Duration::from_secs(480),
         }
     }
 
@@ -201,6 +207,13 @@ impl DelegateTool {
             self.max_concurrent = max_concurrent;
         }
         self.max_total = if max_total > 0 { max_total } else { self.max_concurrent * 4 };
+        self
+    }
+
+    /// Override the hard deadline for a single sub-agent turn.
+    /// Configurable via `[subagent] turn_timeout_secs`.
+    pub fn with_turn_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.turn_timeout = timeout;
         self
     }
 
@@ -347,11 +360,10 @@ impl ToolRuntime for DelegateTool {
             // stalls or a lock wedges, the sub-agent (and thus the parent turn)
             // MUST terminate: on timeout we cancel the child and emit a failed
             // Finished so the frontend never sees a permanently "running" node.
-            const SUBAGENT_TURN_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(480);
+            let turn_timeout = self.turn_timeout;
             let cancel_on_timeout = child_link.as_ref().map(|link| link.cancel.clone());
             let ran = tokio::time::timeout(
-                SUBAGENT_TURN_TIMEOUT,
+                turn_timeout,
                 run_subagent_turn(
                     actor,
                     cfg,
@@ -377,7 +389,7 @@ impl ToolRuntime for DelegateTool {
                     }
                     Err(format!(
                         "sub-agent exceeded {}s without producing a final result",
-                        SUBAGENT_TURN_TIMEOUT.as_secs()
+                        turn_timeout.as_secs()
                     ))
                 }
             };
@@ -555,7 +567,10 @@ async fn run_subagent_turn(
             tool_specs: tool_specs.clone(),
             tool_choice: if tool_specs.is_empty() { ToolChoice::None } else { ToolChoice::Auto },
             parallel_tool_calls: false,
-            reasoning_request: None,
+            reasoning_request: Some(grodex_provider::canonical_request::ReasoningRequest {
+                effort: None,
+                summary: Some("auto".to_string()),
+            }),
             response_format: None,
             max_output_tokens: Some(SUBAGENT_MAX_OUTPUT_TOKENS),
             provider_state_in: None,
@@ -680,6 +695,7 @@ async fn run_subagent_turn(
                     call_id,
                     content,
                     is_error,
+                    duration_ms: None,
                 });
             }
             continue;

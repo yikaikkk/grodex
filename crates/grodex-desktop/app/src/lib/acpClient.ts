@@ -83,6 +83,8 @@ interface AcpSnapshotItem {
   item_type: string;
   content: string;
   complete: boolean;
+  call_id?: string;
+  duration_ms?: number;
 }
 
 interface AcpSnapshot {
@@ -361,11 +363,12 @@ function snapshotToTimeline(snap: AcpSnapshot): TimelineItem[] {
             name = raw;
           }
         }
+        // Use call_id from snapshot if available, otherwise fall back to item_id.
+        const toolId = it.call_id || id;
         // Snapshot tools are HISTORY — mark them finished so ToolCard never
         // starts a live elapsed counter just because the session was opened.
-        // (Only genuinely live tools, streamed while a turn runs, tick.)
         const t: ToolItem = {
-          id,
+          id: toolId,
           type: 'tool',
           toolName: (name || 'tool') as ToolItem['toolName'],
           params: args,
@@ -375,40 +378,31 @@ function snapshotToTimeline(snap: AcpSnapshot): TimelineItem[] {
           sourceAgent: 'main',
           timestamp: '',
         };
-        pendingTools.set(id, t);
+        pendingTools.set(toolId, t);
         items.push(t);
         break;
       }
       case 'tool_result': {
-        let content = it.content;
-        let isError = false;
-        let callId: string | null = null;
-        try {
-          const parsed = JSON.parse(it.content);
-          content = parsed.content ?? content;
-          isError = !!parsed.is_error;
-          callId = parsed.call_id ?? null;
-        } catch {
-          /* raw text — backend sends plain text, not JSON */
-        }
-        // Pair with the matching tool_call. Try explicit call_id first; if
-        // that fails (backend doesn't emit item_id or call_id in snapshot),
-        // fall back to FIFO: the oldest pending tool_call gets this result.
+        // Backend now embeds call_id and duration_ms directly on the snapshot item.
+        const content = it.content;
+        const isError = false; // backend doesn't currently set is_error in snapshot
+        const callId = it.call_id || null;
+        const durMs = it.duration_ms;
+        // Pair with the matching tool_call by call_id. Fall back to FIFO if
+        // call_id is missing (older backend versions).
         let found: TimelineItem | undefined;
         if (callId && pendingTools.has(callId)) {
           found = pendingTools.get(callId);
         } else if (pendingTools.size > 0) {
-          // FIFO: take the first entry (oldest pending tool_call).
           const firstEntry = pendingTools.entries().next().value;
           if (firstEntry) {
             const [firstKey, firstTool] = firstEntry;
             found = firstTool;
-            callId = firstKey;
           }
         }
         if (found && found.type === 'tool') {
           found.status = isError ? 'failed' : 'finished';
-          found.elapsedSec = 0;
+          found.elapsedSec = durMs ? durMs / 1000 : 0;
           found.resultSummary = content;
         }
         if (callId) pendingTools.delete(callId);

@@ -100,7 +100,10 @@ impl SamplingBackedExtractor {
             tool_specs: Vec::new(),
             tool_choice: ToolChoice::None,
             parallel_tool_calls: false,
-            reasoning_request: None,
+            reasoning_request: Some(grodex_provider::canonical_request::ReasoningRequest {
+                effort: None,
+                summary: Some("auto".to_string()),
+            }),
             response_format,
             max_output_tokens: Some(1600), // extraction is short-form
             provider_state_in: None,
@@ -481,7 +484,10 @@ impl grodex_memory::QueryUnderstandingModel for SamplingBackedQueryUnderstanding
             tool_specs: Vec::new(),
             tool_choice: ToolChoice::None,
             parallel_tool_calls: false,
-            reasoning_request: None,
+            reasoning_request: Some(grodex_provider::canonical_request::ReasoningRequest {
+                effort: None,
+                summary: Some("auto".to_string()),
+            }),
             response_format,
             max_output_tokens: Some(300),
             provider_state_in: None,
@@ -640,7 +646,10 @@ impl grodex_memory::ConflictJudge for SamplingBackedConflictJudge {
             tool_specs: Vec::new(),
             tool_choice: ToolChoice::None,
             parallel_tool_calls: false,
-            reasoning_request: None,
+            reasoning_request: Some(grodex_provider::canonical_request::ReasoningRequest {
+                effort: None,
+                summary: Some("auto".to_string()),
+            }),
             response_format,
             max_output_tokens: Some(500),
             provider_state_in: None,

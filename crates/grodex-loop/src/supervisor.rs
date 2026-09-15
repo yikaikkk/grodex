@@ -1001,40 +1001,50 @@ impl SessionSupervisor {
         let snapshot_items: Vec<serde_json::Value> = context
             .iter()
             .map(|item| {
-                let (item_type, content) = match item {
+                let (item_type, content, extra) = match item {
                     ContextItem::User { content, .. } => {
-                        ("user", truncate_for_snapshot(content, CAP_USER))
+                        ("user", truncate_for_snapshot(content, CAP_USER), serde_json::json!({}))
                     }
                     ContextItem::Assistant { content, .. } => {
-                        ("assistant", truncate_for_snapshot(content, CAP_ASSISTANT))
+                        ("assistant", truncate_for_snapshot(content, CAP_ASSISTANT), serde_json::json!({}))
                     }
-                    ContextItem::ToolResult { content, .. } => {
-                        ("tool_result", truncate_for_snapshot(content, CAP_TOOL_RESULT))
+                    ContextItem::ToolResult { content, call_id, duration_ms, .. } => {
+                        let cid = call_id.to_string();
+                        ("tool_result", truncate_for_snapshot(content, CAP_TOOL_RESULT), serde_json::json!({
+                            "call_id": cid,
+                            "duration_ms": *duration_ms,
+                        }))
                     }
                     ContextItem::System { content, .. } => {
-                        ("system", truncate_for_snapshot(content, CAP_DEFAULT))
+                        ("system", truncate_for_snapshot(content, CAP_DEFAULT), serde_json::json!({}))
                     }
                     ContextItem::Developer { content, .. } => {
-                        ("developer", truncate_for_snapshot(content, CAP_DEFAULT))
+                        ("developer", truncate_for_snapshot(content, CAP_DEFAULT), serde_json::json!({}))
                     }
-                    ContextItem::ToolCall { name, arguments, .. } => {
+                    ContextItem::ToolCall { name, arguments, call_id, .. } => {
                         let joined = format!("{name}: {arguments}");
-                        ("tool_call", truncate_for_snapshot(&joined, CAP_TOOL_CALL))
+                        let cid = call_id.to_string();
+                        ("tool_call", truncate_for_snapshot(&joined, CAP_TOOL_CALL), serde_json::json!({
+                            "call_id": cid,
+                        }))
                     }
                     ContextItem::CompactionSummary { summary, .. } => {
-                        ("compaction", truncate_for_snapshot(summary, CAP_DEFAULT))
+                        ("compaction", truncate_for_snapshot(summary, CAP_DEFAULT), serde_json::json!({}))
                     }
                     ContextItem::ReasoningSummary { content, .. } => {
-                        ("reasoning", truncate_for_snapshot(content, CAP_REASONING))
+                        ("reasoning", truncate_for_snapshot(content, CAP_REASONING), serde_json::json!({}))
                     }
                     ContextItem::ImagePlaceholder { mime_type, artifact_ref } => {
-                        ("image", format!("{mime_type}:{artifact_ref}"))
+                        ("image", format!("{mime_type}:{artifact_ref}"), serde_json::json!({}))
                     }
                 };
                 serde_json::json!({
                     "item_type": item_type,
                     "content": content,
                     "complete": true,
+                    "item_id": extra["call_id"].as_str().unwrap_or("").to_string(),
+                    "call_id": extra["call_id"].clone(),
+                    "duration_ms": extra.get("duration_ms").cloned(),
                 })
             })
             .collect();
@@ -1560,7 +1570,7 @@ impl SessionSupervisor {
                             SessionEvent::ToolCallArgs { call_id, args_delta }
                         }
                         StreamFragment::ToolCallEnd { call_id } => SessionEvent::ToolCallEnd { call_id },
-                        StreamFragment::ToolResult { call_id, content, is_error } => {
+                        StreamFragment::ToolResult { call_id, content, is_error, duration_ms: _ } => {
                             SessionEvent::ToolResult { call_id, content, is_error }
                         }
                         StreamFragment::ApprovalRequested {
@@ -2126,7 +2136,7 @@ fn assemble_extraction_context(
                     authority: EvidenceAuthority::ToolObservation,
                 });
             }
-            ContextItem::ToolResult { call_id, content, is_error } => {
+            ContextItem::ToolResult { call_id, content, is_error, .. } => {
                 let name = tool_name_for_call_id(tail, call_id).unwrap_or_else(|| "unknown".into());
                 if is_subagent_tool_noise(&name) {
                     continue;

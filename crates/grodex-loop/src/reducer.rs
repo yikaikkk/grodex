@@ -224,6 +224,10 @@ impl SessionReducer {
                         .get("is_error")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    let duration_ms = event
+                        .payload
+                        .get("duration_ms")
+                        .and_then(|v| v.as_u64());
                     let call_id =
                         grodex_core::id::ToolCallId::from_string(call_id_str).unwrap_or_default();
                     self.pending_tool_calls.remove(call_id_str);
@@ -234,6 +238,7 @@ impl SessionReducer {
                         call_id,
                         content: content.to_string(),
                         is_error,
+                        duration_ms,
                     });
                 }
             }
@@ -415,6 +420,7 @@ impl SessionReducer {
                             call_id: *call_id,
                             content,
                             is_error,
+                            duration_ms: None,
                         }
                     } else {
                         // Tier 2: no capture — generic interrupted message.
@@ -426,6 +432,7 @@ impl SessionReducer {
                                  Do not assume it completed — verify actual state if needed."
                             ),
                             is_error: true,
+                            duration_ms: None,
                         }
                     };
                     rebuilt.push(item);

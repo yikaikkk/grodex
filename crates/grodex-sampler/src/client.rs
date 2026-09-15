@@ -334,6 +334,22 @@ impl SamplingClient {
             body["max_output_tokens"] = serde_json::json!(max_tokens);
         }
 
+        // Reasoning request: when present, serialize as the Responses API
+        // `reasoning` field so the provider returns reasoning summaries.
+        // Format: {"reasoning": {"summary": "auto"}} or with effort.
+        if let Some(rr) = &request.reasoning_request {
+            let mut reasoning = serde_json::Map::new();
+            if let Some(effort) = &rr.effort {
+                reasoning.insert("effort".into(), serde_json::json!(effort));
+            }
+            if let Some(summary) = &rr.summary {
+                reasoning.insert("summary".into(), serde_json::json!(summary));
+            }
+            if !reasoning.is_empty() {
+                body["reasoning"] = serde_json::Value::Object(reasoning);
+            }
+        }
+
         body
     }
 
@@ -371,6 +387,7 @@ impl SamplingClient {
                 call_id,
                 content,
                 is_error: _is_error,
+                ..
             } => Some(serde_json::json!({
                 "type": "function_call_output",
                 "call_id": call_id.to_string(),
@@ -420,7 +437,7 @@ impl SamplingClient {
                     }]
                 }))
             }
-            ContextItem::ToolResult { call_id, content, is_error: _ } => {
+            ContextItem::ToolResult { call_id, content, is_error: _, .. } => {
                 Some(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": call_id.to_string(),
@@ -624,7 +641,7 @@ impl SamplingClient {
                         }]
                     }));
                 }
-                ContextItem::ToolResult { call_id, content, is_error } => {
+                ContextItem::ToolResult { call_id, content, is_error, .. } => {
                     messages.push(serde_json::json!({
                         "role": "user",
                         "content": [{
@@ -795,6 +812,7 @@ mod wire_role_tests {
                     call_id: ToolCallId::new(),
                     content: "interrupted".into(),
                     is_error: true,
+                    duration_ms: None,
                 },
             ],
             Vec::new(),
@@ -842,7 +860,7 @@ mod wire_role_tests {
         let req = request_with(
             vec![
                 ContextItem::ToolCall { call_id: call_id.clone(), name: "exec".into(), arguments: serde_json::json!({"cmd": "ls"}) },
-                ContextItem::ToolResult { call_id, content: "ok".into(), is_error: false },
+                ContextItem::ToolResult { call_id, content: "ok".into(), is_error: false, duration_ms: None },
                 ContextItem::CompactionSummary { summary: "sum".into(), window_number: 1 },
             ],
             vec![InstructionBlock { role: InstructionRole::Developer, content: "base".into(), priority: 100 }],
