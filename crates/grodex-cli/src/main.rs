@@ -1348,6 +1348,10 @@ async fn serve_acp() -> Result<()> {
     let mut client_last_consumed = 0u64;
     let mut inflight_cap: u32 = 128;
     let mut requested_pause_until: Option<Instant> = None;
+    // Edge-latch for the backpressure window: true once the ON FlowControl
+    // frame for the current blocked window has been emitted; cleared after
+    // the matching OFF frame. Replaces the old per-10ms frame flood.
+    let mut backpressure_asserted = false;
 
     // Server-side keepalive: long tool executions can leave the event
     // stream silent for minutes; a periodic Ping keeps the frontend from
@@ -1358,30 +1362,71 @@ async fn serve_acp() -> Result<()> {
     keepalive.tick().await; // consume the immediate first tick
 
     loop {
+        // ── Backpressure gate (P0) ──────────────────────────────────────
+        // The send window for the NEXT event is recomputed from live state
+        // on every iteration. The previous implementation captured
+        // `inflight` once inside the event branch and span in a nested
+        // `loop { sleep(10ms) }`, which (a) never re-read `client_last_consumed`
+        // and (b) lived inside a `select!` branch body, so the sibling stdin
+        // branch (the ONLY Ack entry point) could not run for up to 10s at a
+        // time — a self-lock. Here the event branch is disabled by a
+        // precondition while blocked, leaving stdin (Ack) and the pause timer
+        // always serviceable: an inbound Ack releases the window immediately.
+        let now = Instant::now();
+        let now_paused = requested_pause_until.is_some_and(|t| now < t);
+        let next_seq = seq + 1;
+        let inflight = next_seq.saturating_sub(client_last_consumed);
+        let window_full = inflight >= inflight_cap as u64;
+        let blocked = window_full || now_paused;
+        // Remaining client-requested pause; drives a dedicated wakeup branch
+        // so the gate re-evaluates when the pause expires even without an Ack.
+        let pause_remaining = requested_pause_until
+            .filter(|t| *t > now)
+            .map(|t| t - now);
+
+        // Edge-triggered FlowControl: exactly ONE frame on entering the
+        // blocked window and ONE on leaving it (the old code flooded a frame
+        // every 10ms for up to 10s — hundreds of frames per stalled event).
+        if blocked && !backpressure_asserted {
+            let pause_frame = ServerFrame::FlowControl {
+                inflight_events: inflight.min(u32::MAX as u64) as u32,
+                requested_pause_ms: Some(10u32),
+            };
+            if write_frame(&mut stdout, &pause_frame).await.is_err() {
+                // A dead ACP client must be distinguishable from success.
+                eprintln!("[acp] frame write failed (client disconnected?)");
+            }
+            eprintln!(
+                "[acp] backpressure ON: inflight={} cap={} paused={} seq={} consumed={}",
+                inflight, inflight_cap, now_paused, seq, client_last_consumed
+            );
+            backpressure_asserted = true;
+        } else if !blocked && backpressure_asserted {
+            // Release frame. The client currently derives its own outbound
+            // command window from this field (`max_inflight_events =
+            // inflight_events.max(4)`), so report the CAP rather than the now
+            // low current count — otherwise a single resume frame would shrink
+            // the client's window to 4 for the rest of the session.
+            let resume_frame = ServerFrame::FlowControl {
+                inflight_events: inflight_cap,
+                requested_pause_ms: None,
+            };
+            if write_frame(&mut stdout, &resume_frame).await.is_err() {
+                // A dead ACP client must be distinguishable from success.
+                eprintln!("[acp] frame write failed (client disconnected?)");
+            }
+            eprintln!(
+                "[acp] backpressure OFF: inflight={} cap={} seq={} consumed={}",
+                inflight, inflight_cap, seq, client_last_consumed
+            );
+            backpressure_asserted = false;
+        }
+
         tokio::select! {
-            Some(ev) = acp_rx.recv() => {
-                let next_seq = seq + 1;
-                let inflight = next_seq.saturating_sub(client_last_consumed);
-                let mut waited_ms: u64 = 0;
-                loop {
-                    let paused = requested_pause_until.map(|t| Instant::now() < t).unwrap_or(false);
-                    if inflight < inflight_cap as u64 && !paused {
-                        break;
-                    }
-                    if waited_ms >= 10_000 {
-                        break;
-                    }
-                    let pause_frame = ServerFrame::FlowControl {
-                        inflight_events: inflight.min(u32::MAX as u64) as u32,
-                        requested_pause_ms: Some(10u32),
-                    };
-                    if write_frame(&mut stdout, &pause_frame).await.is_err() {
-                        // A dead ACP client must be distinguishable from success.
-                        eprintln!("[acp] frame write failed (client disconnected?)");
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    waited_ms += 10;
-                }
+            // While blocked this branch is disabled outright, so `select!`
+            // keeps polling stdin (Ack) and the pause timer instead of
+            // busy-spinning inside the branch body. Ack can never starve.
+            Some(ev) = acp_rx.recv(), if !blocked => {
                 seq = next_seq;
                 if let Some(frame) = map_loop_event_to_update(ev, session_id, seq) {
                     if write_frame(&mut stdout, &frame).await.is_err() {
@@ -1452,6 +1497,16 @@ async fn serve_acp() -> Result<()> {
                     }
                 }
             }
+            // Wake exactly when a client-requested pause expires so the
+            // blocked gate re-evaluates even if no further Ack arrives.
+            // Disabled when not paused; the async block is inert (pending)
+            // so it is always safe to construct.
+            _ = async {
+                match pause_remaining {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if now_paused => {}
             _ = keepalive.tick() => {
                 let ping = ServerFrame::Ping { sent_at_ms: now_ms() };
                 if write_frame(&mut stdout, &ping).await.is_err() {
