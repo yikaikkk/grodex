@@ -464,8 +464,20 @@ impl SamplingClient {
         }
     }
 
+    /// Whether the provider requires `reasoning_content` to be present (even
+    /// as an empty string) on assistant messages that carry `tool_calls`.
+    ///
+    /// DeepSeek's thinking-mode API rejects such messages with HTTP 400
+    /// ("reasoning_content in the thinking mode must be passed back") if the
+    /// field is absent. Other providers — notably older Doubao revisions —
+    /// reject the field when present-but-empty, so the default policy drops
+    /// empty reasoning. The dispatch therefore MUST be per-provider.
+    fn requires_reasoning_on_tool_calls(provider_id: &str) -> bool {
+        provider_id.eq_ignore_ascii_case("deepseek")
+    }
+
     /// Build Chat Completions API body.
-    fn build_chat_body(&self, _binding: &ModelBinding, request: &CanonicalModelRequest) -> serde_json::Value {
+    fn build_chat_body(&self, binding: &ModelBinding, request: &CanonicalModelRequest) -> serde_json::Value {
         let mut messages: Vec<serde_json::Value> = Vec::new();
         // PREFIX-CACHE AWARE: only the FIRST instruction block (the stable
         // system prompt) goes at the head. Trailing blocks are volatile
@@ -510,14 +522,24 @@ impl SamplingClient {
                         iter.next();
                     }
                     let mut msg = serde_json::json!({"role": "assistant", "content": content});
-                    if !tool_calls.is_empty() {
+                    let has_tool_calls = !tool_calls.is_empty();
+                    if has_tool_calls {
                         msg["tool_calls"] = serde_json::Value::Array(tool_calls);
                     }
-                    if let Some(r) = pending_reasoning.take() {
-                        // Some thinking-mode APIs reject empty-string reasoning.
-                        if !r.is_empty() {
-                            msg["reasoning_content"] = serde_json::json!(r);
-                        }
+                    // Non-empty reasoning is always attached. For providers that
+                    // REQUIRE reasoning_content on tool-carrying assistant
+                    // messages (DeepSeek thinking mode), fall back to an empty
+                    // string when no reasoning was accumulated — omitting the
+                    // field triggers a deterministic HTTP 400. Other providers
+                    // (e.g. older Doubao) reject present-but-empty, so we keep
+                    // the field absent in that case.
+                    let reasoning = pending_reasoning.take();
+                    if let Some(r) = reasoning.filter(|r| !r.is_empty()) {
+                        msg["reasoning_content"] = serde_json::json!(r);
+                    } else if has_tool_calls
+                        && Self::requires_reasoning_on_tool_calls(&binding.provider_id)
+                    {
+                        msg["reasoning_content"] = serde_json::json!("");
                     }
                     messages.push(msg);
                 }
@@ -543,10 +565,14 @@ impl SamplingClient {
                         "content": null,
                         "tool_calls": tool_calls,
                     });
-                    if let Some(r) = pending_reasoning.take() {
-                        if !r.is_empty() {
-                            msg["reasoning_content"] = serde_json::json!(r);
-                        }
+                    // This message always carries tool_calls, so the same
+                    // provider-dispatched reasoning rule applies (see the
+                    // Assistant branch above).
+                    let reasoning = pending_reasoning.take();
+                    if let Some(r) = reasoning.filter(|r| !r.is_empty()) {
+                        msg["reasoning_content"] = serde_json::json!(r);
+                    } else if Self::requires_reasoning_on_tool_calls(&binding.provider_id) {
+                        msg["reasoning_content"] = serde_json::json!("");
                     }
                     messages.push(msg);
                 }
@@ -592,7 +618,7 @@ impl SamplingClient {
         })).collect();
 
         let mut body = serde_json::json!({
-            "model": _binding.model_id,
+            "model": binding.model_id,
             "messages": messages,
             "stream": true,
         });
@@ -849,6 +875,48 @@ mod wire_role_tests {
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs.last().unwrap()["role"], "system", "Developer trailing block must map to system");
+    }
+
+    /// Regression: DeepSeek thinking-mode REQUIRES `reasoning_content` on
+    /// every assistant message that carries `tool_calls`, even when the
+    /// reasoning string is empty. Omitting it yields a deterministic HTTP 400.
+    /// Other providers (e.g. older Doubao) reject present-but-empty, so the
+    /// field stays absent for them. The dispatch is per `provider_id`.
+    #[test]
+    fn chat_deepseek_attaches_empty_reasoning_on_tool_calls() {
+        let call_id = ToolCallId::new();
+        // No ReasoningSummary at all → pending_reasoning stays None.
+        let req = request_with(
+            vec![
+                ContextItem::User { content: "run".into(), message_id: None },
+                ContextItem::Assistant { content: "ok".into() },
+                ContextItem::ToolCall { call_id: call_id.clone(), name: "exec".into(), arguments: serde_json::json!({"cmd": "ls"}) },
+                ContextItem::ToolResult { call_id, content: "done".into(), is_error: false, duration_ms: None },
+            ],
+            Vec::new(),
+        );
+
+        // DeepSeek: reasoning_content must be present (empty string) on the
+        // tool-carrying assistant message.
+        let ds_binding = ModelBinding::new("deepseek".into(), 1, "deepseek-flash".into(), 1, WireProtocol::ChatCompletions);
+        let ds_body = test_client().build_chat_body(&ds_binding, &req);
+        let ds_msgs = ds_body["messages"].as_array().unwrap();
+        let ds_tool_msg = ds_msgs.iter().find(|m| m.get("tool_calls").is_some()).unwrap();
+        assert_eq!(
+            ds_tool_msg.get("reasoning_content").and_then(|v| v.as_str()),
+            Some(""),
+            "DeepSeek must attach empty reasoning_content on tool-carrying assistant: {ds_tool_msg:?}"
+        );
+
+        // Non-DeepSeek ("p"): reasoning_content must be ABSENT when no
+        // reasoning was accumulated.
+        let body = test_client().build_chat_body(&chat_binding(), &req);
+        let msgs = body["messages"].as_array().unwrap();
+        let tool_msg = msgs.iter().find(|m| m.get("tool_calls").is_some()).unwrap();
+        assert!(
+            tool_msg.get("reasoning_content").is_none(),
+            "non-DeepSeek must omit empty reasoning_content: {tool_msg:?}"
+        );
     }
 
     /// Regression: Anthropic Messages wire must use native tool_use /
