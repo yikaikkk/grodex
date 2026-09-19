@@ -625,8 +625,22 @@ async fn run_child_chain(
     mut payload: String,
 ) {
     loop {
+        // Retrieve the per-run budget recorded on the TaskRun. For a
+        // followup_task(max_turns=N) queued behind a busy target, this is
+        // the only path the override reaches the executor — without it
+        // the run silently falls back to the DelegateTool's config default.
+        let per_call_max_turns = host
+            .protocol()
+            .lock()
+            .unwrap()
+            .task_budget(&task_id)
+            .and_then(|b| b.max_turns);
+        let mut args = json!({"task": payload});
+        if let Some(t) = per_call_max_turns {
+            args["max_turns"] = json!(t);
+        }
         let outcome = executor
-            .execute(json!({"task": payload}), OperationId::new())
+            .execute(args, OperationId::new())
             .await
             .map(|v| {
                 v.get("message")

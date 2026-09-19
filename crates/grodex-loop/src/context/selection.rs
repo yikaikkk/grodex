@@ -233,6 +233,7 @@ mod tests {
             call_id: ToolCallId::new(),
             content: text.into(),
             is_error: false,
+            duration_ms: None,
         }
     }
 

@@ -940,7 +940,7 @@ mod tests {
         assert_eq!(ctx.len(), 3);
         assert!(matches!(ctx[1], ContextItem::ToolCall { .. }));
         match &ctx[2] {
-            ContextItem::ToolResult { call_id, content, is_error } => {
+            ContextItem::ToolResult { call_id, content, is_error, .. } => {
                 assert_eq!(call_id, &cid);
                 assert!(is_error);
                 assert!(content.contains("interrupted"));

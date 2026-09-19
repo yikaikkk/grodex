@@ -56,6 +56,42 @@ pub struct DelegateArgs {
     pub task: String,
     #[serde(default)]
     pub label: Option<String>,
+    /// Optional per-call override of the sampling-turn budget
+    /// (`[subagent] max_turns`). One turn = one model sample in the
+    /// sub-agent loop. Must be within [`DelegateTool`]'s allowed range
+    /// (1..=100); out-of-range values are rejected before spawning.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+}
+
+/// Lower bound for a sub-agent turn budget: a zero-turn loop can never
+/// produce a result.
+pub const SUBAGENT_MIN_TURNS: u32 = 1;
+/// Upper bound for a sub-agent turn budget (config default or per-call).
+/// Prevents a single sub-agent from running away over a long session;
+/// raise here deliberately if deeper agentic searches are needed.
+pub const SUBAGENT_MAX_TURNS: u32 = 100;
+
+/// Resolve the effective sampling-turn budget for one sub-agent run.
+///
+/// - `configured` comes from `[subagent] max_turns` (clamped into range —
+///   a bad config value must never disable the loop silently).
+/// - `per_call` is the optional `delegate_task`/`followup_task` override;
+///   `None` falls back to `configured`, while an explicit out-of-range
+///   value is an error (the model/user supplied a bad argument and
+///   should see why rather than getting a silently clamped run).
+pub fn resolve_effective_max_turns(
+    configured: u32,
+    per_call: Option<u32>,
+) -> Result<u32, String> {
+    let configured = configured.clamp(SUBAGENT_MIN_TURNS, SUBAGENT_MAX_TURNS);
+    match per_call {
+        None => Ok(configured),
+        Some(v) if (SUBAGENT_MIN_TURNS..=SUBAGENT_MAX_TURNS).contains(&v) => Ok(v),
+        Some(v) => Err(format!(
+            "max_turns={v} out of allowed range {SUBAGENT_MIN_TURNS}..={SUBAGENT_MAX_TURNS}"
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +153,10 @@ pub struct DelegateTool {
     /// child is cancelled and a failed Finished is emitted so the UI
     /// never shows a permanently "running" node.
     turn_timeout: std::time::Duration,
+    /// Default sampling-turn budget for one sub-agent run, from
+    /// `[subagent] max_turns` via `SubAgentConfig.default_max_turns`.
+    /// Previously the run loop hard-capped at 15 and ignored this.
+    max_turns: u32,
 }
 
 /// Long sub-agent reports are written to a temp file and only a
@@ -126,6 +166,10 @@ const SUBAGENT_INLINE_MAX_BYTES: usize = 8 * 1024;
 
 impl DelegateTool {
     pub fn new(config: SubAgentConfig) -> Self {
+        // Read the turn budget BEFORE moving `config` into the supervisor;
+        // `default_max_turns` is Copy (u32) so this is cheap.
+        let max_turns = config.default_max_turns
+            .clamp(SUBAGENT_MIN_TURNS, SUBAGENT_MAX_TURNS);
         Self {
             runtime: SubAgentRuntime::InMemory(Arc::new(Mutex::new(
                 SubAgentSupervisor::new(config),
@@ -141,6 +185,7 @@ impl DelegateTool {
             permission: None,
             protocol_host: None,
             turn_timeout: std::time::Duration::from_secs(480),
+            max_turns,
         }
     }
 
@@ -256,7 +301,8 @@ impl Tool for DelegateTool {
             "type": "object",
             "properties": {
                 "task": {"type": "string", "description": "The task description for the sub-agent"},
-                "label": {"type": "string", "description": "Human-readable label for the sub-agent"}
+                "label": {"type": "string", "description": "Human-readable label for the sub-agent"},
+                "max_turns": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Optional per-call sampling-turn budget (one turn = one model sample). Defaults to the [subagent] max_turns config value."}
             },
             "required": ["task"]
         })
@@ -283,6 +329,13 @@ impl ToolRuntime for DelegateTool {
     ) -> Result<serde_json::Value, GrodexError> {
         let args: DelegateArgs = serde_json::from_value(args)
             .map_err(|e| GrodexError::ToolExecution(format!("invalid delegate args: {e}")))?;
+
+        // Resolve the sampling-turn budget: config default, optionally
+        // overridden per call. Out-of-range per-call values are rejected
+        // BEFORE any spawn so the model gets an explicit error instead of
+        // a silently truncated run.
+        let effective_max_turns = resolve_effective_max_turns(self.max_turns, args.max_turns)
+            .map_err(GrodexError::ToolExecution)?;
 
         let label = args.label.unwrap_or_else(|| "sub-agent".into());
 
@@ -313,17 +366,23 @@ impl ToolRuntime for DelegateTool {
         }
 
         // ── 1. Spawn the sub-agent task ──────────────────────────
+        // Record the same effective budget on the TaskRun metadata so
+        // supervisor/protocol views agree with the actual run loop.
+        let task_budget = TaskBudget {
+            max_turns: Some(effective_max_turns),
+            max_duration_secs: Some(self.turn_timeout.as_secs()),
+        };
         let (agent_id, task_id) = match &self.runtime {
             SubAgentRuntime::InMemory(sup) => {
                 let mut sup = sup.lock().await;
                 let root = sup.root_id();
-                sup.spawn(root, &label, &args.task, ContextFork::None, None)
+                sup.spawn(root, &label, &args.task, ContextFork::None, Some(task_budget.clone()))
                     .map_err(|e| GrodexError::ToolExecution(format!("cannot spawn: {e}")))?
             }
             SubAgentRuntime::Durable(sup) => {
                 let mut sup = sup.lock().await;
                 let root = sup.root_id();
-                sup.spawn(root, &label, &args.task, ContextFork::None, None)
+                sup.spawn(root, &label, &args.task, ContextFork::None, Some(task_budget.clone()))
                     .await
                     .map_err(|e| GrodexError::ToolExecution(format!("cannot spawn: {e}")))?
             }
@@ -368,6 +427,7 @@ impl ToolRuntime for DelegateTool {
                     actor,
                     cfg,
                     &args.task,
+                    effective_max_turns,
                     &self.readonly_tools,
                     self.permission.clone(),
                     controls.as_mut(),
@@ -481,6 +541,7 @@ async fn run_subagent_turn(
     actor: &grodex_sampler::SamplingActor,
     cfg: &ModelConfig,
     task: &str,
+    max_turns: u32,
     readonly_tools: &[(String, Arc<dyn ToolRuntime>, serde_json::Value, String)],
     permission: Option<Arc<Mutex<grodex_permission::PermissionManager>>>,
     mut controls: Option<&mut ChildControls>,
@@ -496,8 +557,9 @@ async fn run_subagent_turn(
     use grodex_provider::prompt_snapshot::PromptSnapshot;
 
 
-    /// Hard cap on sub-agent steps — keeps a runaway sub-agent bounded.
-    const MAX_SUBAGENT_STEPS: usize = 15;
+    // The sampling-turn cap arrives via `max_turns` (config default plus
+    // optional per-call override), resolved and range-checked by the caller.
+    // One iteration below = one model sample = one turn.
     /// Long answers (analysis reports) need headroom; 4096 truncated them.
     const SUBAGENT_MAX_OUTPUT_TOKENS: u64 = 16384;
 
@@ -530,8 +592,8 @@ async fn run_subagent_turn(
     }];
     let mut last_error: Option<String> = None;
 
-    for step in 0..MAX_SUBAGENT_STEPS {
-        // ── Step-boundary controls (unified tree) ───────────────────
+    for turn in 0..max_turns as usize {
+        // ── Turn-boundary controls (unified tree) ───────────────────
         if let Some(c) = controls.as_deref_mut() {
             if c.cancel.is_cancelled() {
                 return Err("interrupted by user (interrupt_agent)".into());
@@ -547,7 +609,7 @@ async fn run_subagent_turn(
                 }
             }
         }
-        on_step(format!("采样步骤 {}", step + 1));
+        on_step(format!("采样轮次 {}/{}", turn + 1, max_turns));
         let request = CanonicalModelRequest {
             request_id: format!("subagent-{}", StepId::new()),
             session_id: SessionId::new(),
@@ -730,7 +792,7 @@ async fn run_subagent_turn(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        format!("sub-agent hit the max step cap ({MAX_SUBAGENT_STEPS}) without producing a final result")
+        format!("sub-agent hit the max turn cap ({max_turns}) without producing a final result")
     }))
 }
 
@@ -777,5 +839,52 @@ fn truncate_task(s: &str, max: usize) -> &str {
             end -= 1;
         }
         &s[..end]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_no_override_returns_config_clamped() {
+        // In-range config passes through unchanged.
+        assert_eq!(resolve_effective_max_turns(50, None).unwrap(), 50);
+    }
+
+    #[test]
+    fn resolve_config_below_min_clamps_up() {
+        // A bad config (0) must not disable the loop — clamp to 1.
+        assert_eq!(resolve_effective_max_turns(0, None).unwrap(), SUBAGENT_MIN_TURNS);
+    }
+
+    #[test]
+    fn resolve_config_above_max_clamps_down() {
+        assert_eq!(resolve_effective_max_turns(200, None).unwrap(), SUBAGENT_MAX_TURNS);
+    }
+
+    #[test]
+    fn resolve_valid_override_wins() {
+        assert_eq!(resolve_effective_max_turns(50, Some(3)).unwrap(), 3);
+    }
+
+    #[test]
+    fn resolve_override_zero_errors() {
+        assert!(resolve_effective_max_turns(50, Some(0)).is_err());
+    }
+
+    #[test]
+    fn resolve_override_above_max_errors() {
+        assert!(resolve_effective_max_turns(50, Some(101)).is_err());
+    }
+
+    #[test]
+    fn resolve_override_at_boundary_ok() {
+        assert_eq!(resolve_effective_max_turns(50, Some(SUBAGENT_MAX_TURNS)).unwrap(), 100);
+    }
+
+    #[test]
+    fn resolve_override_one_ok() {
+        assert_eq!(resolve_effective_max_turns(50, Some(SUBAGENT_MIN_TURNS)).unwrap(), 1);
     }
 }

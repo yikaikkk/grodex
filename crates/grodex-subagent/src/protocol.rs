@@ -274,7 +274,10 @@ impl CollaborationProtocol {
             return Err(ProtocolError::AgentNotFound(target));
         }
         let payload: String = message.into();
-        let msg = AgentMessage::followup(author, target, payload.clone(), None);
+        // The budget rides on the message: for a busy target the queued
+        // message is the ONLY place this per-call budget survives until
+        // the run actually starts (FIFO consumption after terminal).
+        let msg = AgentMessage::followup(author, target, payload.clone(), None, Some(budget.clone()));
         let id = msg.message_id.to_string();
         self.router.dispatch(msg)?;
 
@@ -288,9 +291,12 @@ impl CollaborationProtocol {
             .router
             .pop_followup(&target)
             .ok_or_else(|| ProtocolError::Mailbox("queued followup vanished".into()))?;
+        // Prefer the budget carried by the queued message; fall back to
+        // the caller-supplied default for messages without one.
+        let effective_budget = followup.budget.clone().unwrap_or(budget);
         let task_id = self
             .manager
-            .start_followup_task(target, followup.payload, context_fork, budget)
+            .start_followup_task(target, followup.payload, context_fork, effective_budget)
             .map_err(ProtocolError::TaskRefused)?;
         self.events.push(ProtocolEvent::FollowupTriggered {
             message_id: id.clone(),
@@ -318,9 +324,14 @@ impl CollaborationProtocol {
             return Ok(None);
         };
         let id = followup.message_id.to_string();
+        // Prefer the per-followup budget carried on the queued message;
+        // fall back to the caller-supplied default. Without this, a
+        // `followup_task(max_turns=N)` queued behind a busy target would
+        // lose its override when consumed after terminal.
+        let effective_budget = followup.budget.clone().unwrap_or(budget);
         let task_id = self
             .manager
-            .start_followup_task(target, followup.payload, context_fork, budget)
+            .start_followup_task(target, followup.payload, context_fork, effective_budget)
             .map_err(ProtocolError::TaskRefused)?;
         self.events.push(ProtocolEvent::FollowupTriggered {
             message_id: id.clone(),
@@ -358,9 +369,12 @@ impl CollaborationProtocol {
         };
         let message_id = followup.message_id.to_string();
         let payload = followup.payload.clone();
+        // Prefer the per-followup budget carried on the queued message;
+        // fall back to the caller-supplied default (see on_task_finished).
+        let effective_budget = followup.budget.clone().unwrap_or(budget);
         let new_id = self
             .manager
-            .start_followup_task(target, followup.payload, context_fork, budget)
+            .start_followup_task(target, followup.payload, context_fork, effective_budget)
             .map_err(ProtocolError::TaskRefused)?;
         self.events.push(ProtocolEvent::FollowupTriggered {
             message_id,
@@ -368,6 +382,15 @@ impl CollaborationProtocol {
             task_run_id: new_id,
         });
         Ok(Some((new_id, payload)))
+    }
+
+    /// Look up the budget recorded on a TaskRun.
+    ///
+    /// The live-loop adapter calls this after `finish_task_run` returns a
+    /// new `task_run_id` to retrieve the per-run budget — which may be a
+    /// per-call override that rode on the queued followup message.
+    pub fn task_budget(&self, task_id: &TaskId) -> Option<TaskBudget> {
+        self.manager.get_task(task_id).map(|t| t.budget.clone())
     }
 
     // ── 3. wait_agent ───────────────────────────────────────────────

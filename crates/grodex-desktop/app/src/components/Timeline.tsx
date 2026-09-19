@@ -1,8 +1,8 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Bot, Copy, Check, Clock, Cpu, Brain, ChevronDown, ChevronRight, Wrench } from 'lucide-react';
-import { TimelineItem, ToolItem } from '../types';
+import { TimelineItem, ToolItem, AssistantMessageItem } from '../types';
 import { ToolCard } from './ToolCard';
 
 interface TimelineProps {
@@ -171,7 +171,78 @@ function ThinkingFrame({
   );
 }
 
-export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff, scrollToKey }) => {
+/// Memoized assistant message. Skips re-render when `item` reference is
+/// stable (i.e. not changed during approval/scroll state updates), and
+/// caches the expensive ReactMarkdown+remarkGfm parse via useMemo so
+/// streaming updates only re-parse the one item that changed.
+interface AssistantMessageProps {
+  item: AssistantMessageItem;
+}
+
+const AssistantMessage = React.memo(({ item }: AssistantMessageProps) => {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(item.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // clipboard not available
+    }
+  };
+
+  const markdown = useMemo(
+    () => <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>,
+    [item.content]
+  );
+
+  return (
+    <div
+      id={`timeline-assistant-msg-${item.id}`}
+      className="flex justify-start items-start gap-2.5 my-3 w-full pr-2 sm:pr-6"
+    >
+      <div className="w-8 h-8 rounded-lg bg-well border border-hairline flex items-center justify-center text-accent shrink-0 mt-0.5 shadow-2xs select-none">
+        <Bot className="w-4 h-4" />
+      </div>
+      <div className="flex flex-col items-start flex-1 min-w-0">
+        <div className="w-full relative rounded-2xl bg-white border border-hairline p-4.5 text-primary shadow-2xs text-sm leading-relaxed break-words">
+          <div className="md-body prose prose-stone prose-sm max-w-none text-primary prose-headings:text-primary prose-headings:font-bold prose-p:leading-relaxed prose-pre:bg-well prose-pre:border prose-pre:border-hairline prose-pre:rounded-xl prose-pre:w-full prose-code:font-mono prose-code:text-primary prose-code:bg-well prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:border prose-code:border-hairline prose-strong:text-primary">
+            {markdown}
+          </div>
+          <div className="flex items-center justify-between mt-3.5 pt-2.5 border-t border-hairline-2 text-[11px] font-sans text-secondary gap-4">
+            <div className="flex items-center gap-3">
+              <span className="flex items-center gap-1 font-sans">
+                <Cpu className="w-3 h-3 text-tertiary" />
+                {item.tokens ?? item.content.length} 令牌
+              </span>
+            </div>
+            <button
+              id={`copy-assistant-msg-${item.id}`}
+              onClick={handleCopy}
+              className="flex items-center gap-1 px-2 py-0.5 rounded-md hover:bg-well text-secondary hover:text-primary transition-colors"
+              title="复制回复内容"
+            >
+              {copied ? (
+                <Check className="w-3 h-3 text-green-dark" />
+              ) : (
+                <Copy className="w-3 h-3" />
+              )}
+              <span className="text-[10px]">{copied ? '已复制' : '复制'}</span>
+            </button>
+          </div>
+        </div>
+        {item.timestamp && (
+          <span className="text-[10px] text-tertiary mt-1 pl-1 font-sans">
+            {item.timestamp}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+});
+
+export const Timeline = React.memo(({ items, onOpenDiff, scrollToKey }: TimelineProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const pageStuckRef = useRef(false); // true = user scrolled UP (pauses follow)
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -235,50 +306,7 @@ export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff, scrollToK
     }
 
     if (item.type !== 'assistant') return null;
-    return (
-      <div
-        key={item.id}
-        id={`timeline-assistant-msg-${item.id}`}
-        className="flex justify-start items-start gap-2.5 my-3 w-full pr-2 sm:pr-6"
-      >
-        <div className="w-8 h-8 rounded-lg bg-well border border-hairline flex items-center justify-center text-accent shrink-0 mt-0.5 shadow-2xs select-none">
-          <Bot className="w-4 h-4" />
-        </div>
-        <div className="flex flex-col items-start flex-1 min-w-0">
-          <div className="w-full relative rounded-2xl bg-white border border-hairline p-4.5 text-primary shadow-2xs text-sm leading-relaxed break-words">
-            <div className="md-body prose prose-stone prose-sm max-w-none text-primary prose-headings:text-primary prose-headings:font-bold prose-p:leading-relaxed prose-pre:bg-well prose-pre:border prose-pre:border-hairline prose-pre:rounded-xl prose-pre:w-full prose-code:font-mono prose-code:text-primary prose-code:bg-well prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:border prose-code:border-hairline prose-strong:text-primary">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>
-            </div>
-            <div className="flex items-center justify-between mt-3.5 pt-2.5 border-t border-hairline-2 text-[11px] font-sans text-secondary gap-4">
-              <div className="flex items-center gap-3">
-                <span className="flex items-center gap-1 font-sans">
-                  <Cpu className="w-3 h-3 text-tertiary" />
-                  {item.tokens ?? item.content.length} 令牌
-                </span>
-              </div>
-              <button
-                id={`copy-assistant-msg-${item.id}`}
-                onClick={() => handleCopyText(item.id, item.content)}
-                className="flex items-center gap-1 px-2 py-0.5 rounded-md hover:bg-well text-secondary hover:text-primary transition-colors"
-                title="复制回复内容"
-              >
-                {copiedId === item.id ? (
-                  <Check className="w-3 h-3 text-green-dark" />
-                ) : (
-                  <Copy className="w-3 h-3" />
-                )}
-                <span className="text-[10px]">{copiedId === item.id ? '已复制' : '复制'}</span>
-              </button>
-            </div>
-          </div>
-          {item.timestamp && (
-            <span className="text-[10px] text-tertiary mt-1 pl-1 font-sans">
-              {item.timestamp}
-            </span>
-          )}
-        </div>
-      </div>
-    );
+    return <AssistantMessage key={item.id} item={item} />;
   };
 
   const rows = groupRows(items);
@@ -303,4 +331,4 @@ export const Timeline: React.FC<TimelineProps> = ({ items, onOpenDiff, scrollToK
       )}
     </div>
   );
-};
+});

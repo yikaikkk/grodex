@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   ApprovalRequest,
   Session,
@@ -626,9 +626,20 @@ export default function App() {
     action: 'allowed_once' | 'always_allowed' | 'denied' | 'narrowed',
     narrowedParams?: any,
   ) => {
+    // Snapshot for restore-on-failure.
+    const ticket = pendingApprovals.find((a) => a.id === approvalId);
+    // Optimistic removal — Modal disappears immediately. Previously the
+    // modal stayed open until the full ACP round-trip (send → Rust
+    // transport mutex → event drain → approvalResolved) returned.
+    setPendingApprovals((prev) => prev.filter((a) => a.id !== approvalId));
     try {
       await acp.resolveApproval(approvalId, action, narrowedParams);
     } catch (e: any) {
+      // Restore the ticket so the user can retry; the Modal re-mounts
+      // via key={ticket.id}.
+      if (ticket) {
+        setPendingApprovals((prev) => [ticket, ...prev]);
+      }
       showNotice(`审批回复失败：${e?.message || e}`, 'error');
     }
   };
@@ -673,13 +684,13 @@ export default function App() {
   };
 
   const noopSteerAdopt = () => showNotice('此版本未提供干预建议');
-  const handleOpenDiff = () => {
+  const handleOpenDiff = useCallback(() => {
     if (lastDiffId) {
       setIsDiffOpen(true);
     } else {
       showNotice('当前会话还没有文件变更');
     }
-  };
+  }, [lastDiffId]);
 
   return (
     <div id="grodex-desktop-root" className="h-screen w-screen flex flex-col bg-canvas text-primary overflow-hidden font-sans antialiased">
@@ -790,9 +801,12 @@ export default function App() {
         />
       </div>
 
-      {/* Operator Permission Approval Modal — one at a time from the queue */}
+      {/* Operator Permission Approval Modal — one at a time from the queue.
+          key by ticket id so React remounts per request: the Modal's
+          state initializer runs once and the reset effect is gone. */}
       {pendingApprovals[0] && (
         <ApprovalModal
+          key={pendingApprovals[0].id}
           request={pendingApprovals[0]}
           onResolve={handleResolveApproval}
           onDismiss={() => {}}
@@ -801,7 +815,7 @@ export default function App() {
 
       {/* Indeterminate (crash-recovery) resolution modal */}
       {indeterminate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40">
           <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl border border-hairline overflow-hidden">
             <div className="px-6 py-4 bg-orange-soft border-b border-hairline flex items-center gap-2.5">
               <AlertTriangle className="w-5 h-5 text-orange-dark" />
@@ -841,7 +855,7 @@ export default function App() {
 
       {/* Delete-session confirmation dialog */}
       {confirmDelete && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40">
           <div className="w-full max-w-sm rounded-2xl bg-white shadow-2xl border border-hairline overflow-hidden">
             <div className="px-6 py-4 bg-red-soft border-b border-red-soft flex items-center gap-2.5">
               <AlertTriangle className="w-5 h-5 text-red-dark" />
@@ -878,7 +892,7 @@ export default function App() {
 
       {/* Directory picker dialog (window.prompt unavailable in Tauri) */}
       {isDirDialogOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40">
           <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl border border-hairline overflow-hidden">
             <div className="px-6 py-4 bg-well border-b border-hairline">
               <h3 className="text-sm font-bold text-primary">选择工作目录</h3>

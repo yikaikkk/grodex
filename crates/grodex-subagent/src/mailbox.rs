@@ -14,7 +14,7 @@
 //! - `control`: consumed by Runtime only (cancel, interrupt, etc.).
 
 use crate::node::AgentId;
-use crate::task::TaskId;
+use crate::task::{TaskBudget, TaskId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -71,6 +71,12 @@ pub struct AgentMessage {
     pub in_reply_to: Option<MessageId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_at_ms: Option<u64>,
+    /// Per-followup execution budget. Only carried by `Followup` messages:
+    /// a busy target queues the message (FIFO), and the budget rides along
+    /// so the eventual TaskRun honors the caller's `max_turns` override
+    /// instead of silently falling back to the host default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<TaskBudget>,
 }
 
 impl AgentMessage {
@@ -89,6 +95,7 @@ impl AgentMessage {
             created_at: Utc::now(),
             in_reply_to: None,
             timeout_at_ms: None,
+            budget: None,
         }
     }
 
@@ -97,6 +104,7 @@ impl AgentMessage {
         target: AgentId,
         payload: impl Into<String>,
         related_task: Option<TaskId>,
+        budget: Option<TaskBudget>,
     ) -> Self {
         let payload_str = payload.into();
         let preview = make_preview(&payload_str);
@@ -112,6 +120,7 @@ impl AgentMessage {
             created_at: Utc::now(),
             in_reply_to: None,
             timeout_at_ms: None,
+            budget,
         }
     }
 
@@ -135,6 +144,7 @@ impl AgentMessage {
             created_at: Utc::now(),
             in_reply_to: None,
             timeout_at_ms: None,
+            budget: None,
         }
     }
 
@@ -151,6 +161,7 @@ impl AgentMessage {
             created_at: Utc::now(),
             in_reply_to: None,
             timeout_at_ms: None,
+            budget: None,
         }
     }
 }
@@ -424,9 +435,10 @@ mod tests {
     fn followup_triggers_turn() {
         let author = aid();
         let target = aid();
-        let msg = AgentMessage::followup(author, target, "please review", None);
+        let msg = AgentMessage::followup(author, target, "please review", None, None);
         assert!(msg.trigger_turn);
         assert_eq!(msg.kind, MessageKind::Followup);
+        assert!(msg.budget.is_none());
     }
 
     #[test]

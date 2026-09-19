@@ -192,6 +192,7 @@ mod tests {
             call_id: Default::default(),
             content: "result".into(),
             is_error: false,
+            duration_ms: None,
         }];
         let issues = CompactionAssembly::validate(&items);
         assert!(!issues.is_empty());

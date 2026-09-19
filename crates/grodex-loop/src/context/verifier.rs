@@ -298,6 +298,7 @@ mod tests {
             call_id: id,
             content: "result".to_string(),
             is_error,
+            duration_ms: None,
         }
     }
 

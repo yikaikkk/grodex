@@ -209,9 +209,20 @@ pub fn run_agent_worker(
         }
 
         // Drain whatever the agent produced since the last tick.
+        // Cap at 256 events per tick so a large burst (e.g. resume replay
+        // of 3000+ events) doesn't monopolize the 16ms tick and starve
+        // command processing — a ResolveApproval stuck behind the drain
+        // was a major source of "approval disappears slowly".
         if let Some(c) = client.as_mut() {
             let mut evt_count = 0;
+            const DRAIN_BUDGET: usize = 256;
             loop {
+                if evt_count >= DRAIN_BUDGET {
+                    eprintln!(
+                        "[desktop] drain hit per-tick cap ({DRAIN_BUDGET}); remaining events deferred to next tick"
+                    );
+                    break;
+                }
                 match c.poll_event(Duration::ZERO) {
                     Some(env) => {
                         evt_count += 1;

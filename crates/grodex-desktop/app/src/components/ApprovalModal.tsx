@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   ShieldAlert,
   Clock,
@@ -39,24 +39,28 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
     secondsUntilDeadline(request)
   );
   const [isNarrowing, setIsNarrowing] = useState(false);
-  const [narrowedJsonText, setNarrowedJsonText] = useState(
-    request ? JSON.stringify(request.params, null, 2) : ''
-  );
+  const [submitting, setSubmitting] = useState(false);
+  // Serialize the params ONCE per request (was previously stringified in
+  // the state initializer, the reset effect, and the JSX <pre> — three
+  // passes on large payloads, re-run every second by the countdown timer).
+  // Cap at 8KB so a huge patch/script never blocks the main thread.
+  const paramsText = useMemo(() => {
+    if (!request) return '';
+    const json = JSON.stringify(request.params, null, 2);
+    return json.length > 8192 ? json.slice(0, 8192) + '\n…(truncated)' : json;
+  }, [request]);
+  const [narrowedJsonText, setNarrowedJsonText] = useState(paramsText);
   const [jsonError, setJsonError] = useState<string | null>(null);
 
-  // Recompute remaining against the server deadline every second.
+  // Countdown only. The previous effect also reset narrowedJsonText /
+  // isNarrowing / jsonError on every request change — but with a `key`
+  // on the Modal (App.tsx), React remounts per ticket, so the state
+  // initializer already does that once. This effect is now timer-only.
   useEffect(() => {
     if (!request) return;
-
-    setRemainingSec(secondsUntilDeadline(request));
-    setIsNarrowing(false);
-    setNarrowedJsonText(JSON.stringify(request.params, null, 2));
-    setJsonError(null);
-
     const interval = setInterval(() => {
       setRemainingSec(secondsUntilDeadline(request));
     }, 1000);
-
     return () => clearInterval(interval);
   }, [request]);
 
@@ -66,18 +70,36 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
   const total = Math.max(1, request.totalDurationSec);
   const progressPercent = (remainingSec / total) * 100;
 
+  // Optimistic close: set submitting immediately (prevents double-click),
+  // call onResolve in the background. If it rejects, the parent restores
+  // the ticket and the modal re-mounts via key. Previously the modal
+  // stayed open until the full ACP round-trip returned.
+  const handleResolve = (
+    action: Parameters<typeof onResolve>[1],
+    narrowedParams?: any
+  ) => {
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      onResolve(request.id, action, narrowedParams);
+    } catch (err) {
+      setSubmitting(false);
+      throw err;
+    }
+  };
+
   const handleNarrowSubmit = () => {
     try {
       const parsed = JSON.parse(narrowedJsonText);
       setJsonError(null);
-      onResolve(request.id, 'narrowed', parsed);
+      handleResolve('narrowed', parsed);
     } catch (err: any) {
       setJsonError(err.message || '非法的 JSON 语法格式');
     }
   };
 
   return (
-    <div id="approval-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm animate-in fade-in duration-150">
+    <div id="approval-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 animate-in fade-in duration-150">
       <div
         id="approval-modal-card"
         className="w-full max-w-2xl rounded-2xl border border-hairline bg-white shadow-2xl overflow-hidden flex flex-col max-h-[92vh]"
@@ -194,7 +216,7 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
               </div>
             ) : (
               <pre className="p-3.5 rounded-2xl bg-well border border-hairline text-[11px] font-mono text-primary overflow-x-auto leading-relaxed max-h-48">
-                {JSON.stringify(request.params, null, 2)}
+                {paramsText}
               </pre>
             )}
           </div>
@@ -213,8 +235,9 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
           <div className="flex items-center gap-2">
             <button
               id="approval-deny-btn"
-              onClick={() => onResolve(request.id, 'denied')}
-              className="px-3.5 py-2 rounded-full bg-red-soft hover:bg-red-soft text-red-dark border border-red-soft font-medium text-xs flex items-center gap-1.5 transition-colors shadow-xs"
+              onClick={() => handleResolve('denied')}
+              disabled={submitting}
+              className="px-3.5 py-2 rounded-full bg-red-soft hover:bg-red-soft text-red-dark border border-red-soft font-medium text-xs flex items-center gap-1.5 transition-colors shadow-xs disabled:opacity-40"
             >
               <XCircle className="w-4 h-4" />
               拒绝 (Deny)
@@ -233,8 +256,8 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
           <div className="flex items-center gap-2.5">
             <button
               id="approval-allow-always-btn"
-              onClick={() => onResolve(request.id, 'always_allowed')}
-              disabled={isExpired}
+              onClick={() => handleResolve('always_allowed')}
+              disabled={isExpired || submitting}
               className="px-3.5 py-2 rounded-full bg-accent-soft hover:bg-accent-soft text-accent border border-accent-soft disabled:opacity-40 font-medium text-xs flex items-center gap-1.5 transition-colors shadow-xs"
             >
               <CheckCheck className="w-4 h-4" />
@@ -242,8 +265,8 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
             </button>
             <button
               id="approval-allow-once-btn"
-              onClick={() => onResolve(request.id, 'allowed_once')}
-              disabled={isExpired}
+              onClick={() => handleResolve('allowed_once')}
+              disabled={isExpired || submitting}
               className="px-4.5 py-2 rounded-full bg-green hover:bg-green text-white disabled:opacity-40 font-medium text-xs flex items-center gap-1.5 transition-all shadow-xs"
             >
               <Check className="w-4 h-4" />

@@ -22,7 +22,12 @@ pub fn send_command(
 ) -> Result<(), String> {
     let cmd: grodex_protocol::acp::Command =
         serde_json::from_value(command).map_err(|e| format!("命令 JSON 不合法: {e}"))?;
-    let tx = state.0.lock().map_err(|_| "transport state 被污染".to_string())?;
+    // Clone the Sender out of the lock and drop the guard BEFORE
+    // send_and_wait — otherwise the global Mutex is held for up to 60s
+    // (the reply timeout), serializing every command behind the one
+    // currently waiting. A ResolveApproval stuck behind a streaming
+    // burst would hang the UI.
+    let tx = state.0.lock().map_err(|_| "transport state 被污染".to_string())?.clone();
     transport::send_and_wait(&tx, |reply| ControlMsg::Command { cmd, reply })
 }
 
@@ -32,7 +37,7 @@ pub fn send_command(
 #[tauri::command]
 pub fn ensure_agent(state: State<'_, TransportState>, cwd: String) -> Result<bool, String> {
     let workspace = transport::normalize_workspace(&cwd)?;
-    let tx = state.0.lock().map_err(|_| "transport state 被污染".to_string())?;
+    let tx = state.0.lock().map_err(|_| "transport state 被污染".to_string())?.clone();
     transport::ensure_running(&tx, &workspace)
 }
 
@@ -44,7 +49,7 @@ pub fn new_session(
     cwd: String,
 ) -> Result<String, String> {
     let workspace = transport::normalize_workspace(&cwd)?;
-    let tx = state.0.lock().map_err(|_| "transport state 被污染".to_string())?;
+    let tx = state.0.lock().map_err(|_| "transport state 被污染".to_string())?.clone();
     transport::send_and_wait(&tx, |reply| ControlMsg::Respawn {
         cwd: workspace.clone(),
         reply,
