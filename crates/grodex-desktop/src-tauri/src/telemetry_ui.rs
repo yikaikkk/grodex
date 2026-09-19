@@ -16,8 +16,8 @@ use serde::Serialize;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelAggDto {
-    pub provider: String,
-    pub model: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub calls: i64,
     pub errors: i64,
     pub avg_ms: f64,
@@ -31,8 +31,8 @@ pub struct ModelAggDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheStatsDto {
-    pub provider: String,
-    pub model: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub calls: i64,
     pub input_tokens: i64,
     pub cached_input_tokens: i64,
@@ -57,8 +57,8 @@ pub struct TelemetryOverview {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnModelAttemptDto {
-    pub provider: String,
-    pub model: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub attempts: Option<i64>,
     pub status: Option<String>,
     pub error_class: Option<String>,

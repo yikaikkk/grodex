@@ -44,8 +44,8 @@ pub struct ToolAgg {
 
 #[derive(Debug, Clone)]
 pub struct ModelAgg {
-    pub provider: String,
-    pub model: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub calls: i64,
     pub errors: i64,
     pub avg_ms: f64,
@@ -287,8 +287,8 @@ pub fn projection_cursor(
 /// the local prompt hash.
 #[derive(Debug, Clone)]
 pub struct CacheStatsRow {
-    pub provider: String,
-    pub model: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub calls: i64,
     pub input_tokens: i64,
     pub cached_input_tokens: i64,
@@ -391,8 +391,8 @@ pub fn recovery_anomalies(conn: &Connection) -> Result<Vec<RecoveryRow>, rusqlit
 
 #[derive(Debug, Clone)]
 pub struct TurnModelAttemptRow {
-    pub provider: String,
-    pub model: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub attempts: Option<i64>,
     pub status: Option<String>,
     pub error_class: Option<String>,

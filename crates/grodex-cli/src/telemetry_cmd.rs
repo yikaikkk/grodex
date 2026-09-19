@@ -132,7 +132,7 @@ pub fn turn_detail(db: Option<&String>, turn_id: &str) -> Result<(), String> {
                FROM model_attempts WHERE turn_id = ?1 ORDER BY started_at ASC"#,
         )
         .map_err(|e| e.to_string())?;
-    let rows: Vec<(String, String, String, i64, Option<i64>, String, Option<String>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>)> = stmt
+    let rows: Vec<(Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>)> = stmt
         .query_map([turn_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?))
         })
@@ -142,8 +142,13 @@ pub fn turn_detail(db: Option<&String>, turn_id: &str) -> Result<(), String> {
     if !rows.is_empty() {
         println!("model attempts:");
         for (started, provider, model, attempts, dur, status, err, http, retry_after, input, cached, ttft) in &rows {
+            let provider = provider.as_deref().unwrap_or("-");
+            let model = model.as_deref().unwrap_or("-");
+            let status = status.as_deref().unwrap_or("-");
+            let attempts = attempts.unwrap_or(0);
             let mut line = format!(
-                "  {started}  {provider}/{model}  {status} x{attempts}  {}",
+                "  {}  {provider}/{model}  {status} x{attempts}  {}",
+                started.as_deref().unwrap_or("-"),
                 dur.map(|v| fmt_ms(v as f64)).unwrap_or_else(|| "-".into())
             );
             if let Some(e) = err {
@@ -269,8 +274,8 @@ pub fn slow_models(db: Option<&String>, limit: u32) -> Result<(), String> {
     for r in &rows {
         println!(
             "{:<14} {:<20} {:>6} {:>7} {:>9} {:>9} {:>10} {:>12}",
-            trunc(&r.provider, 14),
-            trunc(&r.model, 20),
+            trunc(r.provider.as_deref().unwrap_or("-"), 14),
+            trunc(r.model.as_deref().unwrap_or("-"), 20),
             r.calls,
             r.errors,
             fmt_ms(r.avg_ms),
@@ -320,8 +325,8 @@ pub fn cache(db: Option<&String>) -> Result<(), String> {
         total_cached += r.cached_input_tokens;
         println!(
             "{:<14} {:<20} {:>6} {:>14} {:>14} {:>12} {:>10}",
-            trunc(&r.provider, 14),
-            trunc(&r.model, 20),
+            trunc(r.provider.as_deref().unwrap_or("-"), 14),
+            trunc(r.model.as_deref().unwrap_or("-"), 20),
             r.calls,
             r.input_tokens,
             r.cached_input_tokens,

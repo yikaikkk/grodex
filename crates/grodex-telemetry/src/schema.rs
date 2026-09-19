@@ -321,6 +321,15 @@ const VIEWS_DDL: &str = r#"
         SELECT 'indeterminate_tool', session_id, call_id, prepared_at, tool_name
           FROM tool_executions WHERE status = 'indeterminate';
 
+        -- Rows born from a Finished event with no preceding Started event:
+        -- provider/model/wire_protocol stay NULL, which used to crash the
+        -- observability drill-down. Empty means all attempts have full
+        -- provider/model provenance.
+        CREATE VIEW IF NOT EXISTS v_model_attempt_integrity AS
+        SELECT attempt_id, session_id, turn_id, step_id, started_at
+          FROM model_attempts
+         WHERE provider IS NULL OR model IS NULL;
+
         COMMIT;
         "#;
 

@@ -184,9 +184,9 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                   </thead>
                   <tbody>
                     {models.map((m) => (
-                      <tr key={`${m.provider}/${m.model}`} className="border-t border-hairline-2">
+                      <tr key={`${m.provider ?? '—'}/${m.model ?? '—'}`} className="border-t border-hairline-2">
                         <td className="px-3 py-1.5 font-mono text-primary">
-                          {m.provider}/{m.model}
+                          {m.provider ?? '—'}/{m.model ?? '—'}
                         </td>
                         <td className="text-right px-3 py-1.5">{m.calls}</td>
                         <td className={`text-right px-3 py-1.5 ${m.errors > 0 ? 'text-red-dark' : ''}`}>{m.errors}</td>
@@ -219,9 +219,9 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                   </thead>
                   <tbody>
                     {cache.map((c) => (
-                      <tr key={`${c.provider}/${c.model}`} className="border-t border-hairline-2">
+                      <tr key={`${c.provider ?? '—'}/${c.model ?? '—'}`} className="border-t border-hairline-2">
                         <td className="px-3 py-1.5 font-mono text-primary">
-                          {c.provider}/{c.model}
+                          {c.provider ?? '—'}/{c.model ?? '—'}
                         </td>
                         <td className="text-right px-3 py-1.5 font-mono">{fmtTokens(c.inputTokens)}</td>
                         <td className="text-right px-3 py-1.5 font-mono">{fmtTokens(c.cachedInputTokens)}</td>
@@ -321,7 +321,7 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                               {t.attempts.map((a, i) => (
                                 <tr key={i} className="border-t border-hairline-2">
                                   <td className="px-2 py-1 font-mono text-primary">
-                                    {a.provider}/{a.model}
+                                    {a.provider ?? '—'}/{a.model ?? '—'}
                                   </td>
                                   <td className="text-right px-2 py-1 font-mono">{fmtMs(a.firstTokenMs)}</td>
                                   <td className="text-right px-2 py-1 font-mono">{fmtMs(a.durationMs)}</td>

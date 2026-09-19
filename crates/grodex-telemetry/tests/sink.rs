@@ -377,7 +377,8 @@ fn views_exist_and_cache_stats_works() {
     let conn = rusqlite::Connection::open(&path).unwrap();
     // All six views are queryable.
     for view in ["v_session_timeline", "v_turn_summary", "v_tool_lifecycle",
-                 "v_model_usage", "v_cache_stats", "v_recovery_anomalies"] {
+                 "v_model_usage", "v_cache_stats", "v_recovery_anomalies",
+                 "v_model_attempt_integrity"] {
         let n: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {view}"), [], |r| r.get(0))
             .unwrap_or_else(|e| panic!("view {view} failed: {e}"));
@@ -386,7 +387,7 @@ fn views_exist_and_cache_stats_works() {
     let stats = grodex_telemetry::cache_stats(&conn).unwrap();
     assert_eq!(stats.len(), 1);
     let s = &stats[0];
-    assert_eq!(s.model, "m1");
+    assert_eq!(s.model.as_deref(), Some("m1"));
     assert!((s.cache_hit_rate.unwrap() - 0.25).abs() < 1e-9);
     // TTFT recorded on the attempt row.
     let ttft: i64 = conn

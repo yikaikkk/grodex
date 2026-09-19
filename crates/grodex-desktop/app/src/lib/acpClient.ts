@@ -1113,8 +1113,8 @@ export async function runMemoryMaintenance(): Promise<MaintenanceReport> {
 // ── Observability (telemetry) ────────────────────────────────────────────
 
 export interface ModelAgg {
-  provider: string;
-  model: string;
+  provider: string | null;
+  model: string | null;
   calls: number;
   errors: number;
   avgMs: number;
@@ -1126,8 +1126,8 @@ export interface ModelAgg {
 }
 
 export interface CacheStats {
-  provider: string;
-  model: string;
+  provider: string | null;
+  model: string | null;
   calls: number;
   inputTokens: number;
   cachedInputTokens: number;
@@ -1148,8 +1148,8 @@ export interface TelemetryOverview {
 }
 
 export interface TurnModelAttempt {
-  provider: string;
-  model: string;
+  provider: string | null;
+  model: string | null;
   attempts: number | null;
   status: string | null;
   errorClass: string | null;

@@ -1497,6 +1497,24 @@ impl TurnCoordinator {
                             ToolChoice::Auto,
                             true,
                         );
+                        // Telemetry: the original attempt's Finished event already
+                        // flipped that row to status='error', so the retry's
+                        // Finished event would miss the running-row UPDATE and
+                        // insert a provider/model-less row. Emit a fresh Started
+                        // event so the retry gets its own populated row.
+                        if let Some(ref writer) = self.rollout {
+                            let _ = writer
+                                .write_model_attempt_started(
+                                    turn_ctx.turn_id,
+                                    step_id,
+                                    StepGeneration::new(step_gen),
+                                    &retry_request.request_id,
+                                    &turn_ctx.model_binding.provider_id,
+                                    &turn_ctx.model_binding.model_id,
+                                    &format!("{:?}", turn_ctx.model_binding.wire_protocol),
+                                )
+                                .await;
+                        }
                         let retry_outcome = match stream_tx {
                             Some(ref tx) => self.sampler.sample_streaming(&turn_ctx.model_binding, &retry_request, tx.clone()).await,
                             None => self.sampler.sample(&turn_ctx.model_binding, &retry_request).await,
@@ -1623,6 +1641,24 @@ impl TurnCoordinator {
                 ToolChoice::None,
                 false,
             );
+            // Telemetry: mirror the normal step path. `write_model_attempt_started`
+            // is the sole producer of provider/model/wire_protocol; without it the
+            // projected row is born from the Finished event alone and those columns
+            // stay NULL — which the observability drill-down reads as non-nullable
+            // Strings and rejects.
+            if let Some(ref writer) = self.rollout {
+                let _ = writer
+                    .write_model_attempt_started(
+                        turn_ctx.turn_id,
+                        wrap_request.step_id,
+                        StepGeneration::new(step_gen),
+                        &wrap_request.request_id,
+                        &turn_ctx.model_binding.provider_id,
+                        &turn_ctx.model_binding.model_id,
+                        &format!("{:?}", turn_ctx.model_binding.wire_protocol),
+                    )
+                    .await;
+            }
             let wrap_outcome = match stream_tx {
                 Some(ref tx) => {
                     self.sampler
