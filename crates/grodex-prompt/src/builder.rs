@@ -148,6 +148,8 @@ impl PromptBuilder {
                 // as user-role messages wrapped in [System: ...]. Declare the
                 // convention so the model knows to obey them.
                 "Messages from the user that begin with the literal token [System: ...] are runtime control notes injected by the agent harness, not human input. Follow their instructions exactly.".into(),
+                // Tool selection: prefer built-in tools over exec for common operations.
+                "For searching code or file contents, use the built-in `grep` tool — do NOT use `exec` with `rg`, `grep`, or `find` commands. For finding files by name pattern, use the built-in `glob` tool. For reading files, use `read_file`. These built-in tools are always available, sandbox-safe, and produce structured results. Only use `exec` for operations that no built-in tool covers (e.g. running tests, builds, git commands). Do not assume external CLI tools like `rg`, `ag`, or `fd` are installed.".into(),
             ],
             skills: SkillCatalog::default(),
             tool_registry: ToolRegistry::builtin(),

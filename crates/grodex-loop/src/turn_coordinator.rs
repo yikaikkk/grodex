@@ -2634,7 +2634,26 @@ async fn execute_single_tool(
             };
             match output {
                 Ok(mut output) => {
-                    tracing::info!("tool executed successfully");
+                    // Detect tool-level errors: exec returns Rust Ok even when
+                    // the child exits with a non-zero code (e.g. 127 = command
+                    // not found). The exit_code is embedded in the JSON output.
+                    // Without this check, is_error stays false, the tool error
+                    // metric counts it as success, and the failure output may
+                    // be saved as non-error Evidence.
+                    let is_error = output
+                        .get("exit_code")
+                        .and_then(|v| v.as_i64())
+                        .map(|code| code != 0)
+                        .unwrap_or(false);
+                    if is_error {
+                        tracing::warn!(
+                            tool = %name,
+                            exit_code = ?output.get("exit_code"),
+                            "tool returned non-zero exit code — marking as error"
+                        );
+                    } else {
+                        tracing::info!("tool executed successfully");
+                    }
                     // Diff capture: strip the applied-change delta out of the
                     // tool result BEFORE the output reaches the model, so the
                     // model never sees the old/new file contents. The delta is
@@ -2673,7 +2692,7 @@ async fn execute_single_tool(
                     ContextItem::ToolResult {
                         call_id,
                         content,
-                        is_error: false,
+                        is_error,
                         duration_ms: None,
                     }
                 }
