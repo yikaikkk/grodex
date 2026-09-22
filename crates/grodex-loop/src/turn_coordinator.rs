@@ -2636,20 +2636,28 @@ async fn execute_single_tool(
                 Ok(mut output) => {
                     // Detect tool-level errors: exec returns Rust Ok even when
                     // the child exits with a non-zero code (e.g. 127 = command
-                    // not found). The exit_code is embedded in the JSON output.
-                    // Without this check, is_error stays false, the tool error
-                    // metric counts it as success, and the failure output may
-                    // be saved as non-error Evidence.
-                    let is_error = output
+                    // not found) OR times out. The exit_code/timed_out fields
+                    // are embedded in the JSON output. Without this check,
+                    // is_error stays false (a timeout has exit_code=null which
+                    // the old `as_i64() != 0` path mapped to false), the tool
+                    // error metric counts it as success, and the failure output
+                    // may be saved as non-error Evidence.
+                    let timed_out = output
+                        .get("timed_out")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let nonzero_exit = output
                         .get("exit_code")
                         .and_then(|v| v.as_i64())
                         .map(|code| code != 0)
                         .unwrap_or(false);
+                    let is_error = nonzero_exit || timed_out;
                     if is_error {
                         tracing::warn!(
                             tool = %name,
                             exit_code = ?output.get("exit_code"),
-                            "tool returned non-zero exit code — marking as error"
+                            timed_out,
+                            "tool returned error status — marking as error"
                         );
                     } else {
                         tracing::info!("tool executed successfully");

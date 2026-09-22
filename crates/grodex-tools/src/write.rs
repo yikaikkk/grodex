@@ -26,8 +26,19 @@ pub struct WriteFileArgs {
     pub content: String,
     /// Optional: SHA-256 hash of the file content at read time.
     /// If provided and the file has changed since, the write is rejected.
+    /// Kept for legacy callers; prefer `expected_observation_id` which also
+    /// proves the caller actually read the WHOLE file (not just a fragment).
     #[serde(default)]
     pub expected_hash: Option<String>,
+    /// Opaque capability token from a prior `read_file` with `coverage=full`.
+    /// When overwriting an existing file (`append=false` and the file exists),
+    /// providing this proves the caller saw the full current contents before
+    /// replacing them; the store verifies Full coverage + hash match. A
+    /// partial observation is rejected. Without this, overwrite is still
+    /// accepted (legacy compat) but logs a warning — will become a hard
+    /// refusal in a later batch.
+    #[serde(default)]
+    pub expected_observation_id: Option<String>,
     /// T6 大内容写入模式：当为 true 时，以追加方式写入而非整文件覆盖。
     /// 用于分块构建大文件（每块 ≤ WRITE_HARD_CAP_BYTES），避免一次性
     /// 重新生成整文件内容。追加模式下 `expected_hash` 校验的是追加前
@@ -69,7 +80,7 @@ impl Tool for WriteFileTool {
         ToolMetadata {
             name: "write_file".into(),
             display_name: "Write File".into(),
-            description: "Create or overwrite a file with the given content. Supports append mode for chunked large-file writes.".into(),
+            description: "Create or overwrite a file. Creating a new file is always allowed. Overwriting an existing file should pass `expected_observation_id` from a prior `read_file` with `coverage=full` — partial observations are rejected. For local replacements prefer `edit_file`. Supports append mode for chunked large-file writes.".into(),
             concurrency_class: ConcurrencyClass::Serial,
             side_effect_class: SideEffectClass::NonIdempotent,
             default_policy: grodex_core::policy::PolicyDecision::Ask,
@@ -82,7 +93,8 @@ impl Tool for WriteFileTool {
             "properties": {
                 "path": {"type": "string", "description": "Path to the file to write"},
                 "content": {"type": "string", "description": "Content to write to the file (max 16MB per call; use append=true for larger files)"},
-                "expected_hash": {"type": "string", "description": "SHA-256 from the last read; refuse the write if the file changed since then"},
+                "expected_hash": {"type": "string", "description": "Legacy SHA-256 stale fence. Prefer expected_observation_id, which also proves the caller read the whole file."},
+                "expected_observation_id": {"type": "string", "description": "Opaque token from a prior read_file with coverage=full. Required to authorize overwrite of an existing file (append=false); partial observations are rejected. Creating a new file does not need this."},
                 "append": {"type": "boolean", "description": "Append to the file instead of overwriting. Use for chunked large-file construction (each chunk ≤ 16MB)."}
             },
             "required": ["path", "content"]
@@ -139,6 +151,30 @@ impl ToolRuntime for WriteFileTool {
             } else {
                 None
             };
+
+            // Observation fence (whole-file overwrite protection). When the
+            // caller provides expected_observation_id, the store verifies
+            // Full coverage + current hash match before authorizing the
+            // overwrite. A partial observation (offset/range/truncated read)
+            // is refused — the caller must re-read the whole file. Without
+            // an observation the overwrite is still accepted (legacy compat)
+            // but logs a warning; this will become a hard refusal later.
+            // Creating a new file does not need an observation.
+            if file_existed && !args.append {
+                if let Some(ref obs_id) = args.expected_observation_id {
+                    let store = crate::file_observation::FileObservationStore::global();
+                    if let Err(e) = store.verify_full(obs_id, std::path::Path::new(&args.path)) {
+                        return Err(GrodexError::ToolExecution(format!(
+                            "observation fence refused: {e}"
+                        )));
+                    }
+                } else {
+                    tracing::warn!(
+                        path = %args.path,
+                        "write_file overwrite without expected_observation_id — legacy compat, will become a hard refusal"
+                    );
+                }
+            }
 
             // File version fence (applies to both overwrite and append:
             // in append mode it guards the *existing* pre-append content).
@@ -379,6 +415,43 @@ impl BuiltInTool for WriteFileTool {
                 diagnostics: vec![],
             };
             return Ok(envelope);
+        }
+
+        // Observation fence (envelope path). Mirror the ToolRuntime path:
+        // overwriting an existing file with append=false requires a Full
+        // observation when expected_observation_id is provided. Without
+        // one we accept (legacy compat) but warn.
+        if prepared.file_existed && !prepared.args.append {
+            if let Some(ref obs_id) = prepared.args.expected_observation_id {
+                let store = crate::file_observation::FileObservationStore::global();
+                if let Err(e) = store.verify_full(obs_id, std::path::Path::new(&prepared.args.path)) {
+                    let envelope = ToolResultEnvelope {
+                        tool_call_id: String::new(),
+                        operation_id: None,
+                        capability_id: Some("write_file".into()),
+                        contract_version: 1,
+                        status: ToolStatus::ToolError,
+                        summary: format!("observation fence refused: {e}"),
+                        model_content: vec![ModelContent::Text(format!(
+                            "tool `write_file` refused: {} — re-read the whole file before overwriting",
+                            e
+                        ))],
+                        structured_data: BTreeMap::new(),
+                        artifacts: vec![],
+                        changed_resources: vec![],
+                        truncation: TruncationInfo::default(),
+                        wall_time: start.elapsed(),
+                        retryability: Retryability::StaleResource,
+                        diagnostics: vec![],
+                    };
+                    return Ok(envelope);
+                }
+            } else {
+                tracing::warn!(
+                    path = %prepared.args.path,
+                    "write_file (envelope) overwrite without expected_observation_id — legacy compat"
+                );
+            }
         }
 
         let before_hash_for_changed = prepared.before_hash.clone();

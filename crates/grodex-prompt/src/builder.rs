@@ -150,6 +150,8 @@ impl PromptBuilder {
                 "Messages from the user that begin with the literal token [System: ...] are runtime control notes injected by the agent harness, not human input. Follow their instructions exactly.".into(),
                 // Tool selection: prefer built-in tools over exec for common operations.
                 "For searching code or file contents, use the built-in `grep` tool — do NOT use `exec` with `rg`, `grep`, or `find` commands. For finding files by name pattern, use the built-in `glob` tool. For reading files, use `read_file`. These built-in tools are always available, sandbox-safe, and produce structured results. Only use `exec` for operations that no built-in tool covers (e.g. running tests, builds, git commands). Do not assume external CLI tools like `rg`, `ag`, or `fd` are installed.".into(),
+                // Verification: do not treat empty git diff or grep output as proof.
+                "Search output is partial evidence. Never reconstruct or overwrite an existing file from grep output alone — a few matched lines are not the file's full contents. Do not treat an empty `git diff` as proof that a file is unchanged: before relying on it, verify the repository root and that the target file is tracked by git. For untracked, ignored, or newly-created files, verify state with `read_file` content/hash or with the write tool's before/after hashes. Prefer `edit_file` for local replacements; use whole-file overwrite only after a complete `read_file` of the entire file.".into(),
             ],
             skills: SkillCatalog::default(),
             tool_registry: ToolRegistry::builtin(),

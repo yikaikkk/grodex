@@ -78,6 +78,19 @@ pub struct ReadFileOutput {
     /// 仅 single-range / hashline 模式有意义；multi-range 模式始终为 `None`。
     #[serde(default)]
     pub next_offset: Option<usize>,
+    /// Opaque capability token proving this read observed the file. Write
+    /// tools (`apply_patch modify`, `write_file` overwrite of an existing
+    /// file) require a `Full` observation before authorizing whole-file
+    /// replace. `None` only when the read failed before the observation
+    /// could be recorded.
+    #[serde(default)]
+    pub observation_id: Option<String>,
+    /// Coverage class for the observation: `"full"` means the entire file
+    /// was returned untruncated and authorizes whole-file overwrite;
+    /// `"partial"` means a range/offset/truncated read and does NOT
+    /// authorize whole-file overwrite (only local edit fences).
+    #[serde(default)]
+    pub coverage: Option<String>,
 }
 
 pub struct ReadFileTool;
@@ -145,6 +158,15 @@ impl Tool for ReadFileTool {
                 "next_offset": {
                     "type": "integer",
                     "description": "When truncated=true, the next page's start line (1-indexed). Use as offset in the next read_file call."
+                },
+                "observation_id": {
+                    "type": "string",
+                    "description": "Opaque capability token proving this read observed the file. Pass it as `expected_observation_id` to `apply_patch modify` or `write_file` when overwriting an existing file. Only `coverage=full` observations authorize whole-file overwrite; partial reads (offset/limit/truncated) cannot."
+                },
+                "coverage": {
+                    "type": "string",
+                    "enum": ["full", "partial"],
+                    "description": "`full` = entire file returned untruncated (authorizes whole-file overwrite); `partial` = range/offset/truncated read (does NOT authorize whole-file overwrite)."
                 }
             }
         })
@@ -273,6 +295,39 @@ impl ToolRuntime for ReadFileTool {
             None
         };
 
+            // Observation store: issue a capability token proving this read
+            // observed the file at this hash. Coverage is `Full` only when
+            // the entire file was returned untruncated AND no explicit
+            // range/offset/limit/max_bytes was requested. Any narrowing or
+            // truncation produces `Partial`, which write tools reject for
+            // whole-file overwrite (but edit_file still accepts as a stale
+            // fence).
+            let coverage = if truncated
+                || args.offset.is_some()
+                || args.limit.is_some()
+                || args.max_bytes.is_some()
+                || args.ranges.is_some()
+            {
+                crate::file_observation::ReadCoverage::Partial
+            } else {
+                crate::file_observation::ReadCoverage::Full
+            };
+            let store = crate::file_observation::FileObservationStore::global();
+            let observation_id = store.issue(crate::file_observation::FileObservation {
+                observation_id: String::new(),
+                canonical_resource_id: snapshot.canonical_resource_id.clone(),
+                content_hash: content_hash.clone(),
+                size: file_size,
+                mtime_secs: snapshot.mtime_secs,
+                coverage,
+                issued_at: std::time::SystemTime::now(),
+                session_id: None,
+            });
+            let coverage_str = match coverage {
+                crate::file_observation::ReadCoverage::Full => "full",
+                crate::file_observation::ReadCoverage::Partial => "partial",
+            };
+
             let result = ReadFileOutput {
                 path: args.path,
                 content: final_output,
@@ -284,6 +339,8 @@ impl ToolRuntime for ReadFileTool {
                 snapshot: Some(snapshot),
                 render_format: render_format.to_string(),
                 next_offset,
+                observation_id: Some(observation_id),
+                coverage: Some(coverage_str.into()),
             };
 
             Ok(result)
@@ -726,6 +783,35 @@ impl BuiltInTool for ReadFileTool {
             None
         };
 
+        // Issue an observation (envelope path) so write tools can fence
+        // whole-file overwrites. Same Full/Partial rule as the ToolRuntime
+        // path.
+        let coverage = if truncated
+            || prepared.args.offset.is_some()
+            || prepared.args.limit.is_some()
+            || prepared.args.max_bytes.is_some()
+            || prepared.args.ranges.is_some()
+        {
+            crate::file_observation::ReadCoverage::Partial
+        } else {
+            crate::file_observation::ReadCoverage::Full
+        };
+        let store = crate::file_observation::FileObservationStore::global();
+        let observation_id = store.issue(crate::file_observation::FileObservation {
+            observation_id: String::new(),
+            canonical_resource_id: prepared.snapshot.canonical_resource_id.clone(),
+            content_hash: prepared.content_hash.clone(),
+            size: prepared.file_size_bytes,
+            mtime_secs: prepared.snapshot.mtime_secs,
+            coverage,
+            issued_at: std::time::SystemTime::now(),
+            session_id: None,
+        });
+        let coverage_str = match coverage {
+            crate::file_observation::ReadCoverage::Full => "full",
+            crate::file_observation::ReadCoverage::Partial => "partial",
+        };
+
         let result = ReadFileOutput {
             path: prepared.args.path.clone(),
             content: output.clone(),
@@ -737,6 +823,8 @@ impl BuiltInTool for ReadFileTool {
             snapshot: Some(prepared.snapshot.clone()),
             render_format: render_format.to_string(),
             next_offset,
+            observation_id: Some(observation_id),
+            coverage: Some(coverage_str.into()),
         };
 
         let output_serialized = serde_json::to_string(&result).ok();

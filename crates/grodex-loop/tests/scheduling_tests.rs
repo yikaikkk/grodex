@@ -101,8 +101,8 @@ async fn model_order_commit_survives_random_completion() {
         tokio::spawn(async move {
             let result = runtime.execute(args, OperationId::new()).await;
             let item = match result {
-                Ok(output) => ContextItem::ToolResult { call_id, content: output.to_string(), is_error: false },
-                Err(e) => ContextItem::ToolResult { call_id, content: format!("Error: {e}"), is_error: true },
+                Ok(output) => ContextItem::ToolResult { call_id, content: output.to_string(), is_error: false, duration_ms: None },
+                Err(e) => ContextItem::ToolResult { call_id, content: format!("Error: {e}"), is_error: true, duration_ms: None },
             };
             let _ = tx.send((idx, item));
         });
@@ -148,7 +148,7 @@ async fn tool_result_pairing_preserved_under_random_order() {
     let mut transcript = Vec::new();
     for (_, call_id) in &results {
         transcript.push(ContextItem::ToolCall { call_id: *call_id, name: "test".into(), arguments: serde_json::json!({}) });
-        transcript.push(ContextItem::ToolResult { call_id: *call_id, content: "done".into(), is_error: false });
+        transcript.push(ContextItem::ToolResult { call_id: *call_id, content: "done".into(), is_error: false, duration_ms: None });
     }
 
     for i in (0..transcript.len()).step_by(2) {

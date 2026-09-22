@@ -29,9 +29,25 @@ pub enum PatchOperation {
     /// Create a new file with content.
     #[serde(rename = "create")]
     Create { path: String, content: String },
-    /// Overwrite an existing file.
+    /// Overwrite (replace the entire contents of) an existing file.
+    ///
+    /// This is a WHOLE-FILE REPLACE, not a local edit — it discards every
+    /// byte the model did not include in `content`. To authorize the
+    /// overwrite, the caller MUST pass `expected_observation_id` from a
+    /// prior `read_file` that returned `coverage=full` for this path; a
+    /// partial observation (offset/limit/truncated) is rejected. Without
+    /// an observation the call is currently still accepted (legacy
+    /// compat) but logs a warning — this will become a hard refusal in a
+    /// later batch. For local replacements, prefer `edit_file`.
     #[serde(rename = "modify")]
-    Modify { path: String, content: String },
+    Modify {
+        path: String,
+        content: String,
+        /// Opaque capability token from a prior `read_file` with
+        /// `coverage=full`. Strongly recommended; will become required.
+        #[serde(default)]
+        expected_observation_id: Option<String>,
+    },
     /// Delete a file.
     #[serde(rename = "delete")]
     Delete { path: String },
@@ -69,7 +85,7 @@ impl Tool for ApplyPatchTool {
         ToolMetadata {
             name: "apply_patch".into(),
             display_name: "Apply Patch".into(),
-            description: "Apply structured file operations: create, modify, delete, or rename files. Supports multiple operations in a single call.".into(),
+            description: "Apply structured file operations: create, modify (whole-file replace), delete, or rename files. Supports multiple operations in a single call. For `modify` (overwrite an existing file), pass `expected_observation_id` from a prior `read_file` with `coverage=full`; partial observations are rejected. For local replacements, prefer `edit_file`.".into(),
             concurrency_class: ConcurrencyClass::Serial,
             side_effect_class: SideEffectClass::NonIdempotent,
             default_policy: grodex_core::policy::PolicyDecision::Ask,
@@ -86,7 +102,7 @@ impl Tool for ApplyPatchTool {
                         "type": "object",
                         "oneOf": [
                             {"properties": {"action": {"const": "create"}, "path": {"type": "string"}, "content": {"type": "string"}}, "required": ["action", "path", "content"]},
-                            {"properties": {"action": {"const": "modify"}, "path": {"type": "string"}, "content": {"type": "string"}}, "required": ["action", "path", "content"]},
+                            {"properties": {"action": {"const": "modify"}, "path": {"type": "string"}, "content": {"type": "string"}, "expected_observation_id": {"type": "string", "description": "Opaque token from a prior read_file with coverage=full; authorizes whole-file overwrite. Partial observations are rejected."}}, "required": ["action", "path", "content"]},
                             {"properties": {"action": {"const": "delete"}, "path": {"type": "string"}}, "required": ["action", "path"]},
                             {"properties": {"action": {"const": "rename"}, "old_path": {"type": "string"}, "new_path": {"type": "string"}}, "required": ["action", "old_path", "new_path"]}
                         ]
@@ -143,10 +159,52 @@ impl ToolRuntime for ApplyPatchTool {
                     }
                     Err(e) => PatchOpResult { action: "create".into(), path: path.clone(), success: false, error: Some(e) },
                 },
-                PatchOperation::Modify { path, content } => {
+                PatchOperation::Modify { path, content, expected_observation_id } => {
                     if !Path::new(path).exists() {
                         PatchOpResult { action: "modify".into(), path: path.clone(), success: false, error: Some("file does not exist".into()) }
+                    } else if let Some(obs_id) = expected_observation_id {
+                        // Observation fence: verify the capability token
+                        // authorizes whole-file overwrite (Full coverage +
+                        // current hash matches the recorded one). A stale
+                        // or partial observation refuses the write.
+                        let store = crate::file_observation::FileObservationStore::global();
+                        match store.verify_full(obs_id, Path::new(path)) {
+                            Ok(_) => {
+                                let before = std::fs::read_to_string(path)
+                                    .ok()
+                                    .and_then(|s| crate::common::captured_content(&s));
+                                match txn.modify(path, content) {
+                                    Ok(()) => {
+                                        changed.push(ChangedResource {
+                                            resource_id: patch_rid(path),
+                                            display_path: PathBuf::from(path),
+                                            change_type: ChangeType::Updated,
+                                            before_hash: None,
+                                            after_hash: None,
+                                            before_content: before,
+                                            after_content: crate::common::captured_content(content),
+                                        });
+                                        PatchOpResult { action: "modify".into(), path: path.clone(), success: true, error: None }
+                                    }
+                                    Err(e) => PatchOpResult { action: "modify".into(), path: path.clone(), success: false, error: Some(e) },
+                                }
+                            }
+                            Err(e) => PatchOpResult {
+                                action: "modify".into(),
+                                path: path.clone(),
+                                success: false,
+                                error: Some(format!("observation fence refused: {e}")),
+                            },
+                        }
                     } else {
+                        // Legacy compat: no observation_id. Accept with a
+                        // warning — this will become a hard refusal in a
+                        // later batch. Models should pass
+                        // expected_observation_id from a full read_file.
+                        tracing::warn!(
+                            path = %path,
+                            "apply_patch modify without expected_observation_id — legacy compat, will become a hard refusal"
+                        );
                         let before = std::fs::read_to_string(path)
                             .ok()
                             .and_then(|s| crate::common::captured_content(&s));
@@ -387,7 +445,7 @@ impl BuiltInTool for ApplyPatchTool {
                         None,
                     )
                 }
-                PatchOperation::Modify { path, content } => {
+                PatchOperation::Modify { path, content, expected_observation_id } => {
                     let canonical = crate::fsutil::canonicalize(Path::new(path));
                     let rid = format!("fs://{}", canonical.display());
                     let before = if Path::new(path).exists() {
@@ -409,6 +467,34 @@ impl BuiltInTool for ApplyPatchTool {
                         file_version_fences.push((rid.clone(), None));
                         continue;
                     };
+                    // Observation fence (prepare-time precheck). The real
+                    // authority check happens in execute (TOCTOU fence),
+                    // but we surface a bad observation early here so the
+                    // envelope can return a ToolError before touching fs.
+                    if let Some(obs_id) = expected_observation_id {
+                        let store = crate::file_observation::FileObservationStore::global();
+                        if let Err(e) = store.verify_full(obs_id, Path::new(path)) {
+                            prepare_errors.push(Some(format!(
+                                "modify observation fence refused: {e}"
+                            )));
+                            per_op_stale.push(None);
+                            file_version_fences.push((rid.clone(), before.clone()));
+                            // Still push a patch_file so execute can iterate
+                            // in lockstep; the prepare_error short-circuits.
+                            patch_files.push(common::PatchFile {
+                                source_resource_id: None,
+                                target_resource_id: rid.clone(),
+                                operation: common::PatchOperation::Update,
+                                expected_version_before: before.clone(),
+                                after_hash: sha256_str(content.as_bytes()),
+                                hunks: vec![],
+                                target_display_path: PathBuf::from(path),
+                            });
+                            plan_hash_input.extend_from_slice(b"modify");
+                            plan_hash_input.extend_from_slice(rid.as_bytes());
+                            continue;
+                        }
+                    }
                     let after = sha256_str(content.as_bytes());
                     plan_hash_input.extend_from_slice(b"modify");
                     plan_hash_input.extend_from_slice(rid.as_bytes());
@@ -599,28 +685,63 @@ impl BuiltInTool for ApplyPatchTool {
                         Err(e) => ("create", path.clone(), false, Some(e)),
                     }
                 }
-                PatchOperation::Modify { path, content } => {
+                PatchOperation::Modify { path, content, expected_observation_id } => {
                     if !Path::new(path).exists() {
                         ("modify", path.clone(), false, Some("file does not exist".into()))
                     } else {
-                        let actual_current = std::fs::read(path).ok().map(|b| sha256_str(&b));
-                        if actual_current != patch_file.expected_version_before {
-                            ("modify", path.clone(), false, Some("file changed since prepare (stale)".into()))
-                        } else {
-                            match txn.modify(path, content) {
-                                Ok(()) => {
-                                    changed_resources.push(ChangedResource {
-                                        resource_id: patch_file.target_resource_id.clone(),
-                                        display_path: patch_file.target_display_path.clone(),
-                                        change_type: ChangeType::Updated,
-                                        before_hash,
-                                        after_hash: after_hash_for_changed,
-                                        before_content: None,
-                                        after_content: None,
-                                    });
-                                    ("modify", path.clone(), true, None)
+                        // Observation fence (execute-time TOCTOU). prepare
+                        // already prechecked, but we re-verify here because
+                        // the prepare→execute gap may have been long enough
+                        // for the file to change. When an observation_id is
+                        // present it MUST verify Full + hash match.
+                        if let Some(obs_id) = expected_observation_id {
+                            let store = crate::file_observation::FileObservationStore::global();
+                            if let Err(e) = store.verify_full(obs_id, Path::new(path)) {
+                                ("modify", path.clone(), false, Some(format!("observation fence refused: {e}")))
+                            } else {
+                                match txn.modify(path, content) {
+                                    Ok(()) => {
+                                        changed_resources.push(ChangedResource {
+                                            resource_id: patch_file.target_resource_id.clone(),
+                                            display_path: patch_file.target_display_path.clone(),
+                                            change_type: ChangeType::Updated,
+                                            before_hash,
+                                            after_hash: after_hash_for_changed,
+                                            before_content: None,
+                                            after_content: None,
+                                        });
+                                        ("modify", path.clone(), true, None)
+                                    }
+                                    Err(e) => ("modify", path.clone(), false, Some(e)),
                                 }
-                                Err(e) => ("modify", path.clone(), false, Some(e)),
+                            }
+                        } else {
+                            // Legacy compat: no observation_id. The
+                            // prepare-time hash fence (expected_version_before)
+                            // still catches stale writes.
+                            tracing::warn!(
+                                path = %path,
+                                "apply_patch modify (envelope) without expected_observation_id — legacy compat"
+                            );
+                            let actual_current = std::fs::read(path).ok().map(|b| sha256_str(&b));
+                            if actual_current != patch_file.expected_version_before {
+                                ("modify", path.clone(), false, Some("file changed since prepare (stale)".into()))
+                            } else {
+                                match txn.modify(path, content) {
+                                    Ok(()) => {
+                                        changed_resources.push(ChangedResource {
+                                            resource_id: patch_file.target_resource_id.clone(),
+                                            display_path: patch_file.target_display_path.clone(),
+                                            change_type: ChangeType::Updated,
+                                            before_hash,
+                                            after_hash: after_hash_for_changed,
+                                            before_content: None,
+                                            after_content: None,
+                                        });
+                                        ("modify", path.clone(), true, None)
+                                    }
+                                    Err(e) => ("modify", path.clone(), false, Some(e)),
+                                }
                             }
                         }
                     }

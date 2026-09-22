@@ -1,6 +1,7 @@
 //! ToolRegistry — collects all built-in tools into a single registry.
 
 use crate::edit::EditTool;
+use crate::file_observation::FileObservationStore;
 use crate::glob_tool::GlobTool;
 use crate::grep::GrepTool;
 use crate::load_skill::LoadSkillTool;
@@ -13,21 +14,30 @@ use crate::write::WriteFileTool;
 use grodex_core::tool::Tool;
 use grodex_core::tool::ToolMetadata;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A registry of available tools, keyed by tool name.
 pub struct ToolRegistry {
     tools: HashMap<String, ToolMetadata>,
     /// Shared process manager for Exec + ProcessIo coordination.
     pub process_manager: ProcessManager,
+    /// Shared file-observation store — ReadFileTool signs observations here,
+    /// WriteFileTool / ApplyPatchTool verify them before authorizing
+    /// whole-file overwrite. Cloned cheaply (Arc); tools that were not
+    /// handed a per-session store fall back to `FileObservationStore::global()`
+    /// which is the same instance.
+    pub observation_store: Arc<FileObservationStore>,
 }
 
 impl ToolRegistry {
     /// Create a new registry with all built-in tools.
     pub fn builtin() -> Self {
         let process_manager = ProcessManager::new();
+        let observation_store = FileObservationStore::global();
         let mut registry = Self {
             tools: HashMap::new(),
             process_manager: process_manager.clone(),
+            observation_store,
         };
 
         registry.register(ReadFileTool::new().metadata());

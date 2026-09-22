@@ -23,6 +23,7 @@ pub mod cancel;
 pub mod common;
 pub mod edit;
 pub mod exec;
+pub mod file_observation;
 pub mod glob_tool;
 pub mod grep;
 pub mod load_skill;
@@ -50,6 +51,7 @@ pub use common::{
 };
 pub use edit::EditTool;
 pub use exec::{ExecTool, ResourceLimits};
+pub use file_observation::{FileObservation, FileObservationStore, ReadCoverage, VerifyError, sha256_hex};
 pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
 pub use load_skill::{LoadSkillTool, SharedSkillCatalog};
