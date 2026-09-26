@@ -476,6 +476,22 @@ impl TurnCoordinator {
         // end of `run()`.
         let diff_tracker = Arc::new(std::sync::Mutex::new(grodex_tools::TurnDiffTracker::new()));
 
+        // Workspace snapshot (三层 diff 方案 Phase 2): capture the turn-base
+        // manifest so exec/external mutations are detectable at turn end.
+        // Fail-open: snapshot failure only downgrades diff completeness.
+        let exec_cwds: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let turn_base_snapshot = {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match grodex_tools::WorkspaceSnapshot::capture(&cwd, &[]) {
+                Ok(snap) => Some(snap),
+                Err(e) => {
+                    tracing::debug!(target: "grodex_diff", error = %e, "turn-base snapshot capture failed (diff degrades to tool-delta only)");
+                    None
+                }
+            }
+        };
+
         // ── Approval notification forwarder ───────────────────────────
         // Drains `approval_rx` (fed by `PermissionManager::check()` when
         // policy says `Ask`) and pushes `StreamFragment::ApprovalRequested`
@@ -1107,6 +1123,22 @@ impl TurnCoordinator {
                         // `execute_single_tool` writes `ToolCallApproved`
                         // and `ToolExecutionStarted` at the correct point
                         // (AFTER permission clears, BEFORE the side effect).
+                        // Track exec cwds for snapshot attribution (exec vs
+                        // user_external in the reconciler).
+                        if name == "exec" {
+                            if let Ok(mut cwds) = exec_cwds.lock() {
+                                let cwd = args
+                                    .get("cwd")
+                                    .and_then(|v| v.as_str())
+                                    .map(std::path::PathBuf::from)
+                                    .unwrap_or_else(|| {
+                                        std::env::current_dir().unwrap_or_default()
+                                    });
+                                if !cwds.contains(&cwd) {
+                                    cwds.push(cwd);
+                                }
+                            }
+                        }
                         let exec_ctx = ToolExecCtx {
                             turn_id: turn_ctx.turn_id,
                             step_id,
@@ -1390,6 +1422,7 @@ impl TurnCoordinator {
                                     usage: Some(response.usage.clone()),
                                     steps_exhausted: false,
                                     termination_reason: "journal_failure",
+                                    change_set: None,
                                     metrics: TurnMetricsSummary {
                                         duration_ms: turn_started.elapsed().as_millis() as u64,
                                         steps: metrics.steps,
@@ -1748,6 +1781,32 @@ impl TurnCoordinator {
             "final_answer"
         };
 
+        // ── Workspace snapshot diff (reconciler): catch exec/external ──
+        let turn_change_set: Option<grodex_tools::TurnChangeSet> = {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match (
+                &turn_base_snapshot,
+                grodex_tools::WorkspaceSnapshot::capture(&cwd, &[]),
+            ) {
+                (Some(base), Ok(current)) => {
+                    let changes = current.diff_against(base);
+                    let exec_cwds = exec_cwds.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let net_changes = diff_tracker
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .net_changes()
+                        .unwrap_or_default();
+                    Some(grodex_tools::reconcile(
+                        &net_changes,
+                        &changes,
+                        &cwd,
+                        &exec_cwds,
+                    ))
+                }
+                _ => None,
+            }
+        };
+
         // ── Diff: aggregate + persist the turn's net file changes ──────
         // The full diff body goes to the content-addressed blob store; the
         // journal only records a `DiffAvailable` summary (diff_id + stats).
@@ -1755,13 +1814,13 @@ impl TurnCoordinator {
         // a reliable `DiffAvailable` event (NOT the stream, which is aborted
         // the moment `run()` returns and could drop a last-chance fragment).
         let mut diff: Option<DiffSummary> = None;
-        let net = {
+        let (net, diff_completeness) = {
             let guard = diff_tracker.lock().unwrap_or_else(|e| e.into_inner());
-            guard.net_changes()
+            (guard.net_changes(), guard.completeness())
         };
         if let Some(changes) = net {
             if !changes.is_empty() {
-                let doc = grodex_tools::DiffDocument::from_net_changes(&changes);
+                let doc = grodex_tools::DiffDocument::from_net_changes_with(diff_completeness, &changes);
                 if let Some(store) = self.blob_store.as_ref() {
                     let (blob_ref, _hash) = store
                         .store_owned(
@@ -1775,8 +1834,12 @@ impl TurnCoordinator {
                         .await;
                     let paths: Vec<String> =
                         doc.files.iter().map(|f| f.path.clone()).collect();
+                    // Persistence status: journal write failure must be
+                    // visible — the UI should know the diff may not survive
+                    // a crash, instead of silently reporting a full diff.
+                    let mut persistence = "persisted".to_string();
                     if let Some(ref writer) = self.rollout {
-                        let _ = writer
+                        match writer
                             .write_diff_available(
                                 turn_ctx.turn_id,
                                 &blob_ref.blob_id,
@@ -1785,7 +1848,19 @@ impl TurnCoordinator {
                                 doc.removed_lines,
                                 &paths,
                             )
-                            .await;
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                persistence = "persist_failed".into();
+                                tracing::error!(
+                                    target: "grodex_diff",
+                                    diff_id = %blob_ref.blob_id,
+                                    error = %e,
+                                    "DiffAvailable journal write failed - diff won't survive a crash"
+                                );
+                            }
+                        }
                     }
                     diff = Some(DiffSummary {
                         diff_id: blob_ref.blob_id,
@@ -1793,6 +1868,8 @@ impl TurnCoordinator {
                         added_lines: doc.added_lines,
                         removed_lines: doc.removed_lines,
                         paths,
+                        completeness: format!("{:?}", doc.completeness),
+                        persistence,
                     });
                 }
             }
@@ -1804,6 +1881,7 @@ impl TurnCoordinator {
             usage,
             steps_exhausted,
             termination_reason,
+            change_set: turn_change_set,
             metrics: TurnMetricsSummary {
                 steps: metrics.steps,
                 model_calls: metrics.model_calls,

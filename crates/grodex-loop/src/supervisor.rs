@@ -210,6 +210,9 @@ pub struct SessionSupervisor {
     /// to the new session's journal as a `ContextRestored` event at startup
     /// so a second crash does not lose the recovered history.
     recovered_context: Option<Vec<grodex_core::context::ContextItem>>,
+    /// Task 级累计变化集（三层 diff 方案 Phase 3）：每轮 TurnOutcome
+    /// 的 change_set 并入，供 UI 展示「任务累计变化」。
+    task_change_set: grodex_tools::TaskChangeSet,
     /// SessionStarted/ContextRestored 是否已写入 journal（惰性：首轮对话才写，
     /// 空会话不在磁盘留任何 journal 内容）。
     session_start_written: bool,
@@ -315,6 +318,7 @@ impl SessionSupervisor {
             completion_tx,
             writer,
             recovered_context,
+            task_change_set: grodex_tools::TaskChangeSet::new(),
             session_start_written: false,
             recovered_context_pending: false,
             memory,
@@ -1701,6 +1705,11 @@ impl SessionSupervisor {
             })
             .await;
 
+        // Task 级累计变化集（三层 diff 方案 Phase 3）。
+        if let Some(cs) = &completion.outcome.change_set {
+            self.task_change_set.absorb(cs);
+        }
+
         // Write TurnCompleted rollout event with the structured
         // termination reason + aggregate counters (telemetry projection).
         if let Some(ref writer) = self.writer {
@@ -2491,6 +2500,11 @@ impl SessionSupervisor {
         {
             tracing::warn!("heal_interrupted_tool_calls: TurnCompleted write failed: {e}");
         }
+    }
+
+    /// 任务级累计变化集快照（前端/遥测查询用）。
+    pub fn task_change_set(&self) -> &grodex_tools::TaskChangeSet {
+        &self.task_change_set
     }
 
     async fn shutdown(&mut self) {

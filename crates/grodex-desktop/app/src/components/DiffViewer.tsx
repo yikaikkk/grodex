@@ -172,6 +172,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({ isOpen, onClose, diffId 
 
   const files = payload?.files ?? [];
   const currentFile = files[activeFileIdx];
+  const isPartial = payload?.completeness === 'Partial';
 
   // Compute diff lines for the current file (memoised per file).
   // MUST be called before any early return to satisfy React's rules of hooks.
@@ -261,6 +262,24 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({ isOpen, onClose, diffId 
             <X className="w-5 h-5" />
           </button>
         </div>
+
+        {/* Completeness banner — 第三十七轮 diff 可信度 */}
+        {isPartial && (
+          <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-[11px] text-amber-800 flex items-center gap-2">
+            <span>⚠️ 本轮包含非精确工具（如 exec），已知变更如下，但可能存在未观测到的文件修改。</span>
+          </div>
+        )}
+        {(payload?.warnings?.length ?? 0) > 0 &&
+          payload!.warnings
+            .filter((w) => !isPartial || !w.startsWith('An inexact tool'))
+            .map((w, i) => (
+              <div
+                key={i}
+                className="px-4 py-2 bg-well border-b border-hairline text-[11px] text-secondary"
+              >
+                {w}
+              </div>
+            ))}
 
         {/* File tabs */}
         {files.length > 0 && (

@@ -74,6 +74,8 @@ pub struct SessionRuntime {
     /// resume path runs `recover_from_journal` on it after the rollout
     /// writer is rebound so unfinished sub-agent tasks are re-registered.
     pub subagent_recovery: Option<Arc<tokio::sync::Mutex<grodex_loop::durable_subagent::DurableSubAgentSupervisor>>>,
+    /// Shared blob store (diff lazy-load / tool-result offload / artifacts).
+    pub blob_store: Option<Arc<grodex_tools::ManagedBlobStore<grodex_tools::FileBlobStore>>>,
     /// Config hot-reload fs backend (Doc 18 §11): kept alive for the
     /// session so `notify` keeps feeding the ConfigWatcher pipeline.
     pub config_fs_backend: Option<grodex_config::FsConfigBackend>,
@@ -668,7 +670,7 @@ impl SessionRuntimeBuilder {
             .with_permission_arc(permission_mgr.clone(), approval_rx)
             .with_sandbox(sandbox)
             .with_context_window(model_config.context_window)
-            .with_blob_store(blob_store);
+            .with_blob_store(blob_store.clone());
         if let Some(pct) = compaction_threshold_pct {
             coordinator = coordinator.with_compaction_threshold(pct);
         }
@@ -1397,6 +1399,7 @@ impl SessionRuntimeBuilder {
             supervisor_task,
             config_fs_backend,
             subagent_recovery,
+            blob_store: Some(blob_store.clone()),
         })
     }
 }

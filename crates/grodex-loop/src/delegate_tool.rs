@@ -67,6 +67,9 @@ pub struct DelegateArgs {
 /// Lower bound for a sub-agent turn budget: a zero-turn loop can never
 /// produce a result.
 pub const SUBAGENT_MIN_TURNS: u32 = 1;
+/// 剩余轮次达到该阈值时注入 synthesis 提示（软截止）：
+/// "停止新的宽泛搜索，开始汇总"。
+pub const SUBAGENT_SYNTHESIS_REMAINING: u32 = 3;
 /// Upper bound for a sub-agent turn budget (config default or per-call).
 /// Prevents a single sub-agent from running away over a long session;
 /// raise here deliberately if deeper agentic searches are needed.
@@ -94,11 +97,24 @@ pub fn resolve_effective_max_turns(
     }
 }
 
+/// 预算状态——主 Agent 据此决定续派/缩范围/接管（Doc 12 预算管理）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SubagentBudgetStatus {
+    pub max_turns: u32,
+    pub used_turns: u32,
+    pub remaining_turns: u32,
+    /// true = 耗尽预算仍无完整报告（partial report 由 message 承载）。
+    pub exhausted_without_full_report: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateOutput {
     pub agent_id: String,
     pub task_id: String,
     pub message: String,
+    /// 预算状态。旧路径（无 actor）为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<SubagentBudgetStatus>,
 }
 
 /// Sub-agent runtime backing the delegate_task tool.
@@ -289,7 +305,7 @@ impl Tool for DelegateTool {
         ToolMetadata {
             name: "delegate_task".into(),
             display_name: "Delegate Task".into(),
-            description: "Spawn a sub-agent to handle a task independently. The sub-agent runs with a fresh context and returns results when complete.".into(),
+            description: "Spawn a sub-agent to handle a bounded task independently. You (the caller) are responsible for estimating task complexity BEFORE delegating and choosing a sufficient max_turns budget - do not use a fixed default mechanically. Before delegating: split broad investigations into independently completable tasks; define a narrow scope with explicit questions; prefer multiple focused sub-agents over one broad task. Write the task instruction with: scope and exclusions, required findings, priority order, and a stop rule requiring a partial report if full completion is impossible. The sub-agent must fit its work into max_turns: it reserves its final turns for synthesis and returns the best available result even if incomplete. Hitting max_turns without a report is a delegation failure - you remain responsible for continuing from any partial result.".into(),
             concurrency_class: ConcurrencyClass::Parallel,
             side_effect_class: SideEffectClass::NonIdempotent,
             default_policy: grodex_core::policy::PolicyDecision::Ask,
@@ -302,7 +318,7 @@ impl Tool for DelegateTool {
             "properties": {
                 "task": {"type": "string", "description": "The task description for the sub-agent"},
                 "label": {"type": "string", "description": "Human-readable label for the sub-agent"},
-                "max_turns": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Optional per-call sampling-turn budget (one turn = one model sample). Defaults to the [subagent] max_turns config value."}
+                "max_turns": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Sampling-turn budget for this sub-agent (one turn = one model sample). Estimate from task breadth, repo size, number of questions, and reporting cost; ALWAYS reserve 2-3 turns for the final report. Suggested: 6-8 symbol/config lookup; 10-15 focused module investigation; 15-22 cross-layer review; 20-35 code changes with tests. For broader work, split into multiple delegations rather than only raising this."}
             },
             "required": ["task"]
         })
@@ -351,6 +367,7 @@ impl ToolRuntime for DelegateTool {
                     "[Subagent quota] {running_now} sub-agents are already running (cap {}). This one was NOT scheduled. Wait for a running sub-agent to finish, or do the subtask yourself.",
                     self.max_concurrent
                 ),
+                budget: None,
             }));
         }
         let spawned_so_far = self.spawned_total.load(Ordering::Relaxed);
@@ -362,6 +379,7 @@ impl ToolRuntime for DelegateTool {
                     "[Subagent quota] This session already spawned {spawned_so_far} sub-agents (cap {}); no more will be scheduled. Complete the remaining work yourself.",
                     self.max_total
                 ),
+                budget: None,
             }));
         }
 
@@ -390,6 +408,7 @@ impl ToolRuntime for DelegateTool {
 
         // ── 2. If a SamplingActor is available, actually run the
         //    sub-agent turn. Otherwise return a placeholder.
+        let mut budget_status: Option<SubagentBudgetStatus> = None;
         let message = if let (Some(actor), Some(cfg)) = (&self.actor, &self.model_config) {
             let task_id_str = task_id.to_string();
             self.running_count.fetch_add(1, Ordering::Relaxed);
@@ -441,18 +460,29 @@ impl ToolRuntime for DelegateTool {
             )
             .await;
             self.running_count.fetch_sub(1, Ordering::Relaxed);
-            let response: Result<String, String> = match ran {
-                Ok(r) => r,
+            let (response, used_turns): (Result<String, String>, u32) = match ran {
+                Ok(pair) => pair,
                 Err(_elapsed) => {
                     if let Some(c) = cancel_on_timeout {
                         c.cancel();
                     }
-                    Err(format!(
-                        "sub-agent exceeded {}s without producing a final result",
-                        turn_timeout.as_secs()
-                    ))
+                    (
+                        Err(format!(
+                            "sub-agent exceeded {}s without producing a final result",
+                            turn_timeout.as_secs()
+                        )),
+                        effective_max_turns,
+                    )
                 }
             };
+            // 预算状态（Doc 12）：主 Agent 据此决定续派/接管/缩范围。
+            budget_status = Some(SubagentBudgetStatus {
+                max_turns: effective_max_turns,
+                used_turns,
+                remaining_turns: effective_max_turns.saturating_sub(used_turns),
+                exhausted_without_full_report: response.is_err()
+                    || used_turns >= effective_max_turns,
+            });
             if let Some(link) = &child_link {
                 let ok = response.is_ok();
                 self.protocol_host
@@ -514,6 +544,7 @@ impl ToolRuntime for DelegateTool {
             agent_id: agent_id.to_string(),
             task_id: task_id.to_string(),
             message,
+            budget: budget_status,
         };
 
         serde_json::to_value(output)
@@ -546,7 +577,7 @@ async fn run_subagent_turn(
     permission: Option<Arc<Mutex<grodex_permission::PermissionManager>>>,
     mut controls: Option<&mut ChildControls>,
     mut on_step: impl FnMut(String),
-) -> Result<String, String> {
+) -> (Result<String, String>, u32) {
     use grodex_core::context::ContextItem;
     use grodex_core::id::{SessionId, StepId, TurnId};
     use grodex_provider::binding::ModelBinding;
@@ -596,7 +627,7 @@ async fn run_subagent_turn(
         // ── Turn-boundary controls (unified tree) ───────────────────
         if let Some(c) = controls.as_deref_mut() {
             if c.cancel.is_cancelled() {
-                return Err("interrupted by user (interrupt_agent)".into());
+                return (Err("interrupted by user (interrupt_agent)".into()), (turn + 1) as u32);
             }
             // Deliver parent messages queued via send_message: injected as
             // user-role items so the model sees them before the next sample.
@@ -610,6 +641,23 @@ async fn run_subagent_turn(
             }
         }
         on_step(format!("采样轮次 {}/{}", turn + 1, max_turns));
+
+        // ── 软截止 + 末轮硬禁用（Doc 12 预算管理） ──────────────────
+        // remaining 含本轮：`remaining == 1` 即最后一轮。
+        let remaining = max_turns as usize - turn;
+        let final_turn = remaining == 1;
+        if remaining as u32 == SUBAGENT_SYNTHESIS_REMAINING && !final_turn {
+            context.push(ContextItem::User {
+                content: "[System: You have 3 turns remaining. Enter synthesis mode now.                           Do not begin broad new investigations. Gather only evidence strictly                           necessary for the final report. You must return a final or partial                           report before the budget expires.]".into(),
+                message_id: None,
+            });
+        } else if final_turn {
+            context.push(ContextItem::User {
+                content: "[System: This is your FINAL turn. Do not call tools — tool use is                           disabled for this turn. Return the best available report now. If                           incomplete, include confirmed findings, evidence, unresolved items,                           and continuation instructions.]".into(),
+                message_id: None,
+            });
+        }
+
         let request = CanonicalModelRequest {
             request_id: format!("subagent-{}", StepId::new()),
             session_id: SessionId::new(),
@@ -619,15 +667,24 @@ async fn run_subagent_turn(
             prompt_snapshot_hash: Some(PromptSnapshot::capture(&context, &tool_specs).content_hash),
             instructions: vec![InstructionBlock {
                 role: InstructionRole::System,
-                content: "You are a sub-agent. Complete the task thoroughly. \
-                          You may use the provided tools to inspect resources. \
-                          ALWAYS end with a final textual deliverable — never stop \
-                          with only tool calls or silent reasoning.".into(),
+                content: format!(
+                    "You are a sub-agent with a budget of {max_turns} turns (one turn = one model sample). \
+                     Spend early turns on discovery and middle turns on verification. \
+                     When {synthesis_remaining} or fewer turns remain, enter synthesis mode: do NOT begin broad new investigations — gather only evidence strictly necessary for the final report. \
+                     Your final deliverable must include: a conclusion, confirmed findings with file paths and line numbers, unresolved items, and continuation hints. \
+                     Running out of turns without a report is a delegation failure — a partial report is ALWAYS better than nothing.",
+                    synthesis_remaining = SUBAGENT_SYNTHESIS_REMAINING,
+                ),
                 priority: 0,
             }],
             context_items: context.clone(),
-            tool_specs: tool_specs.clone(),
-            tool_choice: if tool_specs.is_empty() { ToolChoice::None } else { ToolChoice::Auto },
+            // 最后一轮结构性禁用工具：模型没有任何工具可调，只能输出报告。
+            tool_specs: if final_turn { Vec::new() } else { tool_specs.clone() },
+            tool_choice: if final_turn || tool_specs.is_empty() {
+                ToolChoice::None
+            } else {
+                ToolChoice::Auto
+            },
             parallel_tool_calls: false,
             reasoning_request: Some(grodex_provider::canonical_request::ReasoningRequest {
                 effort: None,
@@ -643,12 +700,12 @@ async fn run_subagent_turn(
         // the delegate (and the whole turn) until it returns / times out.
         let outcome = if let Some(c) = controls.as_deref_mut() {
             if c.cancel.is_cancelled() {
-                return Err("interrupted by user (stop)".into());
+                return (Err("interrupted by user (stop)".into()), (turn + 1) as u32);
             }
             let cancel = c.cancel.clone();
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    return Err("interrupted by user (stop)".into());
+                    return (Err("interrupted by user (stop)".into()), (turn + 1) as u32);
                 }
                 out = actor.sample(&binding, &request) => out,
             }
@@ -766,7 +823,7 @@ async fn run_subagent_turn(
         // ── Final answer ────────────────────────────────────────
         let text = response.assistant_text().unwrap_or_default().to_string();
         if !text.is_empty() {
-            return Ok(text);
+            return (Ok(text), (turn + 1) as u32);
         }
 
         // Reasoning-only output (thinking models): salvage the reasoning
@@ -781,7 +838,7 @@ async fn run_subagent_turn(
             .collect::<Vec<_>>()
             .join("\n");
         if !reasoning.is_empty() {
-            return Ok(format!("[sub-agent reasoning-only output]\n{reasoning}"));
+            return (Ok(format!("[sub-agent reasoning-only output]\n{reasoning}")), (turn + 1) as u32);
         }
 
         // Truly empty — nudge once and retry.
@@ -791,9 +848,62 @@ async fn run_subagent_turn(
         });
     }
 
-    Err(last_error.unwrap_or_else(|| {
-        format!("sub-agent hit the max turn cap ({max_turns}) without producing a final result")
-    }))
+    // ── 预算耗尽：强制总结采样（最后一次免费机会） ─────────────────
+    // 循环正常结束说明模型每一轮都在调工具（或输出为空）。给一次
+    // tool_choice=None 的总结机会，把已收集的证据变成 partial report，
+    // 而不是直接返回 "hit the max turn cap"。
+    if !context.is_empty() {
+        context.push(ContextItem::User {
+            content: "[System: The turn budget is exhausted. Tool use is disabled.                       Return the best available partial report NOW: confirmed findings,                       evidence, unresolved items, and continuation instructions.]".into(),
+            message_id: None,
+        });
+        let request = CanonicalModelRequest {
+            request_id: format!("subagent-final-{}", StepId::new()),
+            session_id: SessionId::new(),
+            turn_id: TurnId::new(),
+            step_id: StepId::new(),
+            model_binding_id: binding.binding_id.clone(),
+            prompt_snapshot_hash: Some(PromptSnapshot::capture(&context, &[]).content_hash),
+            instructions: vec![InstructionBlock {
+                role: InstructionRole::System,
+                content: "You are a sub-agent whose budget just ran out. Produce the best                           available partial report from the evidence already gathered. Never                           mention that you ran out of budget; just report findings, evidence,                           unresolved items, and continuation hints.".into(),
+                priority: 0,
+            }],
+            context_items: context.clone(),
+            tool_specs: Vec::new(),
+            tool_choice: ToolChoice::None,
+            parallel_tool_calls: false,
+            reasoning_request: Some(grodex_provider::canonical_request::ReasoningRequest {
+                effort: None,
+                summary: Some("auto".to_string()),
+            }),
+            response_format: None,
+            max_output_tokens: Some(SUBAGENT_MAX_OUTPUT_TOKENS),
+            provider_state_in: None,
+        };
+        let outcome = actor.sample(&binding, &request).await;
+        if let Some(resp) = outcome.response {
+            let text = resp.assistant_text().unwrap_or_default().to_string();
+            if !text.trim().is_empty() {
+                return (
+                    Ok(format!(
+                        "[partial report — turn budget exhausted ({max_turns} turns used)]\n{text}"
+                    )),
+                    max_turns,
+                );
+            }
+        }
+    }
+
+    // 强制总结也失败：带上已观测的工具摘要，主 Agent 至少知道查过什么。
+    (
+        Err(last_error.unwrap_or_else(|| {
+            format!(
+                "sub-agent hit the max turn cap ({max_turns}) without producing a final result"
+            )
+        })),
+        max_turns,
+    )
 }
 
 /// Write an oversized sub-agent report to a temp file and return a

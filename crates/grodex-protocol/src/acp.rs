@@ -495,6 +495,11 @@ pub enum UpdateContent {
         diff_id: String,
         format: String,
         files: Vec<DiffFilePayload>,
+        /// Complete | Partial — Partial 时前端渲染 "可能不完整" 横幅。
+        #[serde(default)]
+        completeness: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
     },
 }
 

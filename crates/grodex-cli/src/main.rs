@@ -32,7 +32,7 @@ use grodex_protocol::acp::{
 use grodex_protocol::{ClientFrame, ServerFrame};
 use grodex_rollout::store::{FileRolloutStore, RolloutStore};
 use grodex_sampler::{SamplingActor, SamplingClient, SamplingClientConfig};
-use grodex_tools::{ApplyPatchTool, EditTool, ExecTool, ReadFileTool, WriteFileTool};
+use grodex_tools::{BlobStore, ApplyPatchTool, EditTool, ExecTool, ReadFileTool, WriteFileTool};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 #[derive(clap::Subcommand, Debug)]
@@ -285,6 +285,25 @@ enum PromptCommand {
 /// writer 在退出时 flush。级别受 `RUST_LOG` 控制;未设置时 grodex
 /// crate 默认 info(grodex_loop=debug 以便看到 step/turn 细节),第三方
 /// crate(hyper/reqwest/tokio)默认 warn 以降噪。
+/// Process-global blob store handle (shared by the session runtime and
+/// the ACP `GetDiff` lazy-load path).
+static BLOB_STORE: std::sync::OnceLock<Option<Arc<grodex_tools::ManagedBlobStore<grodex_tools::FileBlobStore>>>> =
+    std::sync::OnceLock::new();
+
+fn runtime_blob_store() -> Arc<grodex_tools::ManagedBlobStore<grodex_tools::FileBlobStore>> {
+    // Lazily fall back to a default store so GetDiff never hard-crashes
+    // when called before/atypical session setup.
+    BLOB_STORE
+        .get()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_else(|| {
+            Arc::new(grodex_tools::ManagedBlobStore::new(
+                grodex_tools::FileBlobStore::new(std::env::temp_dir().join("grodex-blobs")),
+                std::time::Duration::from_secs(30),
+            ))
+        })
+}
+
 /// Process-global telemetry sink handle. Initialised once in `main`;
 /// read by `build_session_parts` wherever a session runtime is built.
 static TELEMETRY: std::sync::OnceLock<Option<Arc<dyn grodex_telemetry::TelemetrySink>>> =
@@ -1287,37 +1306,47 @@ async fn route_command(
                 .await
         }
         AcpCommand::GetDiff(gd) => {
-            // Lazy-load the diff body from the temp blob store and emit it.
-            let path = std::env::temp_dir()
-                .join("grodex-blobs")
-                .join(format!("{}.blob", gd.diff_id));
-            match tokio::fs::read(&path).await {
-                Err(_) => Err(format!("diff blob not found: {}", gd.diff_id)),
-                Ok(bytes) => match serde_json::from_slice::<grodex_tools::DiffDocument>(&bytes) {
-                    Err(e) => Err(format!("diff blob parse failed: {e}")),
-                    Ok(doc) => {
-                        let files = doc
-                            .files
-                            .into_iter()
-                            .map(|f| grodex_protocol::acp::DiffFilePayload {
-                                path: f.path,
-                                change_type: f.change_type,
-                                before_content: f.before_content,
-                                after_content: f.after_content,
-                            })
-                            .collect();
-                        let content = UpdateContent::DiffPayload {
-                            diff_id: gd.diff_id.clone(),
-                            format: doc.format,
-                            files,
-                        };
-                        let env = EventEnvelope::wrap(*seq, session_id, content);
-                        match write_frame(stdout, &ServerFrame::Event(env)).await {
-                            Ok(()) => Ok(()),
-                            Err(e) => Err(e.to_string()),
-                        }
-                    }
-                },
+            // Lazy-load the diff body through the shared BlobStore (NOT a
+            // hand-built temp path — the store owns the on-disk layout and
+            // session release semantics).
+            let blob_store = runtime_blob_store();
+            let result: Result<(Vec<u8>, grodex_tools::DiffDocument), String> = async {
+                let bytes = grodex_tools::BlobStore::retrieve(&*blob_store, &gd.diff_id)
+                    .await
+                    .ok_or_else(|| format!("diff blob not found: {}", gd.diff_id))?;
+                let doc: grodex_tools::DiffDocument = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("diff blob parse failed: {e}"))?;
+                Ok((bytes, doc))
+            }
+            .await;
+            let (bytes, doc) = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    write_protocol_error(stdout, command_id, "ROUTE_FAILED", e).await;
+                    return (ack_bucket_out, rebind_session_id);
+                }
+            };
+            let files = doc
+                .files
+                .into_iter()
+                .map(|f| grodex_protocol::acp::DiffFilePayload {
+                    path: f.path,
+                    change_type: f.change_type,
+                    before_content: f.before_content,
+                    after_content: f.after_content,
+                })
+                .collect();
+            let content = UpdateContent::DiffPayload {
+                diff_id: gd.diff_id.clone(),
+                format: doc.format,
+                files,
+                completeness: format!("{:?}", doc.completeness),
+                warnings: doc.warnings,
+            };
+            let env = EventEnvelope::wrap(*seq, session_id, content);
+            match write_frame(stdout, &ServerFrame::Event(env)).await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.to_string()),
             }
         }
     };

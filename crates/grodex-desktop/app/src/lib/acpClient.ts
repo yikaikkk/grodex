@@ -76,6 +76,9 @@ export interface DiffPayload {
   diff_id: string;
   format: string;
   files: DiffFilePayload[];
+  /** "Complete" | "Partial" — Partial 渲染 "可能不完整" 横幅。 */
+  completeness?: string;
+  warnings?: string[];
 }
 
 interface AcpSnapshotItem {

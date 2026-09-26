@@ -29,6 +29,9 @@ pub struct TurnOutcome {
     /// exhausted (a wrap-up summary was forced) instead of a natural
     /// model stop. Lets the supervisor surface a visible notice.
     pub steps_exhausted: bool,
+    /// Reconciled workspace changes for this turn (tool deltas ∪ snapshot
+    /// 检出)，带来源与置信度。`None` when snapshots unavailable.
+    pub change_set: Option<grodex_tools::TurnChangeSet>,
     /// Structured reason the turn reached its terminal state:
     /// `final_answer` | `repair_exhausted` | `step_budget_exhausted` |
     /// `cancelled` | `sampling_error` | `tool_error` | `journal_failure`
@@ -52,6 +55,14 @@ pub struct DiffSummary {
     pub added_lines: usize,
     pub removed_lines: usize,
     pub paths: Vec<String>,
+    /// 完整性：Complete = 全部来自精确工具 delta；Partial = 本轮出现过
+    /// inexact 工具（exec），已知变化已列出但可能存在未观测到的变更。
+    /// 前端据此渲染 "可能不完整" 横幅。
+    pub completeness: String,
+    /// 持久化状态：blob 已存、journal DiffAvailable 写入成功 → "persisted"；
+    /// journal 写失败 → "persist_failed"（UI 提示 diff 可能无法在崩溃后
+    /// 查回，而不是假装一切正常）。blob 存储失败时整个 diff 为 None。
+    pub persistence: String,
 }
 
 /// Turn-level aggregate counters — the journaled form of the

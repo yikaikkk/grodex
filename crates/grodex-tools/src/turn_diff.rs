@@ -16,13 +16,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{AppliedChangeDelta, ChangedResource, ChangeType};
 
+/// How trustworthy the turn diff is. The previous single `valid: bool`
+/// DISCARDED the whole diff on the first inexact delta (e.g. any `exec`) —
+/// a turn that edited 5 files then ran `cargo fmt` reported nothing.
+/// Now inexact deltas keep every precisely-known change and downgrade the
+/// completeness instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffCompleteness {
+    /// Every change came from exact tool deltas — the net diff is the
+    /// complete truth for the turn.
+    Complete,
+    /// At least one inexact delta (exec / external process) occurred:
+    /// known changes are listed, but unobserved mutations may exist.
+    Partial,
+    /// The tracker could not produce a meaningful diff at all.
+    Unavailable,
+}
+
 pub struct TurnDiffTracker {
     /// First-observed change per `resource_id` (the pre-turn baseline).
     baseline_by_path: HashMap<String, ChangedResource>,
     /// Latest change per `resource_id` (the post-turn current state).
     current_by_path: HashMap<String, ChangedResource>,
-    /// False once an inexact delta (e.g. arbitrary `exec`) invalidates us.
-    valid: bool,
+    /// Completeness of the net diff (see [`DiffCompleteness`]).
+    completeness: DiffCompleteness,
 }
 
 impl Default for TurnDiffTracker {
@@ -36,22 +53,29 @@ impl TurnDiffTracker {
         Self {
             baseline_by_path: HashMap::new(),
             current_by_path: HashMap::new(),
-            valid: true,
+            completeness: DiffCompleteness::Complete,
         }
     }
 
-    /// Whether the tracker can still produce a trustworthy net diff. An
-    /// arbitrary `exec` (which may mutate files outside the tracked tools)
-    /// flips this to false via [`apply`] with an inexact delta.
+    /// Whether the tracker can still produce a meaningful net diff. An
+    /// inexact delta downgrades to [`DiffCompleteness::Partial`] but the
+    /// known changes remain available (the old behavior discarded
+    /// everything).
     pub fn is_valid(&self) -> bool {
-        self.valid
+        self.completeness != DiffCompleteness::Unavailable
     }
 
-    /// Merge an applied delta. An inexact delta invalidates the whole tracker.
+    pub fn completeness(&self) -> DiffCompleteness {
+        self.completeness
+    }
+
+    /// Merge an applied delta. Inexact deltas keep their known changes and
+    /// downgrade completeness to Partial (previously: whole-diff discard).
     pub fn apply(&mut self, delta: &AppliedChangeDelta) {
         if !delta.exact {
-            self.valid = false;
-            return;
+            if self.completeness == DiffCompleteness::Complete {
+                self.completeness = DiffCompleteness::Partial;
+            }
         }
         for change in &delta.changes {
             self.baseline_by_path
@@ -62,12 +86,12 @@ impl TurnDiffTracker {
         }
     }
 
-    /// Compute the net baseline → current diff. Returns `None` when the
-    /// tracker was invalidated. Files whose content returned to the baseline
-    /// are dropped (no net change). Moves carry through as path-level changes
-    /// (their content is unchanged by definition).
+    /// Compute the net baseline → current diff. Returns `None` only when
+    /// the diff is genuinely unavailable. Files whose content returned to
+    /// the baseline are dropped (no net change). Moves carry through as
+    /// path-level changes (their content is unchanged by definition).
     pub fn net_changes(&self) -> Option<Vec<ChangedResource>> {
-        if !self.valid {
+        if !self.is_valid() {
             return None;
         }
         let mut out = Vec::new();
@@ -121,6 +145,13 @@ pub struct DiffDocument {
     pub changed_files: usize,
     pub added_lines: usize,
     pub removed_lines: usize,
+    /// How trustworthy this diff is (Complete / Partial). The frontend
+    /// renders an "incomplete — an exec ran this turn" banner for Partial.
+    pub completeness: DiffCompleteness,
+    /// Human-readable warnings (e.g. "inexact tool ran; unobserved
+    /// mutations may exist").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +163,17 @@ pub struct DiffFile {
 }
 
 pub const DIFF_MIME: &str = "application/vnd.grodex.diff+json";
+
+fn completeness_and_warnings(completeness: DiffCompleteness) -> (DiffCompleteness, Vec<String>) {
+    match completeness {
+        DiffCompleteness::Partial => (
+            completeness,
+            vec!["An inexact tool (e.g. exec) ran this turn - known changes are                   listed, but unobserved file mutations may exist."
+                .into()],
+        ),
+        other => (other, Vec::new()),
+    }
+}
 
 fn change_type_str(t: ChangeType) -> &'static str {
     match t {
@@ -148,6 +190,16 @@ impl DiffDocument {
     /// `added_lines`/`removed_lines` are an approximate line-count delta; the
     /// frontend renders the precise unified diff from before/after content.
     pub fn from_net_changes(changes: &[ChangedResource]) -> Self {
+        Self::from_net_changes_with(DiffCompleteness::Complete, changes)
+    }
+
+    /// As [`Self::from_net_changes`] with explicit completeness (the
+    /// tracker knows whether an inexact delta occurred — the change list
+    /// alone does not).
+    pub fn from_net_changes_with(
+        completeness: DiffCompleteness,
+        changes: &[ChangedResource],
+    ) -> Self {
         let mut files = Vec::with_capacity(changes.len());
         let mut added_lines = 0usize;
         let mut removed_lines = 0usize;
@@ -166,12 +218,15 @@ impl DiffDocument {
                 after_content: c.after_content.clone(),
             });
         }
+        let (completeness, warnings) = completeness_and_warnings(completeness);
         Self {
             format: DIFF_MIME.to_string(),
             changed_files: files.len(),
             added_lines,
             removed_lines,
             files,
+            completeness,
+            warnings,
         }
     }
 
@@ -252,19 +307,22 @@ mod tests {
     }
 
     #[test]
-    fn inexact_delta_invalidates() {
+    fn inexact_delta_downgrades_to_partial_keeps_changes() {
         let mut t = TurnDiffTracker::new();
         t.apply(&AppliedChangeDelta {
             changes: vec![ch("fs://a.rs", ChangeType::Updated, Some("one"), Some("two"))],
             exact: true,
         });
+        // R 修复：inexact delta 不再丢弃整个 diff——已知变化保留，完整性降级。
         t.apply(&AppliedChangeDelta {
             changes: vec![],
             exact: false,
         });
 
-        assert!(!t.is_valid());
-        assert!(t.net_changes().is_none());
+        assert_eq!(t.completeness(), DiffCompleteness::Partial);
+        let net = t.net_changes().expect("known changes survive");
+        assert_eq!(net.len(), 1, "exact change kept");
+        assert_eq!(net[0].after_content.as_deref(), Some("two"));
     }
 
     #[test]
