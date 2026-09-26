@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { X, RefreshCw, Activity, Gauge, Database, Stethoscope } from 'lucide-react';
 import * as acp from '../lib/acpClient';
 import { eventBus } from '../lib/eventBus';
@@ -95,14 +95,26 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
   const turns = detail?.turns ?? [];
 
   // Per-turn rolled-up figures (first attempt's TTFT + summed tokens).
-  const turnStats = turns.map((t) => {
-    const firstTtft = t.attempts.find((a) => a.firstTokenMs != null)?.firstTokenMs ?? null;
-    const input = t.attempts.reduce((s, a) => s + (a.inputTokens ?? 0), 0);
-    const output = t.attempts.reduce((s, a) => s + (a.outputTokens ?? 0), 0);
-    const cached = t.attempts.reduce((s, a) => s + (a.cachedInputTokens ?? 0), 0);
-    const cacheRate = input > 0 ? cached / input : null;
-    return { t, firstTtft, input, output, cached, cacheRate };
-  });
+  // useMemo: the panel re-renders on every App-level update (e.g. streaming
+  // rAF flushes); recomputing this O(turns x attempts) reduction each frame
+  // made opening the panel feel like a freeze on long sessions.
+  const turnStats = useMemo(
+    () =>
+      turns.map((t) => {
+        const firstTtft =
+          t.attempts.find((a) => a.firstTokenMs != null)?.firstTokenMs ?? null;
+        const input = t.attempts.reduce((s, a) => s + (a.inputTokens ?? 0), 0);
+        const output = t.attempts.reduce((s, a) => s + (a.outputTokens ?? 0), 0);
+        const cached = t.attempts.reduce((s, a) => s + (a.cachedInputTokens ?? 0), 0);
+        const cacheRate = input > 0 ? cached / input : null;
+        return { t, firstTtft, input, output, cached, cacheRate };
+      }),
+    [turns]
+  );
+
+  // 渐进渲染：长会话首帧只渲染 30 行，避免点击那一帧同步拼出整张表。
+  const [renderedTurns, setRenderedTurns] = useState(30);
+  const visibleTurnStats = turnStats.slice(0, renderedTurns);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
@@ -263,7 +275,7 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
               </div>
             ) : (
               <div className="space-y-1.5">
-                {turnStats.map(({ t, firstTtft, input, output, cached, cacheRate }) => (
+                {visibleTurnStats.map(({ t, firstTtft, input, output, cached, cacheRate }) => (
                   <details
                     key={t.turnId}
                     className="group rounded-xl bg-white border border-hairline open:shadow-sm"
@@ -350,6 +362,14 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
                     </div>
                   </details>
                 ))}
+        {turnStats.length > renderedTurns && (
+          <button
+            onClick={() => setRenderedTurns((v) => v + 50)}
+            className="mt-2 px-3 py-1.5 rounded-xl bg-well border border-hairline text-secondary hover:text-primary text-xs"
+          >
+            显示更多（已显示 {renderedTurns} / {turnStats.length} 轮）
+          </button>
+        )}
               </div>
             )}
           </section>

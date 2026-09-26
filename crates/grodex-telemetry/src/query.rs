@@ -104,13 +104,34 @@ pub fn sessions(conn: &Connection, limit: u32) -> Result<Vec<SessionRow>, rusqli
 }
 
 pub fn session_turns(conn: &Connection, session_id: &str) -> Result<Vec<TurnRow>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
+    session_turns_limited(conn, session_id, None)
+}
+
+/// Paginated variant: `limit` caps the returned rows (most recent turns
+/// first, returned in chronological order); `None` = unlimited. Keeps the
+/// query parameterized — the session id is bound, never interpolated.
+pub fn session_turns_limited(
+    conn: &Connection,
+    session_id: &str,
+    limit: Option<u32>,
+) -> Result<Vec<TurnRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!(
         r#"SELECT turn_id, session_id, started_at, finished_at, status,
                   termination_reason, steps, model_calls, tool_calls, retries, duration_ms
-           FROM turns WHERE session_id = ?1 ORDER BY started_at ASC"#,
-    )?;
-    let rows = stmt.query_map([session_id], map_turn)?;
-    rows.collect()
+           FROM turns WHERE session_id = ?1
+           ORDER BY started_at {}
+           LIMIT {}"#,
+        /* newest first when capping, chronological otherwise */
+        if limit.is_some() { "DESC" } else { "ASC" },
+        limit.map(|l| l.to_string()).unwrap_or_else(|| "-1".into())
+    ))?;
+    let mut rows = stmt
+        .query_map([session_id], map_turn)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if limit.is_some() {
+        rows.reverse(); // chronological order for the UI
+    }
+    Ok(rows)
 }
 
 pub fn turn(conn: &Connection, turn_id: &str) -> Result<Option<TurnRow>, rusqlite::Error> {

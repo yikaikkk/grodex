@@ -216,7 +216,7 @@ pub async fn telemetry_overview() -> Result<TelemetryOverview, String> {
 pub async fn telemetry_session(session_id: String) -> Result<SessionDetail, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<SessionDetail, String> {
         let conn = open_db()?;
-        let turns = query::session_turns(&conn, &session_id).map_err(|e| e.to_string())?;
+        let turns = query::session_turns_limited(&conn, &session_id, Some(200)).map_err(|e| e.to_string())?;
 
         // Session-scoped memory retrievals, bucketed by turn for the join below.
         let mut mem_by_turn: std::collections::HashMap<String, Vec<MemoryRetrievalDto>> =
