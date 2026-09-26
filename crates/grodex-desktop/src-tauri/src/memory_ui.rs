@@ -34,6 +34,8 @@ pub struct ConflictRow {
 pub struct MemoryOverview {
     pub units: Vec<MemoryRow>,
     pub conflicts: Vec<ConflictRow>,
+    /// true = 结果被 limit 截断（还有更多未显示）。
+    pub truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -65,40 +67,73 @@ fn ts(t: chrono::DateTime<chrono::Utc>) -> String {
     t.to_rfc3339()
 }
 
-/// List all memory units + conflict rows for the management panel.
+/// List memory units + conflict rows for the management panel.
+/// `query` filters by substring match on id/content (case-insensitive);
+/// `limit`/`offset` page the unit list (conflicts are always returned in
+/// full — they are few). Runs on the blocking pool: a large memory DB must
+/// not stall the command thread when the panel opens.
 #[tauri::command]
-pub fn list_memories() -> Result<MemoryOverview, String> {
-    let db = open_db()?;
-    let mut units = Vec::new();
-    for u in db
-        .list_all_memory_units()
-        .map_err(|e| format!("读取记忆失败: {e}"))?
-    {
-        units.push(MemoryRow {
-            id: u.id,
-            status: format!("{:?}", u.status).to_lowercase(),
-            kind: format!("{:?}", u.kind).to_lowercase(),
-            scope: format!("{:?}", u.scope).to_lowercase(),
-            content: u.content,
-            updated_at: ts(u.updated_at),
-            created_at: ts(u.created_at),
-        });
-    }
-    let mut conflicts = Vec::new();
-    for c in db
-        .list_all_conflicts()
-        .map_err(|e| format!("读取冲突失败: {e}"))?
-    {
-        conflicts.push(ConflictRow {
-            conflict_id: c.conflict_id,
-            left_memory_id: c.left_memory_id,
-            right_memory_id: c.right_memory_id,
-            relation: format!("{:?}", c.relation).to_lowercase(),
-            status: format!("{:?}", c.status).to_lowercase(),
-            reason: c.reason,
-        });
-    }
-    Ok(MemoryOverview { units, conflicts })
+pub async fn list_memories(
+    query: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<MemoryOverview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = open_db()?;
+        let needle = query.as_deref().map(|q| q.to_lowercase());
+        let limit = limit.unwrap_or(200).max(1) as usize;
+        let offset = offset.unwrap_or(0) as usize;
+
+        let mut units = Vec::new();
+        let mut skipped = 0usize;
+        let mut truncated = false;
+        for u in db
+            .list_all_memory_units()
+            .map_err(|e| format!("读取记忆失败: {e}"))?
+        {
+            // Filter before paging.
+            if let Some(q) = &needle {
+                let hay = format!("{} {}", u.id, u.content).to_lowercase();
+                if !hay.contains(q) {
+                    continue;
+                }
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if units.len() >= limit {
+                truncated = true;
+                break;
+            }
+            units.push(MemoryRow {
+                id: u.id,
+                status: format!("{:?}", u.status).to_lowercase(),
+                kind: format!("{:?}", u.kind).to_lowercase(),
+                scope: format!("{:?}", u.scope).to_lowercase(),
+                content: u.content,
+                updated_at: ts(u.updated_at),
+                created_at: ts(u.created_at),
+            });
+        }
+        let mut conflicts = Vec::new();
+        for c in db
+            .list_all_conflicts()
+            .map_err(|e| format!("读取冲突失败: {e}"))?
+        {
+            conflicts.push(ConflictRow {
+                conflict_id: c.conflict_id,
+                left_memory_id: c.left_memory_id,
+                right_memory_id: c.right_memory_id,
+                relation: format!("{:?}", c.relation).to_lowercase(),
+                status: format!("{:?}", c.status).to_lowercase(),
+                reason: c.reason,
+            });
+        }
+        Ok(MemoryOverview { units, conflicts, truncated })
+    })
+    .await
+    .map_err(|e| format!("memory task join error: {e}"))?
 }
 
 /// Soft-delete a memory unit (status → orphaned; excluded from retrieval).

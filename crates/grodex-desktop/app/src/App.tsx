@@ -58,7 +58,9 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [isMemoryOpen, setIsMemoryOpen] = useState<boolean>(false);
   const [isObservabilityOpen, setIsObservabilityOpen] = useState<boolean>(false);
-  const [lastDiffId, setLastDiffId] = useState<string | null>(null);
+  /** Per-session latest diff id — a global single value leaked the previous
+   * session's diff after switching. */
+  const [lastDiffIds, setLastDiffIds] = useState<Record<string, string>>({});
   const [isDiffOpen, setIsDiffOpen] = useState<boolean>(false);
   const [settings, setSettings] = useState<SettingsState>(makeDefaultSettings);
   // Bumped whenever the timeline for the ACTIVE session is (re)built from a
@@ -99,6 +101,18 @@ export default function App() {
   useEffect(() => {
     const unsubSessionState = eventBus.on('sessionStateChanged', (data: any) => {
       setIsRunning(data.isRunning ?? false);
+      // Turn boundary: finalize any sub-agent node stuck in a running state
+      // (a child that skipped its `finished` progress event would otherwise
+      // spin as running_tool forever).
+      if (data.status === 'completed' || data.status === 'error') {
+        setSubagents((prev) =>
+          prev.map((n) =>
+            n.status === 'running_tool' || n.status === 'thinking'
+              ? { ...n, status: n.status === 'running_tool' && data.status === 'completed' ? 'done' : 'interrupted' }
+              : n
+          )
+        );
+      }
       if (data.sessionId && data.status) {
         setSessions((prev) =>
           prev.map((s) =>
@@ -140,69 +154,85 @@ export default function App() {
       }));
     });
 
-    const unsubThinking = eventBus.on('thinkingDelta', (data: any) => {
+    // ── Delta coalescing (perf): TextDelta/ThoughtDelta can arrive at
+    // dozens-per-second during streaming. Each one previously triggered a
+    // full setTimelines + Timeline re-render. Deltas now land in a pending
+    // buffer and are flushed once per animation frame (fallback: 50ms
+    // timer). isStreaming=false (final) flushes immediately so completion
+    // UI is never delayed.
+    type DeltaData = {
+      id: string;
+      content: string;
+      isStreaming: boolean;
+      durationSec?: number;
+      timestamp?: string;
+    };
+    const pendingDeltas = new Map<string, { data: DeltaData; kind: 'thinking' | 'assistant' }>();
+    let flushScheduled = false;
+    const flushDeltas = () => {
+      flushScheduled = false;
+      if (pendingDeltas.size === 0) return;
+      const batch = [...pendingDeltas.values()];
+      pendingDeltas.clear();
       setTimelines((prev) => {
-        const list = prev[activeSessionId] || [];
-        const existingIdx = list.findIndex((it) => it.id === data.id);
-        if (existingIdx >= 0) {
-          const updated = [...list];
-          updated[existingIdx] = {
-            ...updated[existingIdx],
-            content: data.content,
-            isStreaming: data.isStreaming,
-            durationSec: data.durationSec,
-          } as any;
-          return { ...prev, [activeSessionId]: updated };
+        let list = prev[activeSessionId] || [];
+        for (const { data, kind } of batch) {
+          const idx = list.findIndex((it) => it.id === data.id);
+          const entry =
+            kind === 'thinking'
+              ? {
+                  id: data.id,
+                  type: 'thinking' as const,
+                  content: data.content,
+                  isStreaming: data.isStreaming,
+                  isCollapsed: false,
+                  durationSec: data.durationSec,
+                  timestamp: data.timestamp || new Date().toLocaleTimeString(),
+                }
+              : {
+                  id: data.id,
+                  type: 'assistant' as const,
+                  content: data.content,
+                  isStreaming: data.isStreaming,
+                  tokens: (data as any).tokens,
+                  durationSec: data.durationSec,
+                  timestamp: data.timestamp || new Date().toLocaleTimeString(),
+                };
+          if (idx >= 0) {
+            const updated = [...list];
+            updated[idx] = { ...(updated[idx] as any), ...entry };
+            list = updated;
+          } else {
+            list = [...list, entry];
+          }
         }
-        return {
-          ...prev,
-          [activeSessionId]: [
-            ...list,
-            {
-              id: data.id,
-              type: 'thinking',
-              content: data.content,
-              isStreaming: data.isStreaming,
-              isCollapsed: false,
-              durationSec: data.durationSec,
-              timestamp: new Date().toLocaleTimeString(),
-            },
-          ],
-        };
+        return { ...prev, [activeSessionId]: list };
       });
+    };
+    const scheduleFlush = (data: DeltaData, kind: 'thinking' | 'assistant') => {
+      pendingDeltas.set(data.id, { data, kind });
+      if (data.isStreaming) {
+        if (!flushScheduled) {
+          flushScheduled = true;
+          if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(flushDeltas);
+          } else {
+            setTimeout(flushDeltas, 50);
+          }
+        }
+      } else {
+        // Final delta: flush synchronously (rAF may be throttled in a
+        // hidden window and completion must never be delayed).
+        flushDeltas();
+      }
+    };
+
+    const unsubThinking = eventBus.on('thinkingDelta', (data: any) => {
+      scheduleFlush(data as DeltaData, 'thinking');
     });
 
     const unsubAssistantText = eventBus.on('assistantTextDelta', (data: any) => {
-      setTimelines((prev) => {
-        const list = prev[activeSessionId] || [];
-        const existingIdx = list.findIndex((it) => it.id === data.id);
-        if (existingIdx >= 0) {
-          const updated = [...list];
-          updated[existingIdx] = {
-            ...updated[existingIdx],
-            content: data.content,
-            isStreaming: data.isStreaming,
-            tokens: data.tokens,
-            durationSec: data.durationSec,
-          } as any;
-          return { ...prev, [activeSessionId]: updated };
-        }
-        return {
-          ...prev,
-          [activeSessionId]: [
-            ...list,
-            {
-              id: data.id,
-              type: 'assistant',
-              content: data.content,
-              isStreaming: data.isStreaming,
-              tokens: data.tokens,
-              durationSec: data.durationSec,
-              timestamp: data.timestamp || new Date().toLocaleTimeString(),
-            },
-          ],
-        };
-      });
+      scheduleFlush(data as DeltaData, 'assistant');
     });
 
     const unsubToolStarted = eventBus.on('toolStarted', (toolItem: ToolItem) => {
@@ -343,10 +373,17 @@ export default function App() {
     // A turn's net diff finalized — remember the latest diff id (do NOT
     // auto-open the viewer; the user opens it via the toolbar button).
     const unsubDiffAvailable = eventBus.on('diffAvailable', (payload: any) => {
-      if (payload?.diffId) setLastDiffId(payload.diffId);
+      // Route by the session the diff belongs to (acpClient already stamps
+      // realSid), so background sessions never clobber the active view.
+      const sid = payload?.sessionId || activeIdRef.current;
+      if (payload?.diffId && sid) {
+        setLastDiffIds((prev) => ({ ...prev, [sid]: payload.diffId }));
+      }
     });
 
     return () => {
+      // Flush pending deltas so nothing is lost on unmount.
+      flushDeltas();
       unsubSessionState();
       unsubUserMsg();
       unsubUserMsgFailed();
@@ -508,6 +545,10 @@ export default function App() {
     const cwd = target?.workspace || workspace;
     if (cwd) setWorkspace(cwd);
     setActiveSessionId(sessionId);
+    // Arm the switch gate BEFORE anything slow: in-flight events from the
+    // old agent are now dropped at the acpClient gate instead of landing in
+    // the new session's timeline.
+    acp.beginSessionSwitch();
     // ResumeSession needs a live agent process: spawn one for the session's
     // workspace if none is running yet (no-op if a process already exists).
     if (cwd) {
@@ -526,6 +567,18 @@ export default function App() {
   };
 
   const handleSendPrompt = async (text: string, mode: string = 'Auto') => {
+    // ── Mid-stream Steer: input while a turn is running redirects it ──
+    // The Composer already gates its own input; this covers the path where
+    // isRunning flipped after the composer opened.
+    if (isRunning && activeSessionId && acp.currentSessionId() === activeSessionId) {
+      try {
+        await acp.steer(activeSessionId, text);
+        showNotice(`已发送干预指令：${text.slice(0, 40)}`);
+      } catch (e: any) {
+        showNotice(`干预失败：${e?.message || e}`, 'error');
+      }
+      return;
+    }
     // No session yet → create one on the first real message only. Note:
     // `activeSessionId` state updates async, so AFTER prepare we must use the
     // freshly minted id from the client (not the stale closure value).
@@ -684,13 +737,17 @@ export default function App() {
   };
 
   const noopSteerAdopt = () => showNotice('此版本未提供干预建议');
-  const handleOpenDiff = useCallback(() => {
-    if (lastDiffId) {
-      setIsDiffOpen(true);
-    } else {
-      showNotice('当前会话还没有文件变更');
-    }
-  }, [lastDiffId]);
+  const handleOpenDiff = useCallback(
+    (diffId?: string) => {
+      const id = diffId || lastDiffIds[activeIdRef.current];
+      if (id) {
+        setIsDiffOpen(true);
+      } else {
+        showNotice('当前会话还没有文件变更');
+      }
+    },
+    [lastDiffIds]
+  );
 
   return (
     <div id="grodex-desktop-root" className="h-screen w-screen flex flex-col bg-canvas text-primary overflow-hidden font-sans antialiased">
@@ -975,7 +1032,7 @@ export default function App() {
       <DiffViewer
         isOpen={isDiffOpen}
         onClose={() => setIsDiffOpen(false)}
-        diffId={lastDiffId}
+        diffId={lastDiffIds[activeSessionId] ?? null}
       />
     </div>
   );

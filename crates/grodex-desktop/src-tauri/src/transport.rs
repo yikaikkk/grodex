@@ -105,6 +105,7 @@ pub fn run_agent_worker(
     // cross-workspace reuse: a session whose journal lives in project B must
     // never run tools/sandbox rooted in project A.
     let mut active_cwd: Option<PathBuf> = None;
+        let mut crash_reported = false;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(16)) {
@@ -206,6 +207,29 @@ pub fn run_agent_worker(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        // Crash visibility: a child that died mid-session (panic, OOM-kill,
+        // external kill) is detected HERE on the next tick instead of only
+        // when the next command fails. Notify the frontend once so the UI
+        // can stop spinning "running" and surface the failure.
+        if let Some(c) = client.as_mut() {
+            if !c.is_alive() && !crash_reported {
+                crash_reported = true;
+                emit_log(
+                    &app,
+                    "[agent] 进程意外退出（崩溃或被外部终止）— 请重新打开会话以重启".into(),
+                );
+                let envelope = grodex_protocol::acp::EventEnvelope::wrap(
+                    0,
+                    grodex_core::id::SessionId::new(),
+                    grodex_protocol::acp::UpdateContent::Error {
+                        message: "agent 进程意外退出，本会话已中断。请重新打开会话以重启。"
+                            .into(),
+                    },
+                );
+                let _ = app.emit("acp_event", &envelope);
+            }
         }
 
         // Drain whatever the agent produced since the last tick.

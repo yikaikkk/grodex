@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Terminal as TerminalIcon, Copy, Check } from 'lucide-react';
 import { ExecOutputLine } from '../types';
 
@@ -12,12 +12,24 @@ interface ExecTerminalProps {
 
 export const ExecTerminal: React.FC<ExecTerminalProps> = ({
   command,
-  cwd = '~/dev/grodex',
+  cwd,
   output = [],
   exitCode,
   isRunning = false,
 }) => {
   const [copied, setCopied] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  // Same race-free auto-follow as the timeline: only stick to the bottom
+  // when the view is LIVE at the bottom at effect time. Scrolling up to
+  // inspect earlier output pauses follow; scrolling back re-engages it.
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (!nearBottom) return;
+    el.scrollTop = el.scrollHeight;
+  }, [output]);
 
   const handleCopy = () => {
     const text = [
@@ -60,7 +72,7 @@ export const ExecTerminal: React.FC<ExecTerminalProps> = ({
         <div className="flex items-center gap-2 min-w-0">
           <TerminalIcon className="w-3.5 h-3.5 text-terminal-muted shrink-0" />
           <span className="text-terminal-line font-medium truncate">{command}</span>
-          <span className="text-terminal-muted text-[11px] hidden sm:inline shrink-0">目录: {cwd}</span>
+          <span className="text-terminal-muted text-[11px] hidden sm:inline shrink-0">目录: {cwd || '当前目录'}</span>
         </div>
         <div className="flex items-center gap-2">
           {exitCode !== undefined && (
@@ -92,7 +104,7 @@ export const ExecTerminal: React.FC<ExecTerminalProps> = ({
       </div>
 
       {/* Output Body */}
-      <div className="p-3.5 max-h-64 overflow-y-auto space-y-0.5 leading-relaxed">
+      <div ref={bodyRef} className="p-3.5 max-h-64 overflow-y-auto space-y-0.5 leading-relaxed">
         {output.length === 0 && isRunning && (
           <div className="text-terminal-muted italic flex items-center gap-2">
             <span className="inline-block w-2 h-3.5 bg-terminal-blue animate-cursor-blink rounded-xs" />

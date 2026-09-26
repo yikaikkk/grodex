@@ -433,10 +433,11 @@ function onEvent(envelope: AcpEnvelope) {
     expectReconcile = false;
     lastLeftSessionId = null;
     eventBus.emit('sessionReady', { from, to: realSid });
-  } else if (realSid !== wireSessionId) {
-    // Stale event from a different session (old agent / pre-switch tail) —
-    // drop it so it can't pollute the current session or claw the send
-    // target back to a prior session.
+  } else if (wireSessionId === '' || realSid !== wireSessionId) {
+    // Stale event from a different session (old agent / pre-switch tail),
+    // or a mid-session-switch in-flight event — drop it so it can't
+    // pollute the current session or claw the send target back to a prior
+    // session.
     return;
   }
 
@@ -600,12 +601,23 @@ function onEvent(envelope: AcpEnvelope) {
           tokensUsed: 0,
           durationSec: 0,
           logs: detail ? [detail] : [],
+          budget: null,
         };
         nodes.set(subId, node);
       } else {
         node.logs = [...(node.logs || []), detail].filter((l) => l.length > 0);
         if (phase === 'finished') {
           node.status = c.ok === false ? 'interrupted' : 'done';
+          // 预算状态（Doc 12）：随 Finished 帧从 Rust 层透出（snake_case 字段）。
+          const b = (c as any).budget;
+          if (b && typeof b.used_turns === 'number') {
+            node.budget = {
+              maxTurns: b.max_turns,
+              usedTurns: b.used_turns,
+              remainingTurns: b.remaining_turns,
+              exhaustedWithoutFullReport: !!b.exhausted_without_full_report,
+            };
+          }
         } else if (phase === 'step') {
           node.status = 'running_tool';
         }
@@ -618,6 +630,14 @@ function onEvent(envelope: AcpEnvelope) {
       finalizeAssistant();
       endThoughtBurst();
       activeTurn = false;
+      // Turn boundary: finalize sub-agent nodes still marked running (a
+      // child that never emitted `finished` would otherwise spin forever).
+      for (const node of nodes.values()) {
+        if (node.status === 'running_tool' || node.status === 'thinking') {
+          node.status = clientSessionId ? 'interrupted' : 'interrupted';
+        }
+        nodes.set(node.id, { ...node });
+      }
       eventBus.emit('sessionStateChanged', {
         status: 'completed',
         isRunning: false,
@@ -925,6 +945,31 @@ export async function ensureAgent(cwd: string): Promise<boolean> {
   return invoke<boolean>('ensure_agent', { cwd });
 }
 
+/**
+ * Mark the wire as mid-session-switch: called BEFORE the potentially
+ * slow `ensureAgent` so streaming events from the OLD agent process are
+ * dropped at the onEvent gate instead of being routed into the NEW
+ * session's timeline (whose activeSessionId has already been updated by
+ * the UI). Cleared by `resumeSession` when the new wire id is armed.
+ */
+export function beginSessionSwitch(): void {
+  wireSessionId = '';
+}
+
+/** Open/resume a historical session from the rollout root. */
+/** Steer the in-progress Turn: cancel the current turn and start a new one
+ * seeded with the steering text. Uses the ACP Steer frame. */
+export async function steer(sessionId: string, text: string): Promise<void> {
+  const cmd = {
+    type: 'Steer',
+    command_id: uid(),
+    expected_generation: currentGeneration(),
+    session_id: sessionId,
+    text,
+  };
+  await sendWire(cmd);
+}
+
 /** Open/resume a historical session from the rollout root. */
 export async function resumeSession(sessionId: string): Promise<void> {
   if (sessionId === clientSessionId) return;
@@ -1091,6 +1136,7 @@ export interface ConflictRow {
 export interface MemoryOverview {
   units: MemoryRow[];
   conflicts: ConflictRow[];
+  truncated?: boolean;
 }
 
 export interface MaintenanceReport {
@@ -1100,8 +1146,16 @@ export interface MaintenanceReport {
   consolidationOk: boolean;
 }
 
-export async function listMemories(): Promise<MemoryOverview> {
-  return invoke<MemoryOverview>('list_memories');
+export async function listMemories(
+  query?: string,
+  limit?: number,
+  offset?: number
+): Promise<MemoryOverview> {
+  return invoke<MemoryOverview>('list_memories', {
+    query: query ?? null,
+    limit: limit ?? null,
+    offset: offset ?? null,
+  });
 }
 
 /** Soft-delete a memory unit (status → orphaned; excluded from retrieval). */

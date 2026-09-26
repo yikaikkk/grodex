@@ -20,28 +20,46 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [search, setSearch] = useState('');
+  const [limit, setLimit] = useState(200);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const d = await acp.listMemories();
-      setData(d);
-    } catch (e: any) {
-      setNotice(`读取失败：${e?.message || e}`);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const load = useCallback(
+    async (q: string, l: number) => {
+      setLoading(true);
+      try {
+        const d = await acp.listMemories(q || undefined, l, 0);
+        setData(d);
+      } catch (e: any) {
+        setNotice(`读取失败：${e?.message || e}`);
+      } finally {
+        setLoading(false);
+      }
+    },
+    []
+  );
 
+  // Initial load on open only — search/limit changes flow through the
+  // debounced handleSearch / explicit reload buttons, not this effect.
   useEffect(() => {
-    if (isOpen) load();
+    if (isOpen) load('', 200);
+    return () => {
+      if (searchTimer.current) clearTimeout(searchTimer.current);
+    };
   }, [isOpen, load]);
+
+  // Debounced search input handler (300ms) — every keystroke hits SQLite.
+  const searchTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleSearch = (v: string) => {
+    setSearch(v);
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => load(v, limit), 300);
+  };
 
   const handleDelete = async (id: string) => {
     try {
       await acp.deleteMemory(id);
       setNotice(`已删除（orphaned）：${id.slice(0, 12)}…`);
-      load();
+      load(search, limit);
     } catch (e: any) {
       setNotice(`删除失败：${e?.message || e}`);
     }
@@ -52,7 +70,7 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
     try {
       const r = await acp.runMemoryMaintenance();
       setNotice(`维护完成：units=${r.units}, pending 冲突=${r.conflictsPending}（governance/consolidation ${r.governanceOk && r.consolidationOk ? 'OK' : '异常'}）`);
-      load();
+      load(search, limit);
     } catch (e: any) {
       setNotice(`维护失败：${e?.message || e}`);
     } finally {
@@ -74,7 +92,7 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
       <div className="w-full max-w-3xl h-[86vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between">
@@ -85,7 +103,19 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
             <div>
               <h3 className="text-sm font-bold text-primary">记忆管理</h3>
               <p className="text-[11px] text-secondary">
-                {units.length} 条记忆 · {conflicts.length} 条冲突（~/.grodex/memory.db）
+                {units.length} 条记忆{data?.truncated ? '（已截断）' : ''} · {conflicts.length} 条冲突（~/.grodex/memory.db）
+                {data?.truncated && (
+                  <button
+                    onClick={() => {
+                      const next = limit + 200;
+                      setLimit(next);
+                      load(search, next);
+                    }}
+                    className="ml-2 px-2 py-0.5 rounded-full bg-accent-soft text-accent border border-accent-soft text-[10px] hover:bg-accent hover:text-white"
+                  >
+                    加载更多
+                  </button>
+                )}
               </p>
             </div>
           </div>
@@ -98,8 +128,19 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
         </div>
 
         {notice && (
-          <div className="px-5 py-2 bg-accent-soft text-accent text-xs flex items-center gap-2 border-b border-accent-soft">
-            <Check className="w-3.5 h-3.5" /> {notice}
+          <div
+            className={`px-5 py-2 text-xs flex items-center gap-2 border-b ${
+              notice.startsWith('读取失败') || notice.startsWith('删除失败') || notice.startsWith('维护失败')
+                ? 'bg-red-soft text-red-dark border-red-soft'
+                : 'bg-accent-soft text-accent border-accent-soft'
+            }`}
+          >
+            {notice.startsWith('读取失败') || notice.startsWith('删除失败') || notice.startsWith('维护失败') ? (
+              <AlertTriangle className="w-3.5 h-3.5" />
+            ) : (
+              <Check className="w-3.5 h-3.5" />
+            )}{' '}
+            {notice}
           </div>
         )}
 
@@ -135,10 +176,16 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
 
           {/* Units */}
           <section>
-            <div className="flex items-center justify-between mb-2">
-              <h4 className="font-semibold text-primary">记忆条目</h4>
-              <span className="text-secondary text-[11px]">删除 = 标记 orphaned，不再被检索</span>
+            <div className="flex items-center justify-between mb-2 gap-2">
+              <h4 className="font-semibold text-primary shrink-0">记忆条目</h4>
+              <input
+                value={search}
+                onChange={(e) => handleSearch(e.target.value)}
+                placeholder="搜索 id / 内容…"
+                className="flex-1 max-w-[220px] px-2.5 py-1 rounded-lg bg-well border border-hairline text-xs font-mono text-primary focus:outline-none focus:border-accent"
+              />
             </div>
+            <div className="text-secondary text-[11px] mb-2">删除 = 标记 orphaned，不再被检索</div>
             {units.length === 0 ? (
               <div className="px-3 py-4 rounded-xl border border-dashed border-hairline text-center text-secondary">
                 暂无记忆条目
@@ -178,7 +225,7 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
           <span className="text-[11px] text-secondary">删除不会立刻从磁盘移除（保留审计），会停止被检索。</span>
           <div className="flex items-center gap-2">
             <button
-              onClick={load}
+              onClick={() => load(search, limit)}
               disabled={loading}
               className="px-3 py-1.5 rounded-full bg-white border border-hairline text-secondary text-xs flex items-center gap-1.5 hover:bg-black/[0.05]"
             >

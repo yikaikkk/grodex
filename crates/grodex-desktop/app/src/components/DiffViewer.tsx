@@ -211,7 +211,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({ isOpen, onClose, diffId 
   const deletions = diffLines.filter((l) => l.type === 'remove').length;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
       <div className="w-full max-w-6xl h-[88vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between">
@@ -289,6 +289,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({ isOpen, onClose, diffId 
               return (
                 <button
                   key={i}
+                  title={f.path}
                   onClick={() => setActiveFileIdx(i)}
                   className={`px-3 py-1 rounded-lg text-[11px] font-mono whitespace-nowrap transition-colors ${
                     isActive

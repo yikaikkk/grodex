@@ -108,7 +108,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ item, onOpenDiff, compact })
   return (
     <div
       id={`tool-card-${item.id}`}
-      className={`${compact ? 'my-1.5 rounded-xl' : 'my-3 rounded-2xl'} border transition-all duration-150 ${
+      className={`${compact ? 'my-1.5 rounded-xl' : 'my-3 rounded-2xl'} border overflow-hidden transition-all duration-150 ${
         item.status === 'awaiting_approval'
           ? 'border-orange-soft bg-card shadow-md ring-1 ring-orange-soft'
           : item.status === 'running'
@@ -172,7 +172,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ item, onOpenDiff, compact })
       {/* Expanded Content Area */}
       {isExpanded && (
         <div
-          className={`${compact ? 'px-3 py-2.5 rounded-b-xl' : 'px-4 py-3.5 rounded-b-2xl'} border-t border-hairline bg-canvas space-y-3 text-xs`}
+          className={`min-w-0 ${compact ? 'px-3 py-2.5 rounded-b-xl' : 'px-4 py-3.5 rounded-b-2xl'} border-t border-hairline bg-canvas space-y-3 text-xs`}
         >
           {/* Structured parameters JSON (hidden in compact so the nested tool
               stays a small box) */}
@@ -181,7 +181,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ item, onOpenDiff, compact })
               <div className="text-[10px] uppercase font-sans text-secondary font-semibold tracking-wider">
                 工具输入参数 (Payload)
               </div>
-              <pre className="p-3 rounded-xl bg-well border border-hairline text-[11px] font-mono text-primary overflow-x-auto">
+              <pre className="p-3 rounded-xl bg-well border border-hairline text-[11px] font-mono text-primary whitespace-pre-wrap break-all min-w-0">
                 {JSON.stringify(item.params, null, 2)}
               </pre>
             </div>

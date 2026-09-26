@@ -401,6 +401,17 @@ pub struct SessionUpdate {
 /// Alias: SessionEvent is the canonical name for per-event payloads.
 pub type SessionEvent = UpdateContent;
 
+/// Sub-agent budget status (carried on the finished-phase
+/// SubagentProgress frame; used/max turns + incomplete-final-report flag).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentBudgetPayload {
+    pub max_turns: u32,
+    pub used_turns: u32,
+    pub remaining_turns: u32,
+    pub exhausted_without_full_report: bool,
+}
+
+/// Streaming update from the agent to the client during a Turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum UpdateContent {
@@ -430,6 +441,9 @@ pub enum UpdateContent {
         phase: String,
         detail: String,
         ok: Option<bool>,
+        /// 预算状态（仅 finished 阶段携带）：used/max turns + 是否未完整收尾。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<SubagentBudgetPayload>,
     },
     /// The Turn has completed. `cached_tokens` is the prompt-cache hit
     /// subset of `input_tokens` (0 when usage is unavailable).

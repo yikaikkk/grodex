@@ -152,6 +152,35 @@ export const AgentTreePanel: React.FC<AgentTreePanelProps> = ({
                   <span>运行 {agent.durationSec}s</span>
                 </div>
 
+                {/* 预算进度条（Doc 12）：used/max turns，随 Finished 事件定稿 */}
+                {agent.budget && (
+                  <div className="pl-5 pt-1">
+                    <div className="flex items-center justify-between text-[10px] text-tertiary font-sans mb-0.5">
+                      <span>
+                        预算 {agent.budget.usedTurns}/{agent.budget.maxTurns} turns
+                        {agent.budget.exhaustedWithoutFullReport && (
+                          <span className="ml-1 text-orange-dark font-medium">· 未完整收尾</span>
+                        )}
+                      </span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-well overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all ${
+                          agent.budget.exhaustedWithoutFullReport
+                            ? 'bg-orange-dark'
+                            : 'bg-accent'
+                        }`}
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            (agent.budget.usedTurns / Math.max(1, agent.budget.maxTurns)) * 100
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+
                 {/* Agent Actions */}
                 <div className="flex items-center justify-end gap-1.5 pt-1.5 pl-5 border-t border-hairline-2">
                   <button

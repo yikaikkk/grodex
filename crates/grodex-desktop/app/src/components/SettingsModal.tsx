@@ -80,7 +80,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   return (
-    <div id="settings-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm animate-in fade-in duration-150">
+    <div id="settings-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 animate-in fade-in duration-150">
       <div
         id="settings-modal-card"
         className="w-full max-w-2xl rounded-2xl border border-hairline bg-canvas shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"

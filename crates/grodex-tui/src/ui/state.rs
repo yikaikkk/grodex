@@ -1661,7 +1661,7 @@ impl TuiAppState {
                 // "stop at completed Assistant" guard above.
             }
 
-            SessionEvent::SubagentProgress { id, label, phase, detail, ok } => {
+            SessionEvent::SubagentProgress { id, label, phase, detail, ok, budget: _ } => {
                 // Structured sub-agent lifecycle → Subagent card.
                 // Started opens a new card, Step appends an execution
                 // line, Finished closes it (ok=false → failure badge).

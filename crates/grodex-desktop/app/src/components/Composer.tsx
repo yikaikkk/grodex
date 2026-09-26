@@ -46,8 +46,6 @@ interface SlashCommand {
 }
 
 const SLASH_COMMANDS: SlashCommand[] = [
-  { command: '/compact', label: '/compact', description: '压缩上下文并清理冗余输出', icon: <Layers className="w-3.5 h-3.5" /> },
-  { command: '/retry', label: '/retry', description: '重试上一轮 Agent 执行步骤', icon: <RotateCcw className="w-3.5 h-3.5" /> },
   { command: '/clear', label: '/clear', description: '清空当前会话的时间线消息', icon: <Trash2 className="w-3.5 h-3.5" /> },
 ];
 

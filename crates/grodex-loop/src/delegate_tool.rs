@@ -48,6 +48,9 @@ pub enum SubagentProgress {
         label: String,
         ok: bool,
         summary: String,
+        /// 预算状态（used/max）——None 时前端不显示进度条。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<SubagentBudgetStatus>,
     },
 }
 
@@ -476,12 +479,17 @@ impl ToolRuntime for DelegateTool {
                 }
             };
             // 预算状态（Doc 12）：主 Agent 据此决定续派/接管/缩范围。
+            let exhausted_without_full_report = response.is_err()
+                || used_turns >= effective_max_turns
+                || response
+                    .as_ref()
+                    .map(|t| t.starts_with("[partial report"))
+                    .unwrap_or(false);
             budget_status = Some(SubagentBudgetStatus {
                 max_turns: effective_max_turns,
                 used_turns,
                 remaining_turns: effective_max_turns.saturating_sub(used_turns),
-                exhausted_without_full_report: response.is_err()
-                    || used_turns >= effective_max_turns,
+                exhausted_without_full_report,
             });
             if let Some(link) = &child_link {
                 let ok = response.is_ok();
@@ -496,6 +504,7 @@ impl ToolRuntime for DelegateTool {
                         label: label.clone(),
                         ok: true,
                         summary: truncate_task(&text, 100).to_string(),
+                        budget: budget_status,
                     });
                     // Long reports go to a temp file so aggregating
                     // multiple sub-agent outputs doesn't blow up the
@@ -508,6 +517,7 @@ impl ToolRuntime for DelegateTool {
                         label: label.clone(),
                         ok: false,
                         summary: e.clone(),
+                        budget: budget_status,
                     });
                     // Mark the task as failed in the supervisor.
                     match &self.runtime {

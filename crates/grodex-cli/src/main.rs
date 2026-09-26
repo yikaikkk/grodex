@@ -691,21 +691,34 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
         }
         LoopSessionEvent::SubagentProgress(p) => {
             // Flatten the structured loop event into the ACP wire form.
-                        let (id, label, phase, detail, ok) = match p {
+                        let (id, label, phase, detail, ok, budget) = match p {
                 grodex_loop::delegate_tool::SubagentProgress::Started {
                     id,
                     label,
                     task_preview,
-                } => (id, label, "started".to_string(), task_preview, None),
+                } => (id, label, "started".to_string(), task_preview, None, None),
                 grodex_loop::delegate_tool::SubagentProgress::Step { id, detail } => {
-                    (id, String::new(), "step".to_string(), detail, None)
+                    (id, String::new(), "step".to_string(), detail, None, None)
                 }
                 grodex_loop::delegate_tool::SubagentProgress::Finished {
                     id,
                     label,
                     ok,
                     summary,
-                } => (id, label, "finished".to_string(), summary, Some(ok)),
+                    budget,
+                } => (
+                    id,
+                    label,
+                    "finished".to_string(),
+                    summary,
+                    Some(ok),
+                    budget.map(|b| grodex_protocol::acp::SubagentBudgetPayload {
+                        max_turns: b.max_turns,
+                        used_turns: b.used_turns,
+                        remaining_turns: b.remaining_turns,
+                        exhausted_without_full_report: b.exhausted_without_full_report,
+                    }),
+                ),
             };
             let content = UpdateContent::SubagentProgress {
                 id,
@@ -713,6 +726,7 @@ fn map_loop_event_to_update(ev: LoopSessionEvent, session_id: SessionId, seq: u6
                 phase,
                 detail,
                 ok,
+                budget,
             };
             let env = EventEnvelope::wrap(seq, session_id, content);
             Some(ServerFrame::Event(env))

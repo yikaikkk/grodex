@@ -25,6 +25,7 @@ dirs = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { workspace = true }
 grodex-acp-client = { workspace = true }
+grodex-core = { workspace = true }
 grodex-protocol = { workspace = true }
 grodex-memory = { workspace = true }
 grodex-telemetry = { workspace = true }

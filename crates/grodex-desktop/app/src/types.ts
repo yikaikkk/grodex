@@ -128,6 +128,13 @@ export interface DiffFile {
   toolCallOrigin: string;
 }
 
+export interface SubAgentBudget {
+  maxTurns: number;
+  usedTurns: number;
+  remainingTurns: number;
+  exhaustedWithoutFullReport: boolean;
+}
+
 export interface SubAgentNode {
   id: string;
   name: string;
@@ -138,6 +145,8 @@ export interface SubAgentNode {
   tokensUsed: number;
   durationSec: number;
   logs: string[];
+  /** 预算状态（Doc 12）——随 SubagentProgress::Finished 透出。 */
+  budget?: SubAgentBudget | null;
 }
 
 export type PermissionRule = 'allow' | 'ask' | 'deny';

@@ -7,7 +7,7 @@ import { ToolCard } from './ToolCard';
 
 interface TimelineProps {
   items: TimelineItem[];
-  onOpenDiff: (diffId: string) => void;
+  onOpenDiff: (diffId?: string) => void;
   /** Opaque value bumped each time the timeline is rebuilt from a snapshot for
    * the active session — on change, jump to the bottom (opening a session
    * must not require the user to scroll down). */
@@ -69,28 +69,21 @@ function FrameBody({
 }: {
   items: TimelineItem[];
   expanded: boolean;
-  onOpenDiff: (diffId: string) => void;
+  onOpenDiff: (diffId?: string) => void;
 }) {
   const miniRef = useRef<HTMLDivElement>(null);
-  const stuckRef = useRef(false); // true = user scrolled up inside the mini box
 
-  // Inner smart-follow: auto-stick to the bottom as content (thinking text or
-  // tool cards) streams in. Only paused while the user has scrolled UP; going
-  // back to the bottom re-engages following.
+  // Inner smart-follow (race-free, same as the page level): follow only when
+  // the mini box is LIVE at the bottom at effect time. Scrolling up inside
+  // the mini box pauses follow; scrolling back re-engages it.
   useEffect(() => {
     if (expanded) return;
     const el = miniRef.current;
     if (!el) return;
-    if (stuckRef.current) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    if (!nearBottom) return;
     el.scrollTop = el.scrollHeight;
   }, [items, expanded]);
-
-  const onMiniScroll = () => {
-    const el = miniRef.current;
-    if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    stuckRef.current = !nearBottom;
-  };
 
   const content = (
     <>
@@ -121,8 +114,7 @@ function FrameBody({
   return (
     <div
       ref={miniRef}
-      onScroll={onMiniScroll}
-      className="max-h-40 overflow-y-auto px-3.5 py-2.5 space-y-2.5"
+      className="max-h-40 overflow-y-auto px-3.5 py-2.5 space-y-2.5 min-w-0"
     >
       {content}
     </div>
@@ -244,36 +236,36 @@ const AssistantMessage = React.memo(({ item }: AssistantMessageProps) => {
 
 export const Timeline = React.memo(({ items, onOpenDiff, scrollToKey }: TimelineProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const pageStuckRef = useRef(false); // true = user scrolled UP (pauses follow)
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  // A session's history was (re)loaded: reset any "scrolled up" pause and jump
-  // straight to the newest content. Uses instant scroll (no long animation).
+  // A session's history was (re)loaded: jump straight to the newest content.
+  // Uses instant scroll (no long animation). The jump is ALWAYS performed —
+  // a session switch/reload is an explicit navigation, not a stream update,
+  // so the user's scrolled-up reading position is re-based to the new content.
   useEffect(() => {
     const el = containerRef.current;
-    if (!el || items.length === 0) return;
-    pageStuckRef.current = false;
+    if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [scrollToKey]);
 
-  // Page smart-follow:
-  // Terminal-style auto-follow: only scroll to the bottom when the user
-  // is already near the bottom. If the user scrolled up to read history,
-  // never force them back down — even while content is actively streaming.
-  // The user must manually scroll back to the bottom to re-engage following.
+  // Page smart-follow — race-free formulation:
+  // The follow decision reads the LIVE DOM position at effect time, not a
+  // ref updated by scroll events. This removes the race where a streaming
+  // delta's effect ran before the user's scroll event: if the user has
+  // scrolled up, scrollTop is already away from the bottom, so the follow
+  // is skipped; scrolling back to the bottom re-engages it automatically.
+  // Uses INSTANT scrolling - behavior:'smooth' animates toward a moving
+  // target while deltas arrive faster than the animation completes.
+  const FOLLOW_THRESHOLD_PX = 160;
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    if (pageStuckRef.current) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < FOLLOW_THRESHOLD_PX;
+    if (!nearBottom) return;
+    el.scrollTop = el.scrollHeight;
   }, [items]);
 
-  const onPageScroll = () => {
-    const el = containerRef.current;
-    if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
-    pageStuckRef.current = !nearBottom;
-  };
+
 
   const handleCopyText = (id: string, text: string) => {
     navigator.clipboard.writeText(text);
@@ -314,7 +306,6 @@ export const Timeline = React.memo(({ items, onOpenDiff, scrollToKey }: Timeline
   return (
     <div
       ref={containerRef}
-      onScroll={onPageScroll}
       id="session-timeline-container"
       className="flex-1 overflow-y-auto px-4 sm:px-6 py-5 w-full space-y-4 font-sans"
     >

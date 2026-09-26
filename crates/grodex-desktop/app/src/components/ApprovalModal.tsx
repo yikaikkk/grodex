@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useRef, useState, useEffect, useMemo } from 'react';
 import {
   ShieldAlert,
   Clock,
@@ -59,9 +59,28 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
   useEffect(() => {
     if (!request) return;
     const interval = setInterval(() => {
-      setRemainingSec(secondsUntilDeadline(request));
+      const remaining = secondsUntilDeadline(request);
+      setRemainingSec(remaining);
+      // Expired tickets are auto-DENIED and the modal dismissed — an expired
+      // dialog must not linger open with a countdown stuck at zero.
+      if (remaining <= 0 && !submittingRef.current) {
+        handleResolveRef.current?.('denied');
+      }
     }, 1000);
     return () => clearInterval(interval);
+  }, [request]);
+
+  // Esc = deny (fail-closed, same as TUI cancel semantics). Keydown on
+  // window because the modal does not trap focus.
+  useEffect(() => {
+    if (!request) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !submittingRef.current) {
+        handleResolveRef.current?.('denied');
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, [request]);
 
   if (!request) return null;
@@ -74,19 +93,26 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
   // call onResolve in the background. If it rejects, the parent restores
   // the ticket and the modal re-mounts via key. Previously the modal
   // stayed open until the full ACP round-trip returned.
+  const submittingRef = useRef(false);
+  const handleResolveRef = useRef<((action: Parameters<typeof onResolve>[1]) => void) | null>(null);
+
   const handleResolve = (
     action: Parameters<typeof onResolve>[1],
     narrowedParams?: any
   ) => {
     if (submitting) return;
     setSubmitting(true);
+    submittingRef.current = true;
     try {
       onResolve(request.id, action, narrowedParams);
     } catch (err) {
       setSubmitting(false);
+      submittingRef.current = false;
       throw err;
     }
   };
+
+  handleResolveRef.current = handleResolve;
 
   const handleNarrowSubmit = () => {
     try {
