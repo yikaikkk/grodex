@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Plus, Folder, Trash2, ChevronRight, ChevronDown, RotateCw } from 'lucide-react';
 import { Session, SessionStatus } from '../types';
 
@@ -14,26 +14,44 @@ interface SidebarProps {
   workspace: string;
   onChangeWorkspace: (newPath: string) => void;
   onRunDemo: () => void;
+  /** True while a turn is running: switching sessions would interrupt it. */
+  switchLocked?: boolean;
 }
 
-function folderName(ws: string): string {
-  const trimmed = ws.trim();
-  if (!trimmed) return '未分组';
-  const segs = trimmed.split('/').filter(Boolean);
-  return segs.length > 0 ? segs[segs.length - 1] : trimmed;
+/** Last path segment of an absolute workspace path — the group label.
+ *  Non-path keys (e.g. 「（无工作目录）」) pass through unchanged. */
+function lastSegment(path: string): string {
+  const segs = path.split('/').filter(Boolean);
+  return segs.length > 0 ? segs[segs.length - 1] : path;
 }
 
-const SidebarInner: React.FC<SidebarProps> = ({
-  sessions,
+const SidebarInner: React.FC<SidebarProps> = ({  sessions,
   activeSessionId,
   onSelectSession,
   onNewSession,
   onResumeSession,
   onDeleteSession,
   onRefreshSessions,
+  /** True while a turn is running: switching sessions would interrupt it. */
+  switchLocked = false,
 }) => {
   const [listOpen, setListOpen] = useState(true);
   const [openFolders, setOpenFolders] = useState<Record<string, boolean>>({});
+  // Custom tooltip: after hovering a session row for 1.5s, show its absolute
+  // workspace path near the cursor (native `title` fires too early/inconsistently).
+  const [tip, setTip] = useState<{ x: number; y: number; text: string } | null>(null);
+  const tipTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearTip = () => {
+    if (tipTimer.current) clearTimeout(tipTimer.current);
+    tipTimer.current = null;
+    setTip(null);
+  };
+  const scheduleTip = (e: React.MouseEvent, text: string) => {
+    if (tipTimer.current) clearTimeout(tipTimer.current);
+    const { clientX: x, clientY: y } = e;
+    tipTimer.current = setTimeout(() => setTip({ x, y, text }), 1500);
+  };
+  useEffect(() => clearTip, []);
 
   const toggleFolder = (name: string) =>
     setOpenFolders((prev) => ({ ...prev, [name]: !(prev[name] ?? true) }));
@@ -55,13 +73,17 @@ const SidebarInner: React.FC<SidebarProps> = ({
     }
   };
 
+  // Group by the ABSOLUTE workspace path (not the folder name) — two
+  // different directories sharing a folder name must not collide.
   const byWorkspace = new Map<string, Session[]>();
   for (const s of sessions) {
-    const name = folderName(s.workspace);
-    if (!byWorkspace.has(name)) byWorkspace.set(name, []);
-    byWorkspace.get(name)!.push(s);
+    const key = s.workspace || '（无工作目录）';
+    if (!byWorkspace.has(key)) byWorkspace.set(key, []);
+    byWorkspace.get(key)!.push(s);
   }
-  const folders = Array.from(byWorkspace.entries());
+  const folders = Array.from(byWorkspace.entries()).sort(([a], [b]) =>
+    a.localeCompare(b)
+  );
   const totalTasks = sessions.length;
 
   return (
@@ -73,8 +95,17 @@ const SidebarInner: React.FC<SidebarProps> = ({
       <div className="p-3">
         <button
           id="new-session-btn"
-          onClick={onNewSession}
-          className="w-full flex items-center justify-between pl-3 pr-2.5 py-2 rounded-full bg-accent text-white text-xs font-medium transition-all hover:bg-accent-hover active:scale-[0.98] shadow-sm"
+          onClick={() => {
+            if (switchLocked) return; // guard notice comes from App
+            onNewSession();
+          }}
+          disabled={switchLocked}
+          className={`w-full flex items-center justify-between pl-3 pr-2.5 py-2 rounded-full text-xs font-medium transition-all shadow-sm ${
+            switchLocked
+              ? 'bg-accent/40 cursor-not-allowed text-white/70'
+              : 'bg-accent hover:bg-accent-hover active:scale-[0.98] text-white'
+          }`}
+          title={switchLocked ? '当前会话任务未结束，请先停止' : '新建任务'}
         >
           <span className="flex items-center gap-1.5">
             <Plus className="w-3.5 h-3.5" />
@@ -125,16 +156,19 @@ const SidebarInner: React.FC<SidebarProps> = ({
               <div key={name} className="space-y-0.5">
                 <div
                   onClick={() => toggleFolder(name)}
+                  onMouseEnter={(e) => scheduleTip(e, name)}
+                  onMouseLeave={clearTip}
                   className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs font-medium text-secondary hover:bg-black/[0.05] hover:text-primary cursor-pointer select-none transition-colors"
-                  title={folderOpen ? '收起该文件夹' : '展开该文件夹'}
                 >
                   {folderOpen ? (
                     <ChevronDown className="w-3.5 h-3.5 text-tertiary" />
                   ) : (
                     <ChevronRight className="w-3.5 h-3.5 text-tertiary" />
                   )}
-                  <Folder className="w-3.5 h-3.5 text-tertiary" />
-                  <span className="truncate flex-1">{name}</span>
+                  <Folder className="w-3.5 h-3.5 text-tertiary shrink-0" />
+                  {/* Label shows only the folder name; the full absolute
+                      path appears in the 1.5s hover tooltip. */}
+                  <span className="truncate flex-1">{lastSegment(name)}</span>
                   <span className="text-[10px] font-mono text-tertiary">{items.length}</span>
                 </div>
 
@@ -147,11 +181,26 @@ const SidebarInner: React.FC<SidebarProps> = ({
                         <div
                           key={session.id}
                           id={`session-item-${session.id}`}
-                          onClick={() => onSelectSession(session.id)}
-                          className={`group relative pl-2.5 pr-1.5 py-1.5 rounded-lg transition-colors cursor-pointer text-xs flex items-center justify-between gap-1.5 ${
+                          onClick={() => {
+                            clearTip();
+                            if (switchLocked && !isActive) return; // App shows the notice
+                            onSelectSession(session.id);
+                          }}
+                          onMouseEnter={(e) =>
+                            scheduleTip(e, session.workspace || '（无工作目录）')
+                          }
+                          onMouseLeave={clearTip}
+                          title={
+                            switchLocked && !isActive
+                              ? '当前会话任务未结束，无法切换'
+                              : undefined
+                          }
+                          className={`group relative pl-2.5 pr-1.5 py-1.5 rounded-lg transition-colors text-xs flex items-center justify-between gap-1.5 ${
                             isActive
-                              ? 'bg-black/[0.08] text-primary font-medium'
-                              : 'text-secondary hover:bg-black/[0.04] hover:text-primary'
+                              ? 'bg-black/[0.08] text-primary font-medium cursor-default'
+                              : switchLocked
+                              ? 'text-secondary opacity-50 cursor-not-allowed'
+                              : 'cursor-pointer text-secondary hover:bg-black/[0.04] hover:text-primary'
                           }`}
                         >
                           <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -197,6 +246,18 @@ const SidebarInner: React.FC<SidebarProps> = ({
               </div>
             );
           })}
+        </div>
+      )}
+      {/* Deferred absolute-path tooltip (1.5s hover) */}
+      {tip && (
+        <div
+          className="fixed z-[70] max-w-md px-2.5 py-1.5 rounded-lg bg-[#1f2430] text-white text-[11px] font-mono shadow-lg pointer-events-none break-all"
+          style={{
+            left: Math.min(tip.x + 14, window.innerWidth - 24),
+            top: Math.min(tip.y + 18, window.innerHeight - 48),
+          }}
+        >
+          {tip.text}
         </div>
       )}
     </aside>

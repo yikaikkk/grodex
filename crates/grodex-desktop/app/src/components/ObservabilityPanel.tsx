@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useDeferredMount } from '../lib/useDeferredMount';
 import { X, RefreshCw, Activity, Gauge, Database, Stethoscope } from 'lucide-react';
 import * as acp from '../lib/acpClient';
 import { eventBus } from '../lib/eventBus';
@@ -52,55 +51,60 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
   const [selectedSessionId, setSelectedSessionId] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  // Mirror of selectedSessionId so `load` can stay dependency-free and the
-  // panel-open effect runs exactly once (previously `load` depended on
-  // selectedSessionId, so opening the panel fetched overview/doctor twice).
+  // Mirror of selectedSessionId so `load` can stay dependency-free.
   const selectedSidRef = useRef('');
+  // Generation guard: stale responses (panel closed / session switched
+  // mid-flight) must never overwrite current state.
+  const loadGenRef = useRef(0);
 
   const loadDetail = useCallback(async (sid: string) => {
     if (!sid) return;
+    const gen = ++loadGenRef.current;
     try {
-      setDetail(await acp.telemetrySession(sid));
+      const det = await acp.telemetrySession(sid);
+      if (gen === loadGenRef.current) setDetail(det);
     } catch (e: any) {
-      setNotice(`会话明细读取失败：${e?.message || e}`);
+      if (gen === loadGenRef.current) setNotice(`会话明细读取失败：${e?.message || e}`);
     }
   }, []);
 
-  const load = useCallback(async () => {
+  // One parallel round-trip: overview + doctor + session detail. Requests
+  // for a stale generation are dropped instead of clobbering state.
+  const load = useCallback(async (sessionId: string) => {
+    const gen = ++loadGenRef.current;
     setLoading(true);
     setNotice(null);
     try {
-      // Parallel: overview and doctor are independent queries.
-      const [ov, dr] = await Promise.all([
+      const [ov, dr, det] = await Promise.all([
         acp.telemetryOverview(),
         acp.telemetryDoctor(),
+        sessionId ? acp.telemetrySession(sessionId) : Promise.resolve(null),
       ]);
+      if (gen !== loadGenRef.current) return;
       setOverview(ov);
       setDoctor(dr);
+      if (det) setDetail(det);
     } catch (e: any) {
-      setNotice(`读取失败：${e?.message || e}`);
+      if (gen === loadGenRef.current) setNotice(`读取失败：${e?.message || e}`);
+    } finally {
+      if (gen === loadGenRef.current) setLoading(false);
     }
-    await loadDetail(selectedSidRef.current);
-    setLoading(false);
-  }, [loadDetail]);
+  }, []);
 
-  // Sync the selected session to the active one each time the panel opens.
-  useEffect(() => {
-    if (isOpen && !selectedSidRef.current) {
-      selectedSidRef.current = activeSessionId;
-      setSelectedSessionId(activeSessionId);
-    }
-  }, [isOpen, activeSessionId]);
-
-  // Load on open + auto-refresh when a turn completes while the panel is up.
+  // Single open effect: pick the initial session and fire ONE parallel load.
   useEffect(() => {
     if (!isOpen) return;
-    load();
+    const initial = selectedSidRef.current || activeSessionId || '';
+    selectedSidRef.current = initial;
+    if (initial !== selectedSessionId) setSelectedSessionId(initial);
+    load(initial);
+    // Auto-refresh when a turn completes while the panel is up.
     const off = eventBus.on('sessionStateChanged', (d: any) => {
-      if (d?.status === 'completed') load();
+      if (d?.status === 'completed') load(selectedSidRef.current);
     });
     return () => off();
-  }, [isOpen, load]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, activeSessionId, load]);
 
   const handleSelectSession = (id: string) => {
     selectedSidRef.current = id;
@@ -109,49 +113,47 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
     loadDetail(id);
   };
 
-  // Per-turn rolled-up figures (first attempt's TTFT + summed tokens).
-  // useMemo + all state MUST live above the `if (!isOpen) return null`
-  // early return — hook order must be identical for open and closed
-  // renders, or React throws "rendered more hooks" and unmounts the whole
-  // app (white screen). This reduction is O(turns x attempts); memoizing
-  // it also keeps the open-panel cost off the streaming rAF path.
   const turns = detail?.turns ?? [];
-  const turnStats = useMemo(
-    () =>
-      turns.map((t) => {
-        const firstTtft =
-          t.attempts.find((a) => a.firstTokenMs != null)?.firstTokenMs ?? null;
-        const input = t.attempts.reduce((s, a) => s + (a.inputTokens ?? 0), 0);
-        const output = t.attempts.reduce((s, a) => s + (a.outputTokens ?? 0), 0);
-        const cached = t.attempts.reduce((s, a) => s + (a.cachedInputTokens ?? 0), 0);
-        const cacheRate = input > 0 ? cached / input : null;
-        return { t, firstTtft, input, output, cached, cacheRate };
-      }),
-    [turns]
-  );
 
-  // Turn table pagination: 20 rows per page bounds the render cost of the
-  // open frame regardless of session length.
+  // Turn table pagination: 20 rows per page bounds the render cost.
   const TURN_PAGE_SIZE = 20;
   const [turnPage, setTurnPage] = useState(1);
-  const turnTotalPages = Math.max(1, Math.ceil(turnStats.length / TURN_PAGE_SIZE));
+  const turnTotalPages = Math.max(1, Math.ceil(turns.length / TURN_PAGE_SIZE));
   const safeTurnPage = Math.min(turnPage, turnTotalPages);
-  const visibleTurnStats = turnStats.slice(
-    (safeTurnPage - 1) * TURN_PAGE_SIZE,
-    safeTurnPage * TURN_PAGE_SIZE
-  );
 
-  // Overlay shell renders immediately; heavy body mounts one task later
-  // (after the first paint) so click-to-visible is a single frame.
-  const contentMounted = useDeferredMount(isOpen);
-  if (!isOpen) return null;
+  // slice().map(): only the visible page's turns are reduced. Never walk
+  // the whole telemetry history on a detail load or a page turn.
+  const visibleTurnStats = useMemo(
+    () =>
+      turns
+        .slice(
+          (safeTurnPage - 1) * TURN_PAGE_SIZE,
+          safeTurnPage * TURN_PAGE_SIZE
+        )
+        .map((t) => {
+          const firstTtft =
+            t.attempts.find((a) => a.firstTokenMs != null)?.firstTokenMs ?? null;
+          const input = t.attempts.reduce((s, a) => s + (a.inputTokens ?? 0), 0);
+          const output = t.attempts.reduce((s, a) => s + (a.outputTokens ?? 0), 0);
+          const cached = t.attempts.reduce((s, a) => s + (a.cachedInputTokens ?? 0), 0);
+          const cacheRate = input > 0 ? cached / input : null;
+          return { t, firstTtft, input, output, cached, cacheRate };
+        }),
+    [turns, safeTurnPage]
+  );
 
   const models = overview?.models ?? [];
   const cache = overview?.cache ?? [];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-      {contentMounted && (
+    // Resident DOM: stays mounted, display toggles. Re-opening reuses the
+    // existing DOM; hidden state costs no layout or paint.
+    <div
+      aria-hidden={!isOpen}
+      className={`fixed inset-0 z-50 items-center justify-center p-4 bg-black/50 ${
+        isOpen ? 'flex' : 'hidden'
+      }`}
+    >
       <div className="w-full max-w-5xl h-[85vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between">
@@ -408,7 +410,7 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
               上一页
             </button>
             <span className="font-mono text-[11px]">
-              第 {safeTurnPage} / {turnTotalPages} 页 · 共 {turnStats.length} 轮
+              第 {safeTurnPage} / {turnTotalPages} 页 · 共 {turns.length} 轮
             </span>
             <button
               id="turns-next-page-btn"
@@ -456,7 +458,7 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
         <div className="px-5 py-3 bg-white border-t border-hairline flex items-center justify-between">
           <span className="text-[11px] text-secondary">数据来自 serve 进程实时写入的 telemetry.db，轮次结束后自动刷新。</span>
           <button
-            onClick={load}
+            onClick={() => load(selectedSidRef.current)}
             disabled={loading}
             className="px-3 py-1.5 rounded-full bg-white border border-hairline text-secondary text-xs flex items-center gap-1.5 hover:bg-black/[0.05] disabled:opacity-50"
           >
@@ -464,7 +466,6 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
           </button>
         </div>
       </div>
-      )}
     </div>
   );
 };

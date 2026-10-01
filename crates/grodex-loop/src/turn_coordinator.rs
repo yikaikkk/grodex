@@ -38,17 +38,6 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-/// Per-turn budget for repair sampling (P0-1).
-///
-/// 当模型以 `StopReason::Stop` 结束且没有产生 Tool Call、文本非空时，它
-/// 很可能只是「描述了下一步计划」而非真正完成。此时注入一条 repair prompt
-/// 让模型二选一（总结收尾 / 调用工具继续），并重新采样。
-///
-/// 预算防止无限循环：连续两次无工具 `Stop`（中间没有工具调度）即视为自然
-/// 完成。取值 1 对齐文档「一次 repair sampling」，同时把真正完成的 turn 的
-/// 额外采样成本限制在 1 次以内。
-const REPAIR_SAMPLING_BUDGET: u8 = 1;
-
 /// Result of one tool execution.
 struct ToolExecResult {
     call_id: ToolCallId,
@@ -461,11 +450,6 @@ impl TurnCoordinator {
         // cancelled, the step budget was exhausted — we then force a
         // wrap-up summary instead of ending the turn silently.
         let mut finished = false;
-        // P0-1：无工具 `Stop` 响应的 repair sampling 剩余预算。
-        let mut repair_budget = REPAIR_SAMPLING_BUDGET;
-        // R 修复：repair 从 retries 分列（遥测可区分「模型犹豫」与真失败重试）；
-        // repair_exhausted 终止原因据此判定。
-        let mut repair_injected = false;
 
         // 可观测(设计文档 09 §19.1):Turn 计时与指标累加。
         let turn_started = std::time::Instant::now();
@@ -769,8 +753,7 @@ impl TurnCoordinator {
                         // ── 结构化终止判断（StepDisposition）──
                         // 把散落的 if/else 收拢成 classify_step 分类函数，
                         // 终止协议可读、可单测。
-                        let disposition =
-                            classify_step(&response, repair_budget, metrics.tool_calls > 0);
+                        let disposition = classify_step(&response);
 
                         // 非工具分支统一 push step result（工具分支在下方
                         // dispatch 段自行 push）。
@@ -830,52 +813,8 @@ impl TurnCoordinator {
                                 }
                                 continue;
                             }
-                            StepDisposition::Repair => {
-                                repair_injected = true;
-                                metrics.repair_injections += 1;
-                                // 无工具自然 Stop + 非空文本 + 预算未耗尽 + 本轮已有工具调用。
-                                // 注入 repair prompt 迫使模型二选一：
-                                //   总结收尾 → turn 结束
-                                //   调用工具 → turn 继续
-                                repair_budget -= 1;
-                                tracing::info!(
-                                    step_id = %step_id,
-                                    repair_budget,
-                                    "no-tool natural stop — injecting repair prompt"
-                                );
-                                const REPAIR_NOTE: &str = "[System: You stopped without calling a tool. \
-                                         If the user's request is fully resolved, give a concise final summary. \
-                                         If you were already in the middle of multi-step tool work that you \
-                                         started earlier in this turn, continue with the next tool call now. \
-                                         IMPORTANT: If your previous message asked the user a question or \
-                                         proposed an action requiring their confirmation (e.g. \"要不要我…\" / \
-                                         \"shall I…\" / \"do you want me to…\"), you MUST NOT auto-execute \
-                                         that proposed action. Wait for the user's response instead. \
-                                         Do not merely describe what you would do next — either summarize \
-                                         your findings or continue already-started work.]";
-                                self.chat_state.push_user_message(
-                                    ContextItem::User {
-                                        content: REPAIR_NOTE.into(),
-                                        message_id: None,
-                                    }
-                                ).await;
-                                // Journal the synthetic note (non-durable) so a
-                                // replayed context matches the live one exactly.
-                                if let Some(ref writer) = self.rollout {
-                                    let _ = writer
-                                        .write_prompt_injected(
-                                            turn_ctx.turn_id,
-                                            step_id,
-                                            StepGeneration::new(step_gen),
-                                            "repair",
-                                            REPAIR_NOTE,
-                                        )
-                                        .await;
-                                }
-                                continue;
-                            }
                             StepDisposition::FinalAnswer => {
-                                // 无工具 Stop + 预算耗尽 → 自然结束。
+                                // 无工具自然 Stop → 自然结束。
                                 finished = true;
                                 break;
                             }
@@ -1772,11 +1711,6 @@ impl TurnCoordinator {
             // The FINAL step's error is what ended the turn; an earlier
             // step's recovered error does not make the turn a failure.
             "sampling_error"
-        } else if repair_injected {
-            // Repair was injected and the post-repair response ended the
-            // turn without tools — the conclusion was budget-driven, not
-            // a spontaneous natural stop.
-            "repair_exhausted"
         } else {
             "final_answer"
         };

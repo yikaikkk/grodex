@@ -48,7 +48,13 @@ class ACPEventBus {
   }
 
   public emit(event: ACPEventType, payload: any) {
-    if (event !== 'thinkingDelta' && event !== 'assistantTextDelta') {
+    if (
+      event !== 'thinkingDelta' &&
+      event !== 'assistantTextDelta' &&
+      // sessionSnapshot carries the full rebuilt timeline — stringify would
+      // touch the entire session history on every resume.
+      event !== 'sessionSnapshot'
+    ) {
       const now = Date.now();
       const json = JSON.stringify(payload ?? null);
       if (

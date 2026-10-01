@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useDeferredMount } from '../lib/useDeferredMount';
-import { X, FileText, Loader2 } from 'lucide-react';
+import { X, FileText, Loader2, Eye, FileCode } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import * as acp from '../lib/acpClient';
 
 export interface FilePreviewTarget {
@@ -15,6 +16,8 @@ interface FilePreviewProps {
   /** Workspace the file is resolved against. */
   workspace?: string;
   target: FilePreviewTarget | null;
+  /** Markdown links in a rendered .md preview open other files through here. */
+  onOpenFile?: (path: string, line?: number, column?: number) => void;
 }
 
 const MAX_RENDER_LINES = 5000;
@@ -30,11 +33,15 @@ const FilePreviewInner: React.FC<FilePreviewProps> = ({
   onClose,
   workspace,
   target,
+  onOpenFile,
 }) => {
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Markdown files: rendered preview (default) or raw source. Non-markdown
+  // files always use the source view.
+  const [view, setView] = useState<'preview' | 'source'>('preview');
 
   useEffect(() => {
     if (!isOpen || !target?.path || !workspace) return;
@@ -42,6 +49,7 @@ const FilePreviewInner: React.FC<FilePreviewProps> = ({
     setLoading(true);
     setError(null);
     setContent(null);
+    setView('preview'); // new file → back to rendered preview
     acp
       .previewFile(workspace, target.path)
       .then((c) => {
@@ -63,21 +71,60 @@ const FilePreviewInner: React.FC<FilePreviewProps> = ({
     return content.split('\n').slice(0, MAX_RENDER_LINES);
   }, [content]);
 
-  // Scroll the requested line into view once content is rendered.
+  // Markdown files get a fully RENDERED preview (GFM) instead of raw source;
+  // every other extension keeps the line-numbered code view.
+  const isMarkdown = /\.(md|markdown|mdx)$/i.test(target?.path || '');
+  const renderedMarkdown = useMemo(
+    () =>
+      content === null || !isMarkdown ? null : (
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            a: ({ href, children }) => {
+              const classes =
+                'text-accent underline underline-offset-2 hover:text-accent-hover break-all';
+              // Non-http link = workspace file reference → open in preview.
+              if (href && !/^https?:\/\//i.test(href)) {
+                return (
+                  <a
+                    href="#"
+                    title={href}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      onOpenFile?.(href.replace(/^file:\/\//, ''));
+                    }}
+                    className={classes}
+                  >
+                    {children}
+                  </a>
+                );
+              }
+              return (
+                <a href={href} target="_blank" rel="noreferrer" className={classes}>
+                  {children}
+                </a>
+              );
+            },
+          }}
+        >
+          {content}
+        </ReactMarkdown>
+      ),
+    [content, isMarkdown, onOpenFile]
+  );
+
+  // Scroll the requested line into view once content is rendered
+  // (code view only — rendered markdown has no stable line mapping).
   useEffect(() => {
-    if (content === null || !target?.line) return;
+    if (content === null || !target?.line || isMarkdown) return;
     const el = scrollRef.current?.querySelector(`[data-line="${target.line}"]`);
     el?.scrollIntoView({ block: 'center' });
-  }, [content, target?.line]);
+  }, [content, target?.line, isMarkdown]);
 
-  // Overlay shell renders immediately; heavy body mounts one task later
-  // (after the first paint) so click-to-visible is a single frame.
-  const contentMounted = useDeferredMount(isOpen);
   if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-      {contentMounted && (
       <div className="w-full max-w-5xl h-[85vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between gap-3">
@@ -95,13 +142,40 @@ const FilePreviewInner: React.FC<FilePreviewProps> = ({
               </p>
             </div>
           </div>
-          <button
-            id="close-file-preview-btn"
-            onClick={onClose}
-            className="p-1.5 rounded-full hover:bg-well text-secondary hover:text-primary transition-colors shrink-0"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-1.5 shrink-0">
+            {isMarkdown && (
+              <>
+                <button
+                  id="file-preview-mode-btn"
+                  onClick={() => setView((v) => (v === 'preview' ? 'source' : 'preview'))}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium flex items-center gap-1 transition-colors ${
+                    view === 'preview'
+                      ? 'bg-accent-soft text-accent border border-accent-soft'
+                      : 'text-secondary hover:text-primary border border-transparent'
+                  }`}
+                  title="切换 预览 / 源码"
+                >
+                  {view === 'preview' ? (
+                    <>
+                      <Eye className="w-3.5 h-3.5" /> 预览
+                    </>
+                  ) : (
+                    <>
+                      <FileCode className="w-3.5 h-3.5" /> 源码
+                    </>
+                  )}
+                </button>
+                <div className="w-px h-4 bg-hairline" />
+              </>
+            )}
+            <button
+              id="close-file-preview-btn"
+              onClick={onClose}
+              className="p-1.5 rounded-full hover:bg-well text-secondary hover:text-primary transition-colors shrink-0"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Body */}
@@ -118,7 +192,14 @@ const FilePreviewInner: React.FC<FilePreviewProps> = ({
           {!loading && !error && content !== null && lines.length === 0 && (
             <div className="px-5 py-8 text-secondary text-xs">空文件</div>
           )}
-          {content !== null && lines.length > 0 && (
+          {content !== null && isMarkdown && view === 'preview' && lines.length > 0 && (
+            <div className="px-8 py-6">
+              <div className="md-body prose prose-stone prose-sm max-w-3xl mx-auto text-primary prose-headings:text-primary prose-headings:font-bold prose-p:leading-relaxed prose-pre:bg-well prose-pre:border prose-pre:border-hairline prose-pre:rounded-xl prose-code:font-mono prose-code:text-primary prose-code:bg-well prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:border prose-code:border-hairline prose-strong:text-primary prose-a:break-all">
+                {renderedMarkdown}
+              </div>
+            </div>
+          )}
+          {content !== null && (!isMarkdown || view === 'source') && lines.length > 0 && (
             <div className="font-mono text-[11px] leading-5 py-2 min-w-max">
               {lines.map((line, idx) => {
                 const lineNo = idx + 1;
@@ -146,7 +227,6 @@ const FilePreviewInner: React.FC<FilePreviewProps> = ({
           )}
         </div>
       </div>
-      )}
     </div>
   );
 };

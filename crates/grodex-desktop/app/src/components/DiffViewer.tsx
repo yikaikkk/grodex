@@ -1,5 +1,4 @@
 import React, { useEffect, useState, useMemo } from 'react';
-import { useDeferredMount } from '../lib/useDeferredMount';
 import { X, FileCode, Columns2, AlignLeft } from 'lucide-react';
 import * as acp from '../lib/acpClient';
 
@@ -205,9 +204,6 @@ const DiffViewerInner: React.FC<DiffViewerProps> = ({ isOpen, onClose, diffId })
     return computeLineDiff(before, after);
   }, [currentFile]);
 
-  // Overlay shell renders immediately; heavy body mounts one task later
-  // (after the first paint) so click-to-visible is a single frame.
-  const contentMounted = useDeferredMount(isOpen);
   if (!isOpen) return null;
 
   // Stats for header
@@ -216,7 +212,6 @@ const DiffViewerInner: React.FC<DiffViewerProps> = ({ isOpen, onClose, diffId })
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-      {contentMounted && (
       <div className="w-full max-w-5xl h-[85vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between">
@@ -426,7 +421,6 @@ const DiffViewerInner: React.FC<DiffViewerProps> = ({ isOpen, onClose, diffId })
           )}
         </div>
       </div>
-      )}
     </div>
   );
 };

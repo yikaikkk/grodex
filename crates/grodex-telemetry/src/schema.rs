@@ -71,9 +71,10 @@ const V1_DDL: &str = r#"
         );
 
         -- One row per Turn (projection of TurnStarted + TurnCompleted).
-        -- `termination_reason` is structured: final_answer | repair_exhausted
+        -- `termination_reason` is structured: final_answer
         -- | step_budget_exhausted | cancelled | sampling_error | tool_error
-        -- | journal_failure | indeterminate_wait.
+        -- | journal_failure | indeterminate_wait. (repair_exhausted existed
+        -- in older rows; the repair fallback has been removed.)
         CREATE TABLE IF NOT EXISTS turns (
             turn_id            TEXT PRIMARY KEY,
             session_id         TEXT NOT NULL,

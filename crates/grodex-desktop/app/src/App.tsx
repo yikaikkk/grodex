@@ -545,14 +545,19 @@ export default function App() {
    * the directory picker on the next send instead of silently reusing the
    * previous session's cwd. */
   const handleNewSession = useCallback(async (): Promise<void> => {
-    if (isRunning) await acp.stop();
+    // A running turn must not be silently killed by navigating away —
+    // the user stops it explicitly via the stop button first.
+    if (isRunning) {
+      showNotice('当前会话任务未结束，请先停止任务再新建', 'error');
+      return;
+    }
     setPendingApprovals([]);
     setIndeterminate(null);
     setSubagents([]);
     setActiveSessionId('');
     setWorkspace('');
     setNotice(null);
-  }, [isRunning]);
+  }, [isRunning, showNotice]);
 
   /** First real message on the empty page: choose a workspace, spawn the agent
    * and register the session row, so nothing is created until the user sends. */
@@ -592,6 +597,12 @@ export default function App() {
   const handleSelectSession = useCallback(
     async (sessionId: string) => {
     if (sessionId === activeSessionId) return;
+    // Switching calls acp.stop() on the running agent — never do that
+    // implicitly while a turn is still streaming.
+    if (isRunning) {
+      showNotice('当前会话任务未结束，请先停止任务再切换会话', 'error');
+      return;
+    }
     if (isRunning) await acp.stop();
     setPendingApprovals([]);
     setIndeterminate(null);
@@ -910,6 +921,7 @@ export default function App() {
           workspace={workspace}
           onChangeWorkspace={changeWorkspace}
           onRunDemo={handleNewSession}
+          switchLocked={isRunning}
         />
 
         {/* Center: Main Floating White Canvas */}
@@ -1148,6 +1160,7 @@ export default function App() {
         onClose={closePreview}
         workspace={activeSession?.workspace || workspace}
         target={previewTarget}
+        onOpenFile={handleOpenFile}
       />
     </div>
   );

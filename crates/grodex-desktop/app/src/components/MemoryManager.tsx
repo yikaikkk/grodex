@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { useDeferredMount } from '../lib/useDeferredMount';
 import { X, RefreshCw, Trash2, Wrench, AlertTriangle, Check } from 'lucide-react';
 import * as acp from '../lib/acpClient';
 
@@ -94,11 +93,6 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
     }
   };
 
-  // Overlay shell renders immediately; heavy body mounts one task later
-  // (after the first paint) so click-to-visible is a single frame.
-  const contentMounted = useDeferredMount(isOpen);
-  if (!isOpen) return null;
-
   const units = data?.units ?? [];
   const conflicts = data?.conflicts ?? [];
   const badge = (s: string) => {
@@ -110,9 +104,16 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
     );
   };
 
+  // Resident DOM: the panel stays mounted and toggles display. Re-opening
+  // reuses the existing list nodes (display:none costs nothing); only the
+  // data is refreshed per open.
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-      {contentMounted && (
+    <div
+      aria-hidden={!isOpen}
+      className={`fixed inset-0 z-50 items-center justify-center p-4 bg-black/50 ${
+        isOpen ? 'flex' : 'hidden'
+      }`}
+    >
       <div className="w-full max-w-5xl h-[85vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between">
@@ -267,7 +268,6 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
           </div>
         </div>
       </div>
-      )}
     </div>
   );
 };

@@ -1,13 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { useDeferredMount } from '../lib/useDeferredMount';
 import {
   X,
   Sliders,
   Shield,
-  Check,
   CheckCircle2,
-  Cpu,
-  Radio,
   FileCode,
   Terminal,
   Search,
@@ -25,6 +21,13 @@ interface SettingsModalProps {
   settings: SettingsState;
   onSave: (newSettings: SettingsState) => Promise<void>;
 }
+
+const SANDBOX_LABELS: Record<SettingsState['sandboxProfile'], string> = {
+  workspace: '仅工作区（标准开发沙盒）',
+  readonly: '严格只读（禁止写文件与执行命令）',
+  restricted: '受限容器沙盒（禁止外部网络访问）',
+  full: '完全宿主权限（允许特权系统调用）',
+};
 
 const SettingsModalInner: React.FC<SettingsModalProps> = ({
   isOpen,
@@ -44,9 +47,6 @@ const SettingsModalInner: React.FC<SettingsModalProps> = ({
     }
   }, [isOpen, settings]);
 
-  // Overlay shell renders immediately; heavy body mounts one task later
-  // (after the first paint) so click-to-visible is a single frame.
-  const contentMounted = useDeferredMount(isOpen);
   if (!isOpen) return null;
 
   const toolsList: { name: ToolName; label: string; desc: string; icon: React.ReactNode }[] = [
@@ -74,7 +74,7 @@ const SettingsModalInner: React.FC<SettingsModalProps> = ({
     setIsSaving(true);
     try {
       await onSave(currentSettings);
-      setToastMessage('配置已成功写入 ~/.grodex/config.toml');
+      setToastMessage('权限配置已成功写入 ~/.grodex/config.toml');
       setIsSaving(false);
       setTimeout(() => setToastMessage(null), 2000);
     } catch (e: any) {
@@ -84,9 +84,22 @@ const SettingsModalInner: React.FC<SettingsModalProps> = ({
     }
   };
 
+  // Read-only rows reflect what the backend actually reads from
+  // ~/.grodex/config.toml (sessions::get_config). The former provider /
+  // wire-protocol / sandbox pickers were mock UI (never persisted) and are
+  // removed — these values are only editable via the config file.
+  const configRows: { label: string; value: string; mono?: boolean }[] = [
+    { label: '模型提供商', value: currentSettings.provider, mono: true },
+    { label: '模型', value: currentSettings.model, mono: true },
+    { label: 'ACP 传输协议', value: 'ACP over stdio（唯一支持的传输）' },
+    {
+      label: '沙盒隔离模式',
+      value: SANDBOX_LABELS[currentSettings.sandboxProfile] ?? currentSettings.sandboxProfile,
+    },
+  ];
+
   return (
-    <div id="settings-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 animate-in fade-in duration-150">
-      {contentMounted && (
+    <div id="settings-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
       <div
         id="settings-modal-card"
         className="w-full max-w-5xl h-[85vh] rounded-2xl border border-hairline bg-canvas shadow-2xl overflow-hidden flex flex-col"
@@ -99,7 +112,7 @@ const SettingsModalInner: React.FC<SettingsModalProps> = ({
             </div>
             <div>
               <h3 className="text-sm font-bold text-primary">Agent 核心配置与工具权限</h3>
-              <p className="text-xs text-secondary mt-0.5">管理推理模型提供商、ACP 通信协议以及细粒度工具安全审批策略</p>
+              <p className="text-xs text-secondary mt-0.5">生效配置只读展示；工具审批策略在此直接编辑并热加载</p>
             </div>
           </div>
           <button
@@ -112,87 +125,36 @@ const SettingsModalInner: React.FC<SettingsModalProps> = ({
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-6 text-xs text-primary">
+        <div className="flex-1 overflow-y-auto p-6 space-y-6 text-xs text-primary [scrollbar-gutter:stable]">
           {/* Toast Notification */}
           {toastMessage && (
             <div
               id="settings-toast-banner"
-              className="p-3.5 rounded-2xl bg-green-soft border border-green-soft text-green-dark text-xs font-medium flex items-center gap-2 animate-in fade-in slide-in-from-top-2"
+              className="p-3.5 rounded-2xl bg-green-soft border border-green-soft text-green-dark text-xs font-medium flex items-center gap-2"
             >
               <CheckCircle2 className="w-4 h-4 text-green-dark" />
               <span>{toastMessage}</span>
             </div>
           )}
 
-          {/* Model Provider Choice */}
+          {/* Effective config — read-only, real values from config.toml */}
           <div className="space-y-2">
             <label className="text-[11px] uppercase font-sans text-secondary font-bold tracking-wider">
-              AI 推理模型提供商
+              生效配置（只读，来源 ~/.grodex/config.toml）
             </label>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
-              {[
-                { id: 'anthropic', label: 'Anthropic', desc: 'Claude 3.7 Sonnet', recommended: true },
-                { id: 'openai', label: 'OpenAI', desc: 'GPT-5 Coding', recommended: false },
-                { id: 'deepseek', label: 'DeepSeek', desc: 'DeepSeek-V3 推理', recommended: false },
-                { id: 'ollama', label: 'Ollama', desc: '本地 Llama 3.3', recommended: false },
-              ].map((p) => {
-                const isSelected = currentSettings.provider === p.id;
-                return (
-                  <button
-                    key={p.id}
-                    id={`provider-card-${p.id}`}
-                    onClick={() => setCurrentSettings({ ...currentSettings, provider: p.id as any })}
-                    className={`p-3.5 rounded-2xl border text-left transition-all ${
-                      isSelected
-                        ? 'border-accent bg-accent-soft ring-1 ring-accent/30 text-primary shadow-xs'
-                        : 'border-hairline bg-white hover:border-hairline text-secondary hover:text-primary'
-                    }`}
-                  >
-                    <div className="font-semibold text-xs text-primary flex items-center justify-between">
-                      <span>{p.label}</span>
-                      {isSelected && <Check className="w-3.5 h-3.5 text-accent" />}
-                    </div>
-                    <div className="text-[10px] text-secondary mt-1 font-sans">{p.desc}</div>
-                  </button>
-                );
-              })}
+            <div className="rounded-2xl border border-hairline bg-white overflow-hidden divide-y divide-hairline-2 shadow-xs">
+              {configRows.map((row) => (
+                <div key={row.label} className="flex items-center justify-between px-4 py-3">
+                  <span className="text-secondary">{row.label}</span>
+                  <span className={`text-primary font-medium ${row.mono ? 'font-mono' : 'font-sans'}`}>
+                    {row.value}
+                  </span>
+                </div>
+              ))}
             </div>
-          </div>
-
-          {/* Wire Protocol & Sandbox profile */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="space-y-1.5">
-              <label className="text-[11px] uppercase font-sans text-secondary font-bold tracking-wider">
-                ACP 传输协议
-              </label>
-              <select
-                id="select-wire-protocol"
-                value={currentSettings.wireProtocol}
-                onChange={(e) => setCurrentSettings({ ...currentSettings, wireProtocol: e.target.value as any })}
-                className="w-full p-2.5 rounded-xl bg-white border border-hairline font-sans text-xs text-primary focus:outline-none focus:border-accent"
-              >
-                <option value="acp_stdio">ACP over stdio（原生推荐）</option>
-                <option value="acp_websocket">ACP over WebSocket (ws://localhost:4040)</option>
-                <option value="sse_direct">Server-Sent Events (Direct HTTP 流)</option>
-              </select>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-[11px] uppercase font-sans text-secondary font-bold tracking-wider">
-                沙盒隔离模式
-              </label>
-              <select
-                id="select-sandbox-profile"
-                value={currentSettings.sandboxProfile}
-                onChange={(e) => setCurrentSettings({ ...currentSettings, sandboxProfile: e.target.value as any })}
-                className="w-full p-2.5 rounded-xl bg-white border border-hairline font-sans text-xs text-primary focus:outline-none focus:border-accent"
-              >
-                <option value="workspace">仅工作区 (标准开发沙盒)</option>
-                <option value="readonly">严格只读 (禁止写文件与执行命令)</option>
-                <option value="restricted">受限容器沙盒 (禁止外部网络访问)</option>
-                <option value="full">完全宿主权限 (允许特权系统调用)</option>
-              </select>
-            </div>
+            <p className="text-[11px] text-tertiary">
+              如需更换模型或提供商，请直接编辑 ~/.grodex/config.toml 后重启会话。
+            </p>
           </div>
 
           {/* Granular Tool Permissions Table */}
@@ -292,7 +254,6 @@ const SettingsModalInner: React.FC<SettingsModalProps> = ({
           </div>
         </div>
       </div>
-      )}
     </div>
   );
 };

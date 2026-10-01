@@ -33,7 +33,7 @@ pub struct TurnOutcome {
     /// 检出)，带来源与置信度。`None` when snapshots unavailable.
     pub change_set: Option<grodex_tools::TurnChangeSet>,
     /// Structured reason the turn reached its terminal state:
-    /// `final_answer` | `repair_exhausted` | `step_budget_exhausted` |
+    /// `final_answer` | `step_budget_exhausted` |
     /// `cancelled` | `sampling_error` | `tool_error` | `journal_failure`
     /// | `indeterminate_wait`. Journaled in TurnCompleted so the
     /// telemetry projection can answer "why did this turn end?".
@@ -75,8 +75,8 @@ pub struct TurnMetricsSummary {
     pub retries: u64,
     pub compactions: u64,
     pub cancels: u64,
-    /// Repair 提示注入次数（与 retries 分列——repair 是「模型犹豫」，
-    /// 不是失败重试）。
+    /// 退役：repair 提示注入机制已移除，字段保留以兼容旧 journal 回放；
+    /// 新 turn 恒为 0。
     pub repair_injections: u64,
     pub duration_ms: u64,
 }
@@ -84,12 +84,12 @@ pub struct TurnMetricsSummary {
 // ── Step disposition — 结构化终止判断 ─────────────────────────────
 //
 // 把 turn_coordinator 里散落的 if/else 收拢成一个分类函数，终止协议
-// 可读、可单测。分类依据：模型 response 的 stop_reason + items 内容 +
-// repair 预算。
+// 可读、可单测。分类依据：模型 response 的 stop_reason + items 内容。
 //
 // 注意：这个 enum 不含 Codex 的 ContinueRequested（end_turn=false）和
 // Commentary 两支——因为 DeepSeek 的 finish_reason 给不出这两个信号，
-// 硬塞进去是死代码。Repair 就是「协议无法区分 phase 时的有界兜底」。
+// 硬塞进去是死代码。旧版的 Repair 兜底（无工具自然 Stop 时注入提示
+// 强制再采样）已移除：无工具自然 Stop 一律视为自然完成。
 
 /// 结构化的单步终止判断结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,9 +98,7 @@ pub enum StepDisposition {
     ContinueForTools,
     /// Length → 注入 continuation prompt 继续采样。
     Truncated,
-    /// 无工具 Stop + 非空文本 + 预算未耗尽 → 注入 repair prompt 再采样。
-    Repair,
-    /// 无工具 Stop + 预算耗尽 → 结束 turn。
+    /// 无工具 Stop + 非空文本 → 自然完成，结束 turn。
     FinalAnswer,
     /// ContentFilter / 空文本 / Refusal → 报错结束。
     Failed,
@@ -114,19 +112,8 @@ pub enum StepDisposition {
 /// 3. stop_reason = Length → Truncated
 /// 4. stop_reason = ContentFilter → Failed
 /// 5. stop_reason = Stop / None + 空文本 → Failed
-/// 6. stop_reason = Stop / None + 非空文本 + repair_budget > 0 + 本轮已有
-///    工具调用 → Repair（mid-flight 兜底）
-/// 7. stop_reason = Stop / None + 非空文本 + 其余情况 → FinalAnswer
-///
-/// R 修复：Repair 增加 `had_tool_work` 守卫。此前任何无工具自然 Stop 都会
-/// 触发 repair——纯问答 turn 因此被双倍采样（模型答完后被强制再答一次），
-/// 且用户看到重复输出。Repair 的原始目的是兜底「工具工作中途停下」，
-/// 没有工具工作就没有 mid-flight 可言。
-pub fn classify_step(
-    response: &CanonicalModelResponse,
-    repair_budget: u8,
-    had_tool_work: bool,
-) -> StepDisposition {
+/// 6. stop_reason = Stop / None + 非空文本 → FinalAnswer
+pub fn classify_step(response: &CanonicalModelResponse) -> StepDisposition {
     // 1. 检查 items 里有没有 Refusal（不依赖 stop_reason）
     let has_refusal = response
         .items
@@ -141,7 +128,7 @@ pub fn classify_step(
         return StepDisposition::ContinueForTools;
     }
 
-    // 3-7. 按 stop_reason 分类
+    // 3-6. 按 stop_reason 分类
     match response.stop_reason {
         Some(StopReason::Length) => StepDisposition::Truncated,
         Some(StopReason::ContentFilter) => StepDisposition::Failed,
@@ -153,8 +140,6 @@ pub fn classify_step(
                 .map_or(true, |t| t.trim().is_empty())
             {
                 StepDisposition::Failed // 空响应
-            } else if repair_budget > 0 && had_tool_work {
-                StepDisposition::Repair
             } else {
                 StepDisposition::FinalAnswer
             }
@@ -215,7 +200,7 @@ mod tests {
             ],
             Some(StopReason::ToolCalls),
         );
-        assert_eq!(classify_step(&r, 1, true), StepDisposition::ContinueForTools);
+        assert_eq!(classify_step(&r), StepDisposition::ContinueForTools);
     }
 
     #[test]
@@ -226,7 +211,7 @@ mod tests {
             }],
             Some(StopReason::Length),
         );
-        assert_eq!(classify_step(&r, 1, true), StepDisposition::Truncated);
+        assert_eq!(classify_step(&r), StepDisposition::Truncated);
     }
 
     #[test]
@@ -237,48 +222,26 @@ mod tests {
             }],
             Some(StopReason::ContentFilter),
         );
-        assert_eq!(classify_step(&r, 1, true), StepDisposition::Failed);
+        assert_eq!(classify_step(&r), StepDisposition::Failed);
     }
 
     #[test]
     fn classify_empty_text_stop() {
         let r = response(vec![], Some(StopReason::Stop));
-        assert_eq!(classify_step(&r, 1, true), StepDisposition::Failed);
+        assert_eq!(classify_step(&r), StepDisposition::Failed);
     }
 
+    /// repair 兜底移除的回归：无工具自然 Stop（即使本轮已有工具调用、
+    /// 旧版会注入 repair prompt 再采样）一律视为自然完成。
     #[test]
-    fn classify_repair_budget_remaining() {
+    fn classify_no_tool_stop_is_final() {
         let r = response(
             vec![CanonicalResponseItem::AssistantText {
                 content: "I will check the file next.".into(),
             }],
             Some(StopReason::Stop),
         );
-        assert_eq!(classify_step(&r, 1, true), StepDisposition::Repair);
-    }
-
-    /// R 修复回归：纯问答（本轮还没有任何工具调用）必须直接 FinalAnswer，
-    /// 不再触发 repair 双倍采样。
-    #[test]
-    fn classify_no_tool_work_never_repairs() {
-        let r = response(
-            vec![CanonicalResponseItem::AssistantText {
-                content: "42.".into(),
-            }],
-            Some(StopReason::Stop),
-        );
-        assert_eq!(classify_step(&r, 1, false), StepDisposition::FinalAnswer);
-    }
-
-    #[test]
-    fn classify_final_answer_budget_exhausted() {
-        let r = response(
-            vec![CanonicalResponseItem::AssistantText {
-                content: "Done, here's the result.".into(),
-            }],
-            Some(StopReason::Stop),
-        );
-        assert_eq!(classify_step(&r, 0, false), StepDisposition::FinalAnswer);
+        assert_eq!(classify_step(&r), StepDisposition::FinalAnswer);
     }
 
     #[test]
@@ -289,6 +252,6 @@ mod tests {
             }],
             Some(StopReason::Stop),
         );
-        assert_eq!(classify_step(&r, 1, true), StepDisposition::Failed);
+        assert_eq!(classify_step(&r), StepDisposition::Failed);
     }
 }
