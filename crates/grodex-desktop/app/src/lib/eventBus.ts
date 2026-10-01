@@ -29,8 +29,10 @@ class ACPEventBus {
   private listeners: Map<ACPEventType, Set<ACPEventHandler>> = new Map();
   // Duplicate-fire guard: if the exact same (event, payload) is emitted twice
   // within a short window — the classic symptom of a stale HMR listener set —
-  // drop the second copy. Real streaming updates always differ (cumulative
-  // text grows), so legitimate events are never caught by this.
+  // drop the second copy. HIGH_FREQ events are excluded: their payloads carry
+  // the full cumulative text, so stringify-per-emit would serialize megabytes
+  // per second on the main thread for a guard that only matters on control
+  // events.
   private lastDup: { event: ACPEventType; json: string; at: number } | null = null;
 
   public on(event: ACPEventType, handler: ACPEventHandler) {
@@ -46,17 +48,19 @@ class ACPEventBus {
   }
 
   public emit(event: ACPEventType, payload: any) {
-    const now = Date.now();
-    const json = JSON.stringify(payload ?? null);
-    if (
-      this.lastDup &&
-      this.lastDup.event === event &&
-      this.lastDup.json === json &&
-      now - this.lastDup.at < 150
-    ) {
-      return; // duplicate fire from a stale listener set — ignore
+    if (event !== 'thinkingDelta' && event !== 'assistantTextDelta') {
+      const now = Date.now();
+      const json = JSON.stringify(payload ?? null);
+      if (
+        this.lastDup &&
+        this.lastDup.event === event &&
+        this.lastDup.json === json &&
+        now - this.lastDup.at < 150
+      ) {
+        return; // duplicate fire from a stale listener set — ignore
+      }
+      this.lastDup = { event, json, at: now };
     }
-    this.lastDup = { event, json, at: now };
 
     const handlers = this.listeners.get(event);
     if (handlers) {

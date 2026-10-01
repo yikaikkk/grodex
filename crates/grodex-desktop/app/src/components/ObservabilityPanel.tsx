@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useDeferredMount } from '../lib/useDeferredMount';
 import { X, RefreshCw, Activity, Gauge, Database, Stethoscope } from 'lucide-react';
 import * as acp from '../lib/acpClient';
 import { eventBus } from '../lib/eventBus';
@@ -51,29 +52,44 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
   const [selectedSessionId, setSelectedSessionId] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  // Mirror of selectedSessionId so `load` can stay dependency-free and the
+  // panel-open effect runs exactly once (previously `load` depended on
+  // selectedSessionId, so opening the panel fetched overview/doctor twice).
+  const selectedSidRef = useRef('');
+
+  const loadDetail = useCallback(async (sid: string) => {
+    if (!sid) return;
+    try {
+      setDetail(await acp.telemetrySession(sid));
+    } catch (e: any) {
+      setNotice(`会话明细读取失败：${e?.message || e}`);
+    }
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
     setNotice(null);
     try {
-      setOverview(await acp.telemetryOverview());
-      setDoctor(await acp.telemetryDoctor());
+      // Parallel: overview and doctor are independent queries.
+      const [ov, dr] = await Promise.all([
+        acp.telemetryOverview(),
+        acp.telemetryDoctor(),
+      ]);
+      setOverview(ov);
+      setDoctor(dr);
     } catch (e: any) {
       setNotice(`读取失败：${e?.message || e}`);
     }
-    if (selectedSessionId) {
-      try {
-        setDetail(await acp.telemetrySession(selectedSessionId));
-      } catch (e: any) {
-        setNotice(`会话明细读取失败：${e?.message || e}`);
-      }
-    }
+    await loadDetail(selectedSidRef.current);
     setLoading(false);
-  }, [selectedSessionId]);
+  }, [loadDetail]);
 
   // Sync the selected session to the active one each time the panel opens.
   useEffect(() => {
-    if (isOpen) setSelectedSessionId((prev) => prev || activeSessionId);
+    if (isOpen && !selectedSidRef.current) {
+      selectedSidRef.current = activeSessionId;
+      setSelectedSessionId(activeSessionId);
+    }
   }, [isOpen, activeSessionId]);
 
   // Load on open + auto-refresh when a turn completes while the panel is up.
@@ -86,7 +102,12 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
     return () => off();
   }, [isOpen, load]);
 
-  const handleSelectSession = (id: string) => setSelectedSessionId(id);
+  const handleSelectSession = (id: string) => {
+    selectedSidRef.current = id;
+    setSelectedSessionId(id);
+    setTurnPage(1);
+    loadDetail(id);
+  };
 
   // Per-turn rolled-up figures (first attempt's TTFT + summed tokens).
   // useMemo + all state MUST live above the `if (!isOpen) return null`
@@ -109,10 +130,20 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
     [turns]
   );
 
-  // 渐进渲染：长会话首帧只渲染 30 行，避免点击那一帧同步拼出整张表。
-  const [renderedTurns, setRenderedTurns] = useState(30);
-  const visibleTurnStats = turnStats.slice(0, renderedTurns);
+  // Turn table pagination: 20 rows per page bounds the render cost of the
+  // open frame regardless of session length.
+  const TURN_PAGE_SIZE = 20;
+  const [turnPage, setTurnPage] = useState(1);
+  const turnTotalPages = Math.max(1, Math.ceil(turnStats.length / TURN_PAGE_SIZE));
+  const safeTurnPage = Math.min(turnPage, turnTotalPages);
+  const visibleTurnStats = turnStats.slice(
+    (safeTurnPage - 1) * TURN_PAGE_SIZE,
+    safeTurnPage * TURN_PAGE_SIZE
+  );
 
+  // Overlay shell renders immediately; heavy body mounts one task later
+  // (after the first paint) so click-to-visible is a single frame.
+  const contentMounted = useDeferredMount(isOpen);
   if (!isOpen) return null;
 
   const models = overview?.models ?? [];
@@ -120,7 +151,8 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-      <div className="w-full max-w-5xl h-[88vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
+      {contentMounted && (
+      <div className="w-full max-w-5xl h-[85vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between">
           <div className="flex items-center gap-2.5">
@@ -364,13 +396,29 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
                     </div>
                   </details>
                 ))}
-        {turnStats.length > renderedTurns && (
-          <button
-            onClick={() => setRenderedTurns((v) => v + 50)}
-            className="mt-2 px-3 py-1.5 rounded-xl bg-well border border-hairline text-secondary hover:text-primary text-xs"
-          >
-            显示更多（已显示 {renderedTurns} / {turnStats.length} 轮）
-          </button>
+        {/* Turn list pager */}
+        {turnTotalPages > 1 && (
+          <div className="mt-2 flex items-center justify-center gap-3 text-xs text-secondary">
+            <button
+              id="turns-prev-page-btn"
+              disabled={safeTurnPage <= 1}
+              onClick={() => setTurnPage((v) => Math.max(1, v - 1))}
+              className="px-3 py-1.5 rounded-xl bg-well border border-hairline hover:text-primary text-xs disabled:opacity-40 disabled:hover:text-secondary"
+            >
+              上一页
+            </button>
+            <span className="font-mono text-[11px]">
+              第 {safeTurnPage} / {turnTotalPages} 页 · 共 {turnStats.length} 轮
+            </span>
+            <button
+              id="turns-next-page-btn"
+              disabled={safeTurnPage >= turnTotalPages}
+              onClick={() => setTurnPage((v) => Math.min(turnTotalPages, v + 1))}
+              className="px-3 py-1.5 rounded-xl bg-well border border-hairline hover:text-primary text-xs disabled:opacity-40 disabled:hover:text-secondary"
+            >
+              下一页
+            </button>
+          </div>
         )}
               </div>
             )}
@@ -416,6 +464,7 @@ const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
           </button>
         </div>
       </div>
+      )}
     </div>
   );
 };

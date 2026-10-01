@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { useDeferredMount } from '../lib/useDeferredMount';
 import { X, RefreshCw, Trash2, Wrench, AlertTriangle, Check } from 'lucide-react';
 import * as acp from '../lib/acpClient';
 
@@ -21,13 +22,16 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
   const [notice, setNotice] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [search, setSearch] = useState('');
-  const [limit, setLimit] = useState(200);
+  // Explicit offset pagination: 20 records per page, one SQLite-level paged
+  // query per page turn (backend `list_memories` → SQL LIMIT/OFFSET).
+  const PAGE_SIZE = 20;
+  const [page, setPage] = useState(1);
 
   const load = useCallback(
-    async (q: string, l: number) => {
+    async (q: string, p: number) => {
       setLoading(true);
       try {
-        const d = await acp.listMemories(q || undefined, l, 0);
+        const d = await acp.listMemories(q || undefined, PAGE_SIZE, (p - 1) * PAGE_SIZE);
         setData(d);
       } catch (e: any) {
         setNotice(`读取失败：${e?.message || e}`);
@@ -38,13 +42,17 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
     []
   );
 
-  // Initial load on open only — search/limit changes flow through the
-  // debounced handleSearch / explicit reload buttons, not this effect.
+  // Reset to page 1 and load on open only — search/page changes flow through
+  // the debounced handleSearch / pager buttons, not this effect.
   useEffect(() => {
-    if (isOpen) load('', 200);
+    if (isOpen) {
+      setPage(1);
+      load('', 1);
+    }
     return () => {
       if (searchTimer.current) clearTimeout(searchTimer.current);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, load]);
 
   // Debounced search input handler (300ms) — every keystroke hits SQLite.
@@ -52,14 +60,22 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
   const handleSearch = (v: string) => {
     setSearch(v);
     if (searchTimer.current) clearTimeout(searchTimer.current);
-    searchTimer.current = setTimeout(() => load(v, limit), 300);
+    searchTimer.current = setTimeout(() => {
+      setPage(1);
+      load(v, 1);
+    }, 300);
+  };
+
+  const goToPage = (p: number) => {
+    setPage(p);
+    load(search, p);
   };
 
   const handleDelete = async (id: string) => {
     try {
       await acp.deleteMemory(id);
       setNotice(`已删除（orphaned）：${id.slice(0, 12)}…`);
-      load(search, limit);
+      load(search, page);
     } catch (e: any) {
       setNotice(`删除失败：${e?.message || e}`);
     }
@@ -70,7 +86,7 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
     try {
       const r = await acp.runMemoryMaintenance();
       setNotice(`维护完成：units=${r.units}, pending 冲突=${r.conflictsPending}（governance/consolidation ${r.governanceOk && r.consolidationOk ? 'OK' : '异常'}）`);
-      load(search, limit);
+      load(search, page);
     } catch (e: any) {
       setNotice(`维护失败：${e?.message || e}`);
     } finally {
@@ -78,6 +94,9 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
     }
   };
 
+  // Overlay shell renders immediately; heavy body mounts one task later
+  // (after the first paint) so click-to-visible is a single frame.
+  const contentMounted = useDeferredMount(isOpen);
   if (!isOpen) return null;
 
   const units = data?.units ?? [];
@@ -93,7 +112,8 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-      <div className="w-full max-w-3xl h-[86vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
+      {contentMounted && (
+      <div className="w-full max-w-5xl h-[85vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between">
           <div className="flex items-center gap-2.5">
@@ -102,21 +122,27 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
             </div>
             <div>
               <h3 className="text-sm font-bold text-primary">记忆管理</h3>
-              <p className="text-[11px] text-secondary">
-                {units.length} 条记忆{data?.truncated ? '（已截断）' : ''} · {conflicts.length} 条冲突（~/.grodex/memory.db）
-                {data?.truncated && (
-                  <button
-                    onClick={() => {
-                      const next = limit + 200;
-                      setLimit(next);
-                      load(search, next);
-                    }}
-                    className="ml-2 px-2 py-0.5 rounded-full bg-accent-soft text-accent border border-accent-soft text-[10px] hover:bg-accent hover:text-white"
-                  >
-                    加载更多
-                  </button>
-                )}
-              </p>
+              <div className="flex items-center gap-2 text-[11px] text-secondary">
+                <span>
+                  第 {page} 页 · 本页 {units.length} 条 · {conflicts.length} 条冲突（~/.grodex/memory.db）
+                </span>
+                <button
+                  id="memory-prev-page-btn"
+                  disabled={page <= 1 || loading}
+                  onClick={() => goToPage(page - 1)}
+                  className="px-2 py-0.5 rounded-full bg-well border border-hairline hover:text-primary text-[10px] disabled:opacity-40 disabled:hover:text-secondary"
+                >
+                  上一页
+                </button>
+                <button
+                  id="memory-next-page-btn"
+                  disabled={!data?.truncated || loading}
+                  onClick={() => goToPage(page + 1)}
+                  className="px-2 py-0.5 rounded-full bg-well border border-hairline hover:text-primary text-[10px] disabled:opacity-40 disabled:hover:text-secondary"
+                >
+                  下一页
+                </button>
+              </div>
             </div>
           </div>
           <button
@@ -145,7 +171,7 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
         )}
 
         {/* Body */}
-        <div className="flex-1 overflow-y-auto p-5 space-y-5 text-xs">
+        <div className="flex-1 overflow-y-auto p-5 space-y-5 text-xs [scrollbar-gutter:stable]">
           {/* Conflicts */}
           <section>
             <div className="flex items-center justify-between mb-2">
@@ -225,7 +251,7 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
           <span className="text-[11px] text-secondary">删除不会立刻从磁盘移除（保留审计），会停止被检索。</span>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => load(search, limit)}
+              onClick={() => load(search, page)}
               disabled={loading}
               className="px-3 py-1.5 rounded-full bg-white border border-hairline text-secondary text-xs flex items-center gap-1.5 hover:bg-black/[0.05]"
             >
@@ -241,6 +267,7 @@ const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) =
           </div>
         </div>
       </div>
+      )}
     </div>
   );
 };

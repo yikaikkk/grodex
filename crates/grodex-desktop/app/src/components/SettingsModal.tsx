@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useDeferredMount } from '../lib/useDeferredMount';
 import {
   X,
   Sliders,
@@ -43,6 +44,9 @@ const SettingsModalInner: React.FC<SettingsModalProps> = ({
     }
   }, [isOpen, settings]);
 
+  // Overlay shell renders immediately; heavy body mounts one task later
+  // (after the first paint) so click-to-visible is a single frame.
+  const contentMounted = useDeferredMount(isOpen);
   if (!isOpen) return null;
 
   const toolsList: { name: ToolName; label: string; desc: string; icon: React.ReactNode }[] = [
@@ -82,9 +86,10 @@ const SettingsModalInner: React.FC<SettingsModalProps> = ({
 
   return (
     <div id="settings-modal-backdrop" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 animate-in fade-in duration-150">
+      {contentMounted && (
       <div
         id="settings-modal-card"
-        className="w-full max-w-2xl rounded-2xl border border-hairline bg-canvas shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+        className="w-full max-w-5xl h-[85vh] rounded-2xl border border-hairline bg-canvas shadow-2xl overflow-hidden flex flex-col"
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-hairline bg-white">
@@ -287,6 +292,7 @@ const SettingsModalInner: React.FC<SettingsModalProps> = ({
           </div>
         </div>
       </div>
+      )}
     </div>
   );
 };

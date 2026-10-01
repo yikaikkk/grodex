@@ -347,27 +347,67 @@ impl MemoryDatabase {
             "SELECT id, path, section, kind, scope, status, content, content_hash,
              updated_at, created_at FROM memory_units ORDER BY updated_at DESC",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(MemoryUnit {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                section: row.get(2)?,
-                kind: MemoryKind::from_str(&row.get::<_, String>(3)?).unwrap_or(MemoryKind::Fact),
-                scope: MemoryScope::from_str(&row.get::<_, String>(4)?)
-                    .unwrap_or(MemoryScope::Workspace),
-                status: UnitStatus::from_str(&row.get::<_, String>(5)?)
-                    .unwrap_or(UnitStatus::Active),
-                content: row.get(6)?,
-                content_hash: row.get(7)?,
-                updated_at: parse_ts(&row.get::<_, String>(8)?),
-                created_at: parse_ts(&row.get::<_, String>(9)?),
-            })
-        })?;
+        let rows = stmt.query_map([], |row| Self::row_to_unit(row))?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
         }
         Ok(result)
+    }
+
+    /// Paged + filtered memory listing with the filter and LIMIT/OFFSET
+    /// pushed into SQLite, so paging the desktop UI never deserializes the
+    /// whole table per page turn. Fetches one extra row to derive
+    /// `has_more` without a separate COUNT query.
+    pub fn list_memory_units_paged(
+        &self,
+        query: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<MemoryUnit>, bool), DbError> {
+        let conn = self.conn.lock().unwrap();
+        // Same match semantics as the old in-memory filter: the query is
+        // matched against "id content" (lowercased). LIKE wildcards in the
+        // user query are escaped so it behaves as a literal substring.
+        let needle = query.map(|q| {
+            q.to_lowercase()
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        });
+        let mut stmt = conn.prepare(
+            "SELECT id, path, section, kind, scope, status, content, content_hash,
+             updated_at, created_at FROM memory_units
+             WHERE (?1 IS NULL OR LOWER(id || ' ' || content) LIKE '%' || ?1 || '%' ESCAPE '\\')
+             ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![needle, (limit + 1) as i64, offset as i64],
+            |row| Self::row_to_unit(row),
+        )?;
+        let mut units = Vec::new();
+        for row in rows {
+            units.push(row?);
+        }
+        let has_more = units.len() > limit;
+        units.truncate(limit);
+        Ok((units, has_more))
+    }
+
+    fn row_to_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryUnit> {
+        Ok(MemoryUnit {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            section: row.get(2)?,
+            kind: MemoryKind::from_str(&row.get::<_, String>(3)?).unwrap_or(MemoryKind::Fact),
+            scope: MemoryScope::from_str(&row.get::<_, String>(4)?)
+                .unwrap_or(MemoryScope::Workspace),
+            status: UnitStatus::from_str(&row.get::<_, String>(5)?).unwrap_or(UnitStatus::Active),
+            content: row.get(6)?,
+            content_hash: row.get(7)?,
+            updated_at: parse_ts(&row.get::<_, String>(8)?),
+            created_at: parse_ts(&row.get::<_, String>(9)?),
+        })
     }
 
     // ─────────────── Evidence Units ───────────────

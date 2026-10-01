@@ -877,7 +877,7 @@ export default function App() {
         <div className="fixed top-14 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 pointer-events-none">
           {notice && (
             <div
-              className={`px-3.5 py-1.5 rounded-full text-xs shadow-md border backdrop-blur-xl bg-white/90 pointer-events-auto ${
+              className={`px-3.5 py-1.5 rounded-full text-xs shadow-md border bg-white/95 pointer-events-auto ${
                 notice.kind === 'error'
                   ? 'text-red-dark border-red-soft'
                   : notice.kind === 'log'
@@ -889,7 +889,7 @@ export default function App() {
             </div>
           )}
           {isCompacting && (
-            <div className="px-3.5 py-1.5 rounded-full text-xs bg-orange-soft text-orange-dark border border-orange-soft shadow-md backdrop-blur-xl pointer-events-auto flex items-center gap-1.5">
+            <div className="px-3.5 py-1.5 rounded-full text-xs bg-orange-soft text-orange-dark border border-orange-soft shadow-md pointer-events-auto flex items-center gap-1.5">
               <Loader2 className="w-3 h-3 animate-spin" /> 会话压缩中…
             </div>
           )}
@@ -913,12 +913,12 @@ export default function App() {
         />
 
         {/* Center: Main Floating White Canvas */}
-        <main
-          id="main-timeline-area"
-          className={`flex-1 flex flex-col min-w-0 bg-card rounded-2xl border border-hairline shadow-sm relative overflow-hidden transition-all ${
-            isAgentTreeOpen ? 'my-2 ml-2 sm:my-2.5 sm:ml-2.5 mr-1 sm:mr-1.5' : 'm-2 sm:m-2.5'
-          }`}
-        >
+          {/* Constant margins: toggling the side panels changes only the
+              main area's width, never its insets. */}
+          <main
+            id="main-timeline-area"
+            className="flex-1 flex flex-col min-w-0 bg-card rounded-2xl border border-hairline shadow-sm relative overflow-hidden m-2 sm:m-2.5"
+          >
           {currentTimeline.length === 0 ? (
             <EmptyState
               onSend={(t, mode) => handleSendPrompt(t, mode)}

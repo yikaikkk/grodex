@@ -80,33 +80,19 @@ pub async fn list_memories(
 ) -> Result<MemoryOverview, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let db = open_db()?;
-        let needle = query.as_deref().map(|q| q.to_lowercase());
         let limit = limit.unwrap_or(200).max(1) as usize;
         let offset = offset.unwrap_or(0) as usize;
 
-        let mut units = Vec::new();
-        let mut skipped = 0usize;
-        let mut truncated = false;
-        for u in db
-            .list_all_memory_units()
-            .map_err(|e| format!("读取记忆失败: {e}"))?
-        {
-            // Filter before paging.
-            if let Some(q) = &needle {
-                let hay = format!("{} {}", u.id, u.content).to_lowercase();
-                if !hay.contains(q) {
-                    continue;
-                }
-            }
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-            if units.len() >= limit {
-                truncated = true;
-                break;
-            }
-            units.push(MemoryRow {
+        // Filter + paging are pushed into SQLite (list_memory_units_paged),
+        // so a page turn never deserializes the whole memory table.
+        let (paged, has_more) = db
+            .list_memory_units_paged(query.as_deref(), limit, offset)
+            .map_err(|e| format!("读取记忆失败: {e}"))?;
+        let truncated = has_more;
+
+        let units: Vec<MemoryRow> = paged
+            .into_iter()
+            .map(|u| MemoryRow {
                 id: u.id,
                 status: format!("{:?}", u.status).to_lowercase(),
                 kind: format!("{:?}", u.kind).to_lowercase(),
@@ -114,8 +100,8 @@ pub async fn list_memories(
                 content: u.content,
                 updated_at: ts(u.updated_at),
                 created_at: ts(u.created_at),
-            });
-        }
+            })
+            .collect();
         let mut conflicts = Vec::new();
         for c in db
             .list_all_conflicts()

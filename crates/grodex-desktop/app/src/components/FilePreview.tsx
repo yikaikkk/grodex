@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useDeferredMount } from '../lib/useDeferredMount';
 import { X, FileText, Loader2 } from 'lucide-react';
 import * as acp from '../lib/acpClient';
 
@@ -69,11 +70,15 @@ const FilePreviewInner: React.FC<FilePreviewProps> = ({
     el?.scrollIntoView({ block: 'center' });
   }, [content, target?.line]);
 
+  // Overlay shell renders immediately; heavy body mounts one task later
+  // (after the first paint) so click-to-visible is a single frame.
+  const contentMounted = useDeferredMount(isOpen);
   if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-      <div className="w-full max-w-4xl h-[85vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
+      {contentMounted && (
+      <div className="w-full max-w-5xl h-[85vh] rounded-2xl bg-canvas border border-hairline shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 bg-white border-b border-hairline flex items-center justify-between gap-3">
           <div className="flex items-center gap-2.5 min-w-0 flex-1">
@@ -141,6 +146,7 @@ const FilePreviewInner: React.FC<FilePreviewProps> = ({
           )}
         </div>
       </div>
+      )}
     </div>
   );
 };

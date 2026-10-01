@@ -23,10 +23,12 @@ const HeaderInner: React.FC<HeaderProps> = ({
   onOpenMemory,
   onOpenObservability,
 }) => {
+  // backdrop-blur removed: WKWebView re-rasterizes the blur on every scene
+  // repaint (modal open/close, scrolling) at 100ms+ per paint.
   return (
     <header
       id="app-header"
-      className="h-12 border-b border-hairline bg-canvas/80 backdrop-blur-xl flex items-center justify-between px-3 select-none shrink-0 z-20"
+      className="h-12 border-b border-hairline bg-canvas flex items-center justify-between px-3 select-none shrink-0 z-20"
       data-tauri-drag-region
     >
       {/* Left: workspace / session breadcrumb */}

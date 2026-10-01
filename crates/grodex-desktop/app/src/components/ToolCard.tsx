@@ -25,7 +25,7 @@ interface ToolCardProps {
   compact?: boolean;
 }
 
-export const ToolCard: React.FC<ToolCardProps> = ({ item, onOpenDiff, compact }) => {
+const ToolCardInner: React.FC<ToolCardProps> = ({ item, onOpenDiff, compact }) => {
   const [isExpanded, setIsExpanded] = useState(true);
   const [liveElapsed, setLiveElapsed] = useState(item.elapsedSec || 0);
 
@@ -221,3 +221,7 @@ export const ToolCard: React.FC<ToolCardProps> = ({ item, onOpenDiff, compact })
     </div>
   );
 };
+
+/** Memoized: timeline items keep object identity unless changed, so only
+ * the active tool card re-renders per streaming flush. */
+export const ToolCard = React.memo(ToolCardInner);

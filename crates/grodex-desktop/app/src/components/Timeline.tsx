@@ -44,7 +44,11 @@ function groupRows(items: TimelineItem[]): Row[] {
           content: (asstItems as Extract<TimelineItem, { type: 'assistant' }>[])
             .map((a) => a.content)
             .join('\n\n'),
-          isStreaming: false,
+          // Preserve streaming state — the bubble renders plain text while
+          // streaming (markdown re-parse of growing text per frame is O(N²)).
+          isStreaming: (asstItems as Extract<TimelineItem, { type: 'assistant' }>[]).some(
+            (a) => a.isStreaming
+          ),
           timestamp: first.timestamp,
         } as TimelineItem,
       });
@@ -126,13 +130,14 @@ function FrameBody({
 /** A bordered "thinking" frame. Collapsed by default: a short box whose
  * streamed content scrolls inside (and only auto-follows when at the bottom).
  * Clicking the header expands it into a full-size frame. */
-function ThinkingFrame({
-  items,
-  onOpenDiff,
-}: {
-  items: TimelineItem[];
-  onOpenDiff: (diffId: string) => void;
-}) {
+const ThinkingFrame = React.memo(
+  function ThinkingFrame({
+    items,
+    onOpenDiff,
+  }: {
+    items: TimelineItem[];
+    onOpenDiff: (diffId: string) => void;
+  }) {
   const [expanded, setExpanded] = useState(false);
   const toolCount = items.filter((i) => i.type === 'tool').length;
 
@@ -163,7 +168,22 @@ function ThinkingFrame({
       <FrameBody items={items} expanded={expanded} onOpenDiff={onOpenDiff} />
     </div>
   );
-}
+  },
+  (a, b) => {
+    // groupRows builds a NEW items array per render, but the timeline state
+    // preserves object identity for items that did not change (see
+    // flushDeltas / toolFinished), so per-element reference equality lets
+    // completed frames skip re-render during streaming flushes. Only the
+    // frame containing the active thinking/tool item re-renders per frame.
+    if (a.onOpenDiff !== b.onOpenDiff) return false;
+    if (a.items === b.items) return true;
+    if (a.items.length !== b.items.length) return false;
+    for (let i = 0; i < a.items.length; i++) {
+      if (a.items[i] !== b.items[i]) return false;
+    }
+    return true;
+  }
+);
 
 /// Memoized assistant message. Skips re-render when `item` reference is
 /// stable (i.e. not changed during approval/scroll state updates), and
@@ -188,43 +208,47 @@ const AssistantMessage = React.memo(({ item, onPreviewFile }: AssistantMessagePr
     }
   };
 
+  // Markdown parse is expensive on long replies: while streaming, skip it
+  // entirely (plain text renders in its place) — otherwise every frame would
+  // re-parse the full accumulated text (O(N²) over a reply).
   const markdown = useMemo(
-    () => (
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ href, children }) => {
-            const classes =
-              'text-accent underline underline-offset-2 hover:text-accent-hover break-all';
-            // Non-http link = workspace file reference → open the in-app
-            // preview; http(s) links stay real external anchors.
-            if (href && !/^https?:\/\//i.test(href)) {
+    () =>
+      item.isStreaming ? null : (
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            a: ({ href, children }) => {
+              const classes =
+                'text-accent underline underline-offset-2 hover:text-accent-hover break-all';
+              // Non-http link = workspace file reference → open the in-app
+              // preview; http(s) links stay real external anchors.
+              if (href && !/^https?:\/\//i.test(href)) {
+                return (
+                  <a
+                    href="#"
+                    title={href}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      onPreviewFile?.(href.replace(/^file:\/\//, ''));
+                    }}
+                    className={classes}
+                  >
+                    {children}
+                  </a>
+                );
+              }
               return (
-                <a
-                  href="#"
-                  title={href}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    onPreviewFile?.(href.replace(/^file:\/\//, ''));
-                  }}
-                  className={classes}
-                >
+                <a href={href} target="_blank" rel="noreferrer" className={classes}>
                   {children}
                 </a>
               );
-            }
-            return (
-              <a href={href} target="_blank" rel="noreferrer" className={classes}>
-                {children}
-              </a>
-            );
-          },
-        }}
-      >
-        {item.content}
-      </ReactMarkdown>
-    ),
-    [item.content, onPreviewFile]
+            },
+          }}
+        >
+          {item.content}
+        </ReactMarkdown>
+      ),
+    [item.content, item.isStreaming, onPreviewFile]
   );
 
   return (
@@ -237,9 +261,17 @@ const AssistantMessage = React.memo(({ item, onPreviewFile }: AssistantMessagePr
       </div>
       <div className="flex flex-col items-start flex-1 min-w-0">
         <div className="w-full relative rounded-2xl bg-white border border-hairline p-4.5 text-primary shadow-2xs text-sm leading-relaxed break-words">
-          <div className="md-body prose prose-stone prose-sm max-w-none text-primary prose-headings:text-primary prose-headings:font-bold prose-p:leading-relaxed prose-pre:bg-well prose-pre:border prose-pre:border-hairline prose-pre:rounded-xl prose-pre:w-full prose-code:font-mono prose-code:text-primary prose-code:bg-well prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:border prose-code:border-hairline prose-strong:text-primary">
-            {markdown}
-          </div>
+          {item.isStreaming ? (
+            /* Streaming: plain text — markdown re-parses only on completion. */
+            <p className="whitespace-pre-wrap font-sans text-sm leading-relaxed break-words">
+              {item.content}
+              <span className="inline-block w-1.5 h-3.5 ml-1 bg-accent animate-cursor-blink align-middle rounded-full" />
+            </p>
+          ) : (
+            <div className="md-body prose prose-stone prose-sm max-w-none text-primary prose-headings:text-primary prose-headings:font-bold prose-p:leading-relaxed prose-pre:bg-well prose-pre:border prose-pre:border-hairline prose-pre:rounded-xl prose-pre:w-full prose-code:font-mono prose-code:text-primary prose-code:bg-well prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:border prose-code:border-hairline prose-strong:text-primary">
+              {markdown}
+            </div>
+          )}
           <div className="flex items-center justify-between mt-3.5 pt-2.5 border-t border-hairline-2 text-[11px] font-sans text-secondary gap-4">
             <div className="flex items-center gap-3">
               <span className="flex items-center gap-1 font-sans">
@@ -345,7 +377,7 @@ export const Timeline = React.memo(({ items, onOpenDiff, onPreviewFile, scrollTo
     <div
       ref={containerRef}
       id="session-timeline-container"
-      className="flex-1 overflow-y-auto px-4 sm:px-6 py-5 w-full space-y-4 font-sans"
+      className="flex-1 overflow-y-auto px-4 sm:px-6 py-5 w-full space-y-4 font-sans [contain:content]"
     >
       {rows.map((row) =>
         row.kind === 'frame' ? (
