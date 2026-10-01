@@ -1282,15 +1282,66 @@ export async function telemetryDoctor(): Promise<DoctorReport> {
   return invoke<DoctorReport>('telemetry_doctor');
 }
 
+// ── Workspace file preview / tree / search ─────────────────────────────
+
+/** One entry of the lazy file tree (relative paths, '/'-separated). */
+export interface WorkspaceEntryJson {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  ext?: string | null;
+}
+
+/** One search hit; line/column/text are only set by content search. */
+export interface WorkspaceMatchJson {
+  path: string;
+  line?: number | null;
+  column?: number | null;
+  text?: string | null;
+  is_dir: boolean;
+}
+
+/** Read a UTF-8 text file inside the workspace (backend enforces the
+ * security checks: containment, size cap, UTF-8). */
+export async function previewFile(workspace: string, path: string): Promise<string> {
+  return invoke<string>('preview_file', { workspace, path });
+}
+
+/** List one directory of the workspace tree. `path` '' = root. */
+export async function listWorkspaceEntries(
+  workspace: string,
+  path: string = ''
+): Promise<WorkspaceEntryJson[]> {
+  return invoke<WorkspaceEntryJson[]>('list_workspace_entries', { workspace, path });
+}
+
+/** Search file names ('filename') or file contents ('content'). */
+export async function searchWorkspace(
+  workspace: string,
+  query: string,
+  mode: 'filename' | 'content'
+): Promise<WorkspaceMatchJson[]> {
+  return invoke<WorkspaceMatchJson[]>('search_workspace', { workspace, query, mode });
+}
+
 export async function loadConfig(): Promise<SettingsState> {
   const cfg = await invoke<ConfigSummaryJson>('get_config');
   const provider = (cfg.provider || 'deepseek') as SettingsState['provider'];
+  // Merge the persisted [rules] section over the defaults so the approval
+  // pills derive the real current mode from config.toml, not just the
+  // in-memory defaults.
+  let persisted: Partial<SettingsState['permissions']> = {};
+  try {
+    persisted = await invoke<Partial<SettingsState['permissions']>>('get_tool_permissions');
+  } catch {
+    // Missing/corrupt rules section → defaults only.
+  }
   return {
     provider,
     model: cfg.model || 'deepseek-v4-flash',
     wireProtocol: 'acp_stdio',
     sandboxProfile: (cfg.sandboxProfile as SettingsState['sandboxProfile']) || 'workspace',
-    permissions: { ...DEFAULT_PERMISSIONS },
+    permissions: { ...DEFAULT_PERMISSIONS, ...persisted },
   };
 }
 

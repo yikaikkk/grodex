@@ -15,7 +15,7 @@ const STATUS_COLOR: Record<string, string> = {
   orphaned: 'bg-well text-secondary border-hairline',
 };
 
-export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) => {
+const MemoryManagerInner: React.FC<MemoryManagerProps> = ({ isOpen, onClose }) => {
   const [data, setData] = useState<acp.MemoryOverview | null>(null);
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -244,3 +244,6 @@ export const MemoryManager: React.FC<MemoryManagerProps> = ({ isOpen, onClose })
     </div>
   );
 };
+
+/** Memoized: open modal must not re-render on streaming frame flushes. */
+export const MemoryManager = React.memo(MemoryManagerInner);

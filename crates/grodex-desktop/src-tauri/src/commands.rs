@@ -7,6 +7,7 @@ use tauri::State;
 
 use crate::sessions::{self, ConfigSummary, SessionSummary};
 use crate::transport::{self, ControlMsg};
+use std::path::{Component, Path};
 
 /// Long-lived handle to the agent worker's control channel.
 pub struct TransportState(pub Mutex<mpsc::Sender<ControlMsg>>);
@@ -133,6 +134,101 @@ pub fn update_tool_permissions(
         .map_err(|e| format!("重命名临时文件失败: {e}"))?;
 
     Ok(())
+}
+
+/// Read the persisted `[rules]` section from `~/.grodex/config.toml` so the
+/// frontend can derive the current approval mode at startup. Tools not
+/// present in the file are absent from the map (the frontend falls back to
+/// its defaults for those).
+#[tauri::command]
+pub fn get_tool_permissions() -> HashMap<String, String> {
+    let Some(home) = dirs::home_dir() else {
+        return HashMap::new();
+    };
+    let config_path = home.join(".grodex").join("config.toml");
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return HashMap::new();
+    };
+    parse_rules_section(&content)
+}
+
+/// Cap for the file preview command — larger files are rejected rather than
+/// being slurped into the webview.
+const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Read a UTF-8 text file inside the workspace for the frontend preview.
+///
+/// Security model: the requested path is joined onto the canonicalized
+/// workspace root and re-canonicalized, so `..` components AND symlink
+/// escapes both resolve outside the root and are rejected. Only regular
+/// files under the size cap are served, and only if the bytes are valid
+/// UTF-8 (binary files error instead of rendering garbage).
+#[tauri::command]
+pub fn preview_file(workspace: String, path: String) -> Result<String, String> {
+    let root = transport::normalize_workspace(&workspace)?;
+    let root_canon = root
+        .canonicalize()
+        .map_err(|e| format!("无法解析工作区目录: {e}"))?;
+
+    let rel = path.trim().trim_start_matches('/');
+    if rel.is_empty() {
+        return Err("文件路径不能为空".to_string());
+    }
+    let rel_path = Path::new(rel);
+    let traverses_up = rel_path
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir));
+    if traverses_up {
+        return Err("非法文件路径".to_string());
+    }
+
+    let target = root.join(rel_path);
+    let target_canon = target
+        .canonicalize()
+        .map_err(|_| format!("文件不存在: {}", rel))?;
+    if !target_canon.starts_with(&root_canon) {
+        return Err("文件位于工作区之外，拒绝读取".to_string());
+    }
+
+    let meta = std::fs::metadata(&target_canon)
+        .map_err(|e| format!("无法读取文件信息: {e}"))?;
+    if !meta.is_file() {
+        return Err("目标不是普通文件".to_string());
+    }
+    if meta.len() > MAX_PREVIEW_BYTES {
+        return Err(format!(
+            "文件超过 {} MB 预览上限",
+            MAX_PREVIEW_BYTES / 1024 / 1024
+        ));
+    }
+
+    let bytes = std::fs::read(&target_canon).map_err(|e| format!("读取文件失败: {e}"))?;
+    String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本（可能为二进制文件）".to_string())
+}
+
+/// Parse `key = "value"` pairs between the `[rules]` header and the next
+/// section header (or EOF). Malformed lines are skipped.
+fn parse_rules_section(content: &str) -> HashMap<String, String> {
+    let mut rules = HashMap::new();
+    let mut in_rules = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_rules = trimmed == "[rules]";
+            continue;
+        }
+        if !in_rules || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = trimmed.split_once('=') {
+            let key = key.trim();
+            let val = val.trim().trim_matches('"').trim();
+            if !key.is_empty() && !val.is_empty() {
+                rules.insert(key.to_string(), val.to_string());
+            }
+        }
+    }
+    rules
 }
 
 /// Replace the `[rules]` section in `content` with `new_section`.

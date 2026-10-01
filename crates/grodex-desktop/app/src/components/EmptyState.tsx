@@ -11,6 +11,12 @@ import {
   FileCode2,
   ArrowUp,
 } from 'lucide-react';
+import {
+  ApprovalMode,
+  ApprovalModeOrCustom,
+  APPROVAL_MODE_OPTIONS,
+  approvalModeLabel,
+} from '../lib/approval';
 
 type TurnMode = 'Auto' | 'Plan' | 'Build' | 'Review';
 
@@ -24,6 +30,9 @@ interface EmptyStateProps {
   workspace?: string;
   /** Open the directory picker. */
   onChangeWorkspace: () => void;
+  /** Derived approval mode (from settings.permissions) + switch callback. */
+  approvalMode: ApprovalModeOrCustom;
+  onChangeApprovalMode: (mode: ApprovalMode) => void;
 }
 
 export const EmptyState: React.FC<EmptyStateProps> = ({
@@ -32,11 +41,13 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
   modelName,
   workspace,
   onChangeWorkspace,
+  approvalMode,
+  onChangeApprovalMode,
 }) => {
   const [inputText, setInputText] = useState('');
-  const [approvalMode, setApprovalMode] = useState('手动审批');
   const [selectedMode, setSelectedMode] = useState<TurnMode>('Auto');
   const [isModeOpen, setIsModeOpen] = useState(false);
+  const [isApprovalOpen, setIsApprovalOpen] = useState(false);
   const composingRef = useRef(false);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -87,8 +98,8 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
         </h1>
       </div>
 
-      {/* Main Central Input Card (TRAE style) */}
-      <div className="w-full max-w-2xl rounded-2xl border border-hairline bg-white shadow-sm p-4 transition-all focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/10">
+      {/* Main Central Input Card (TRAE style) — soft blue-tinted gradient */}
+      <div className="w-full max-w-2xl rounded-3xl border border-[#cdd9ec] bg-[linear-gradient(135deg,#ffffff,#f8fbff,#f4f7ff)] shadow-[0_8px_30px_rgba(70,91,132,0.10)] p-4 transition-all duration-200 focus-within:border-[#9bbcf0] focus-within:ring-4 focus-within:ring-[#007aff]/[0.07]">
         <textarea
           rows={3}
           value={inputText}
@@ -112,11 +123,43 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
               <Plus className="w-4 h-4" />
             </button>
 
-            {/* 手动审批 dropdown pill */}
-            <div className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-well hover:bg-black/[0.05] text-xs text-primary cursor-pointer transition-colors">
-              <Hand className="w-3.5 h-3.5 text-secondary" />
-              <span className="font-medium text-xs">{approvalMode}</span>
-              <ChevronDown className="w-3 h-3 text-tertiary" />
+            {/* Approval-mode dropdown pill: same state as the session composer */}
+            <div className="relative">
+              <button
+                id="empty-state-approval-btn"
+                onClick={() => setIsApprovalOpen(!isApprovalOpen)}
+                className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-well hover:bg-black/[0.05] text-xs text-primary cursor-pointer transition-colors"
+                title="切换工具审批模式（写入 ~/.grodex/config.toml 并热加载）"
+              >
+                <Hand className="w-3.5 h-3.5 text-secondary" />
+                <span className="font-medium text-xs">{approvalModeLabel(approvalMode)}</span>
+                <ChevronDown className="w-3 h-3 text-tertiary" />
+              </button>
+
+              {isApprovalOpen && (
+                <div
+                  id="empty-state-approval-menu"
+                  className="absolute bottom-full left-0 mb-2 w-56 rounded-xl border border-hairline bg-white shadow-xl py-1.5 z-30 text-xs"
+                >
+                  {APPROVAL_MODE_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.id}
+                      onClick={() => {
+                        onChangeApprovalMode(opt.id);
+                        setIsApprovalOpen(false);
+                      }}
+                      className={`w-full px-3 py-1.5 text-left transition-colors ${
+                        approvalMode === opt.id
+                          ? 'bg-accent-soft text-accent font-semibold'
+                          : 'text-secondary hover:bg-well'
+                      }`}
+                    >
+                      <div className="font-medium text-primary">{opt.label}</div>
+                      <div className="text-[10px] text-tertiary">{opt.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Model logos indicator badge */}

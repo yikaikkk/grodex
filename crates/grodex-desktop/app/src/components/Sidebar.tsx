@@ -23,7 +23,7 @@ function folderName(ws: string): string {
   return segs.length > 0 ? segs[segs.length - 1] : trimmed;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({
+const SidebarInner: React.FC<SidebarProps> = ({
   sessions,
   activeSessionId,
   onSelectSession,
@@ -202,3 +202,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
     </aside>
   );
 };
+
+/** Memoized: streaming frame flushes must not re-render the session list. */
+export const Sidebar = React.memo(SidebarInner);

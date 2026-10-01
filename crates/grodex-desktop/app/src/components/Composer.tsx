@@ -16,6 +16,12 @@ import {
   Folder,
 } from 'lucide-react';
 import { SteerSuggestion } from '../types';
+import {
+  ApprovalMode,
+  ApprovalModeOrCustom,
+  APPROVAL_MODE_OPTIONS,
+  approvalModeLabel,
+} from '../lib/approval';
 
 interface ComposerProps {
   onSend: (message: string, mode: string, model: string) => void;
@@ -36,6 +42,9 @@ interface ComposerProps {
   onClearTimeline?: () => void;
   /** Current working directory, shown in the status bar. */
   workspace?: string;
+  /** Derived approval mode (from settings.permissions) + switch callback. */
+  approvalMode: ApprovalModeOrCustom;
+  onChangeApprovalMode: (mode: ApprovalMode) => void;
 }
 
 interface SlashCommand {
@@ -49,7 +58,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { command: '/clear', label: '/clear', description: '清空当前会话的时间线消息', icon: <Trash2 className="w-3.5 h-3.5" /> },
 ];
 
-export const Composer: React.FC<ComposerProps> = ({
+const ComposerInner: React.FC<ComposerProps> = ({
   onSend,
   onStop,
   isRunning,
@@ -66,10 +75,13 @@ export const Composer: React.FC<ComposerProps> = ({
   onClearTimeline,
   modelName,
   workspace,
+  approvalMode,
+  onChangeApprovalMode,
 }) => {
   const [inputText, setInputText] = useState('');
   const [selectedMode, setSelectedMode] = useState<'Auto' | 'Plan' | 'Build' | 'Review'>('Auto');
   const [isModeOpen, setIsModeOpen] = useState(false);
+  const [isApprovalOpen, setIsApprovalOpen] = useState(false);
 
   // Slash commands popup state
   const [showSlashMenu, setShowSlashMenu] = useState(false);
@@ -252,11 +264,43 @@ export const Composer: React.FC<ComposerProps> = ({
               <FileCode className="w-4 h-4" />
             </button>
 
-            {/* 手动审批 pill */}
-            <div className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-well hover:bg-black/[0.05] text-xs text-primary cursor-pointer transition-colors">
-              <ShieldCheck className="w-3.5 h-3.5 text-secondary" />
-              <span className="font-medium text-xs">手动审批</span>
-              <ChevronDown className="w-3 h-3 text-tertiary" />
+            {/* Approval-mode pill: writes a uniform rule set to config.toml */}
+            <div className="relative">
+              <button
+                id="composer-approval-btn"
+                onClick={() => setIsApprovalOpen(!isApprovalOpen)}
+                className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-well hover:bg-black/[0.05] text-xs text-primary cursor-pointer transition-colors"
+                title="切换工具审批模式（写入 ~/.grodex/config.toml 并热加载）"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 text-secondary" />
+                <span className="font-medium text-xs">{approvalModeLabel(approvalMode)}</span>
+                <ChevronDown className="w-3 h-3 text-tertiary" />
+              </button>
+
+              {isApprovalOpen && (
+                <div
+                  id="composer-approval-menu"
+                  className="absolute bottom-full left-0 mb-2 w-56 rounded-xl border border-hairline bg-white shadow-xl py-1.5 z-30 text-xs"
+                >
+                  {APPROVAL_MODE_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.id}
+                      onClick={() => {
+                        onChangeApprovalMode(opt.id);
+                        setIsApprovalOpen(false);
+                      }}
+                      className={`w-full px-3 py-1.5 text-left transition-colors ${
+                        approvalMode === opt.id
+                          ? 'bg-accent-soft text-accent font-semibold'
+                          : 'text-secondary hover:bg-well'
+                      }`}
+                    >
+                      <div className="font-medium text-primary">{opt.label}</div>
+                      <div className="text-[10px] text-tertiary">{opt.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Model pill — read-only, reflects the real configured model */}
@@ -353,3 +397,7 @@ export const Composer: React.FC<ComposerProps> = ({
     </div>
   );
 };
+
+/** Memoized: streaming frame flushes re-render the Timeline only, not the
+ * composer — keeps typing/clicking responsive mid-turn. */
+export const Composer = React.memo(ComposerInner);

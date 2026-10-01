@@ -23,7 +23,7 @@ interface AgentTreePanelProps {
   onInterruptAgent: (agentId: string) => void;
 }
 
-export const AgentTreePanel: React.FC<AgentTreePanelProps> = ({
+const AgentTreePanelInner: React.FC<AgentTreePanelProps> = ({
   isOpen,
   onClose,
   subagents,
@@ -110,8 +110,9 @@ export const AgentTreePanel: React.FC<AgentTreePanelProps> = ({
         <span>子 Agent 在独立的隔离上下文中并行协作运行。</span>
       </div>
 
-      {/* Tree list */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
+      {/* Tree list — scrollbar-gutter:stable keeps the content width constant
+          whether or not the scrollbar is showing, so cards never shift. */}
+      <div className="flex-1 overflow-y-scroll [scrollbar-gutter:stable] p-3 space-y-2.5">
         {subagents.map((agent) => {
           const isExpanded = expandedAgents[agent.id] ?? false;
           const isChild = agent.parentId !== '';
@@ -120,27 +121,27 @@ export const AgentTreePanel: React.FC<AgentTreePanelProps> = ({
             <div
               key={agent.id}
               id={`agent-node-${agent.id}`}
-              className={`rounded-xl border transition-all ${
+              className={`w-full min-w-0 rounded-xl border transition-colors ${
                 isChild
-                  ? 'ml-3 border-l-2 border-l-accent border-hairline bg-card shadow-2xs'
+                  ? 'border-l-2 border-l-accent border-hairline bg-card shadow-2xs'
                   : 'border-hairline bg-white shadow-2xs'
               }`}
             >
               {/* Node Header */}
               <div className="p-3 space-y-2">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2 min-w-0">
                   <button
                     onClick={() => toggleExpand(agent.id)}
-                    className="flex items-center gap-1.5 font-medium text-xs text-primary hover:text-primary text-left"
+                    className="flex items-center gap-1.5 min-w-0 flex-1 font-medium text-xs text-primary hover:text-primary text-left"
                   >
                     {isExpanded ? (
-                      <ChevronDown className="w-3.5 h-3.5 text-secondary" />
+                      <ChevronDown className="w-3.5 h-3.5 text-secondary shrink-0" />
                     ) : (
-                      <ChevronRight className="w-3.5 h-3.5 text-secondary" />
+                      <ChevronRight className="w-3.5 h-3.5 text-secondary shrink-0" />
                     )}
-                    <span className="font-semibold">{agent.name}</span>
+                    <span className="font-semibold truncate">{agent.name}</span>
                   </button>
-                  {getStatusBadge(agent.status)}
+                  <div className="shrink-0">{getStatusBadge(agent.status)}</div>
                 </div>
 
                 <p className="text-[11px] text-secondary font-sans leading-tight pl-5 line-clamp-2">
@@ -210,7 +211,8 @@ export const AgentTreePanel: React.FC<AgentTreePanelProps> = ({
                   <div className="text-[9px] uppercase font-sans text-secondary font-bold tracking-wider">
                     实时执行日志
                   </div>
-                  <div className="space-y-0.5 max-h-28 overflow-y-auto font-mono text-[10px] text-secondary leading-normal">
+                  {/* 实时日志内部同样固定滚动条槽位，展开时不改变卡片内容宽度 */}
+                  <div className="space-y-0.5 max-h-28 overflow-y-auto [scrollbar-gutter:stable] font-mono text-[10px] text-secondary leading-normal">
                     {agent.logs.map((log, lIdx) => (
                       <div key={lIdx} className="truncate flex items-center gap-1.5">
                         <span className="text-tertiary">›</span>
@@ -227,3 +229,7 @@ export const AgentTreePanel: React.FC<AgentTreePanelProps> = ({
     </aside>
   );
 };
+
+/** Memoized: subagent cards only re-render when subagent state changes,
+ * not on every streaming frame. */
+export const AgentTreePanel = React.memo(AgentTreePanelInner);

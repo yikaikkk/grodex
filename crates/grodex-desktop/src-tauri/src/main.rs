@@ -11,6 +11,7 @@ mod memory_ui;
 mod sessions;
 mod telemetry_ui;
 mod transport;
+mod workspace_ui;
 
 use std::sync::{mpsc, Mutex};
 
@@ -42,6 +43,10 @@ fn main() {
             commands::delete_session,
             commands::purge_empty_sessions,
             commands::update_tool_permissions,
+            commands::get_tool_permissions,
+            commands::preview_file,
+            workspace_ui::list_workspace_entries,
+            workspace_ui::search_workspace,
             memory_ui::list_memories,
             memory_ui::delete_memory,
             memory_ui::run_memory_maintenance,

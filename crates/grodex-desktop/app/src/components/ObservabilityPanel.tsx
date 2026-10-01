@@ -39,7 +39,7 @@ function StatCard({ label, value, hint }: { label: string; value: string; hint?:
   );
 }
 
-export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
+const ObservabilityPanelInner: React.FC<ObservabilityPanelProps> = ({
   isOpen,
   onClose,
   sessions,
@@ -88,16 +88,13 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
 
   const handleSelectSession = (id: string) => setSelectedSessionId(id);
 
-  if (!isOpen) return null;
-
-  const models = overview?.models ?? [];
-  const cache = overview?.cache ?? [];
-  const turns = detail?.turns ?? [];
-
   // Per-turn rolled-up figures (first attempt's TTFT + summed tokens).
-  // useMemo: the panel re-renders on every App-level update (e.g. streaming
-  // rAF flushes); recomputing this O(turns x attempts) reduction each frame
-  // made opening the panel feel like a freeze on long sessions.
+  // useMemo + all state MUST live above the `if (!isOpen) return null`
+  // early return — hook order must be identical for open and closed
+  // renders, or React throws "rendered more hooks" and unmounts the whole
+  // app (white screen). This reduction is O(turns x attempts); memoizing
+  // it also keeps the open-panel cost off the streaming rAF path.
+  const turns = detail?.turns ?? [];
   const turnStats = useMemo(
     () =>
       turns.map((t) => {
@@ -115,6 +112,11 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
   // 渐进渲染：长会话首帧只渲染 30 行，避免点击那一帧同步拼出整张表。
   const [renderedTurns, setRenderedTurns] = useState(30);
   const visibleTurnStats = turnStats.slice(0, renderedTurns);
+
+  if (!isOpen) return null;
+
+  const models = overview?.models ?? [];
+  const cache = overview?.cache ?? [];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
@@ -417,3 +419,7 @@ export const ObservabilityPanel: React.FC<ObservabilityPanelProps> = ({
     </div>
   );
 };
+
+/** Memoized: open modal must not re-render on streaming frame flushes
+ * (its heavy turn-table only recomputes on its own state changes). */
+export const ObservabilityPanel = React.memo(ObservabilityPanelInner);

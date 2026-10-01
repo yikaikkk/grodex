@@ -1,19 +1,24 @@
-import { Settings, GitBranch, Brain, Activity, Folder } from 'lucide-react';
+import React from 'react';
+import { Settings, GitBranch, Brain, Activity, Folder, Files } from 'lucide-react';
 import { Session } from '../types';
 
 interface HeaderProps {
   session?: Session;
   onToggleAgentTree: () => void;
   isAgentTreeOpen: boolean;
+  onToggleWorkspace: () => void;
+  isWorkspaceOpen: boolean;
   onOpenSettings: () => void;
   onOpenMemory: () => void;
   onOpenObservability: () => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({
+const HeaderInner: React.FC<HeaderProps> = ({
   session,
   onToggleAgentTree,
   isAgentTreeOpen,
+  onToggleWorkspace,
+  isWorkspaceOpen,
   onOpenSettings,
   onOpenMemory,
   onOpenObservability,
@@ -45,6 +50,19 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* Right: actions */}
       <div className="flex items-center gap-0.5">
+        <button
+          id="header-workspace-toggle-btn"
+          onClick={onToggleWorkspace}
+          className={`flex items-center gap-1 p-1.5 rounded-lg text-xs font-medium transition-all active:scale-95 ${
+            isWorkspaceOpen
+              ? 'bg-accent-soft text-accent'
+              : 'text-secondary hover:bg-black/[0.05] hover:text-primary'
+          }`}
+          title="展开/收起工作区文件面板"
+        >
+          <Files className="w-4 h-4" />
+        </button>
+
         <button
           id="header-agent-tree-toggle-btn"
           onClick={onToggleAgentTree}
@@ -88,3 +106,7 @@ export const Header: React.FC<HeaderProps> = ({
     </header>
   );
 };
+
+/** Memoized: during streaming the App re-renders every animation frame;
+ * skipping Header keeps the top-bar buttons responsive. */
+export const Header = React.memo(HeaderInner);

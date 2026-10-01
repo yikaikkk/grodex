@@ -8,6 +8,8 @@ import { ToolCard } from './ToolCard';
 interface TimelineProps {
   items: TimelineItem[];
   onOpenDiff: (diffId?: string) => void;
+  /** Open a workspace file in the preview panel (markdown file links). */
+  onPreviewFile?: (path: string, line?: number, column?: number) => void;
   /** Opaque value bumped each time the timeline is rebuilt from a snapshot for
    * the active session — on change, jump to the bottom (opening a session
    * must not require the user to scroll down). */
@@ -169,9 +171,11 @@ function ThinkingFrame({
 /// streaming updates only re-parse the one item that changed.
 interface AssistantMessageProps {
   item: AssistantMessageItem;
+  /** Markdown file links (relative paths, file://) route here. */
+  onPreviewFile?: (path: string, line?: number, column?: number) => void;
 }
 
-const AssistantMessage = React.memo(({ item }: AssistantMessageProps) => {
+const AssistantMessage = React.memo(({ item, onPreviewFile }: AssistantMessageProps) => {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
@@ -185,8 +189,42 @@ const AssistantMessage = React.memo(({ item }: AssistantMessageProps) => {
   };
 
   const markdown = useMemo(
-    () => <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>,
-    [item.content]
+    () => (
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ href, children }) => {
+            const classes =
+              'text-accent underline underline-offset-2 hover:text-accent-hover break-all';
+            // Non-http link = workspace file reference → open the in-app
+            // preview; http(s) links stay real external anchors.
+            if (href && !/^https?:\/\//i.test(href)) {
+              return (
+                <a
+                  href="#"
+                  title={href}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    onPreviewFile?.(href.replace(/^file:\/\//, ''));
+                  }}
+                  className={classes}
+                >
+                  {children}
+                </a>
+              );
+            }
+            return (
+              <a href={href} target="_blank" rel="noreferrer" className={classes}>
+                {children}
+              </a>
+            );
+          },
+        }}
+      >
+        {item.content}
+      </ReactMarkdown>
+    ),
+    [item.content, onPreviewFile]
   );
 
   return (
@@ -234,7 +272,7 @@ const AssistantMessage = React.memo(({ item }: AssistantMessageProps) => {
   );
 });
 
-export const Timeline = React.memo(({ items, onOpenDiff, scrollToKey }: TimelineProps) => {
+export const Timeline = React.memo(({ items, onOpenDiff, onPreviewFile, scrollToKey }: TimelineProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -282,7 +320,7 @@ export const Timeline = React.memo(({ items, onOpenDiff, scrollToKey }: Timeline
           className="flex justify-end my-3 pl-12 sm:pl-24"
         >
           <div className="flex flex-col items-end max-w-[85%] sm:max-w-[75%]">
-            <div className="relative rounded-2xl rounded-br-md bg-accent text-white px-4 py-2.5 text-sm leading-relaxed shadow-sm break-words select-text">
+            <div className="user-message-bubble relative rounded-2xl rounded-br-md text-white px-4 py-2.5 text-sm leading-relaxed break-words select-text">
               <p className="whitespace-pre-wrap font-sans text-sm bubble-wrap">
                 {item.content}
               </p>
@@ -298,7 +336,7 @@ export const Timeline = React.memo(({ items, onOpenDiff, scrollToKey }: Timeline
     }
 
     if (item.type !== 'assistant') return null;
-    return <AssistantMessage key={item.id} item={item} />;
+    return <AssistantMessage key={item.id} item={item} onPreviewFile={onPreviewFile} />;
   };
 
   const rows = groupRows(items);

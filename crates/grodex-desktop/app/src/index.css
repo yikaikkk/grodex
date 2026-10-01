@@ -124,6 +124,22 @@
     overflow-wrap: anywhere;
     word-break: break-word;
   }
+
+  /* User message bubble: low-saturation gray-blue gradient — softer than the
+     accent color so links / tool cards still read as interactive. */
+  .user-message-bubble {
+    background: linear-gradient(135deg, #5578b5 0%, #6577ad 100%);
+    box-shadow: 0 4px 12px rgba(70, 91, 132, 0.14);
+  }
+
+  /* Selection inside the bubble: translucent white on white text keeps the
+     selection readable; the global blue selection washes out on this
+     gradient. */
+  .user-message-bubble ::selection,
+  .user-message-bubble::selection {
+    background-color: rgba(255, 255, 255, 0.34);
+    color: #ffffff;
+  }
 }
 
 /* Neutral macOS scrollbars — hairline thumb, transparent track. */

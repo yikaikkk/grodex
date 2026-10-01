@@ -9,6 +9,12 @@ import {
 } from './types';
 import * as acp from './lib/acpClient';
 import { eventBus } from './lib/eventBus';
+import {
+  ApprovalMode,
+  approvalModeLabel,
+  modeToPermissions,
+  permissionsToMode,
+} from './lib/approval';
 import { open as openDirectoryDialog } from '@tauri-apps/plugin-dialog';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
@@ -21,6 +27,8 @@ import { EmptyState } from './components/EmptyState';
 import { MemoryManager } from './components/MemoryManager';
 import { ObservabilityPanel } from './components/ObservabilityPanel';
 import { DiffViewer } from './components/DiffViewer';
+import { WorkspacePanel } from './components/WorkspacePanel';
+import { FilePreview, FilePreviewTarget } from './components/FilePreview';
 import { AlertTriangle, RotateCcw, XCircle, Check, Loader2, Trash2 } from 'lucide-react';
 
 interface IndeterminateReq {
@@ -58,6 +66,12 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [isMemoryOpen, setIsMemoryOpen] = useState<boolean>(false);
   const [isObservabilityOpen, setIsObservabilityOpen] = useState<boolean>(false);
+  // Workspace file panel — mutually exclusive with the agent tree so two
+  // wide side panels never squeeze the timeline at once.
+  const [isWorkspaceOpen, setIsWorkspaceOpen] = useState<boolean>(false);
+  // Currently previewed file (FilePreview resolves it against the active
+  // workspace; `null` = closed).
+  const [previewTarget, setPreviewTarget] = useState<FilePreviewTarget | null>(null);
   /** Per-session latest diff id — a global single value leaked the previous
    * session's diff after switching. */
   const [lastDiffIds, setLastDiffIds] = useState<Record<string, string>>({});
@@ -86,9 +100,37 @@ export default function App() {
     sessions.find((s) => s.id === activeSessionId) || sessions[0];
   const currentTimeline = timelines[activeSessionId] || [];
 
-  const showNotice = (message: string, kind = 'info') => {
+  // NOTE: every handler passed to a memoized child (Sidebar, Header,
+  // Composer, panels, modals) is wrapped in useCallback with explicit deps.
+  // During streaming, App re-renders once per animation frame; stable
+  // callbacks + child memo are what keep those frames confined to the
+  // Timeline instead of re-rendering open modals and the whole chrome.
+
+  const showNotice = useCallback((message: string, kind = 'info') => {
     setNotice({ message, kind });
-  };
+  }, []);
+
+  // ── Approval mode (composer pill ⇄ settings.permissions) ────────────
+  // Derived from the permission set so SettingsModal edits and pill switches
+  // share one source of truth; a mixed set shows up as 自定义权限.
+  const approvalMode = permissionsToMode(settings.permissions);
+  const applyApprovalMode = useCallback(
+    async (mode: ApprovalMode): Promise<void> => {
+    const perms = modeToPermissions(mode);
+    const prev = settings;
+    setSettings({ ...settings, permissions: perms });
+    try {
+      await acp.updateToolPermissions(perms);
+      showNotice(
+        `审批模式已切换为「${approvalModeLabel(mode)}」，已写入 ~/.grodex/config.toml 并热加载`
+      );
+    } catch (e: any) {
+      setSettings(prev);
+      showNotice(`审批模式切换失败：${e?.message || e}`, 'error');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings, showNotice]);
+
 
   // Auto-dismiss notices.
   useEffect(() => {
@@ -96,6 +138,15 @@ export default function App() {
     const t = setTimeout(() => setNotice(null), 6000);
     return () => clearTimeout(t);
   }, [notice]);
+
+  // Stable callback so Timeline's memoized AssistantMessage doesn't re-render
+  // on every App render. Opens the FilePreview modal; data loads inside.
+  const handleOpenFile = useCallback(
+    (path: string, line?: number, column?: number): void => {
+      setPreviewTarget({ path, line, column });
+    },
+    []
+  );
 
   // ── Event bus subscriptions ─────────────────────────────────────────
   useEffect(() => {
@@ -446,10 +497,11 @@ export default function App() {
   // ── Actions ────────────────────────────────────────────────────────
   /** Resolve a workspace directory, prompting via an in-app dialog when the
    * current workspace is empty (window.prompt is unavailable in Tauri). */
-  const ensureWorkspacePath = async (): Promise<string> => {
+  const ensureWorkspacePath = useCallback(async (): Promise<string> => {
     if (workspace) return workspace;
     return promptForWorkspace();
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace]);
 
   const submitDirDialog = () => {
     const path = dirInput.trim();
@@ -462,7 +514,7 @@ export default function App() {
   /** Open the native macOS directory picker and resolve to the selected path.
    * Falls back to the manual text-input dialog if the native dialog is
    * unavailable (e.g. running outside the Tauri shell) or cancelled. */
-  const promptForWorkspace = async (): Promise<string> => {
+  const promptForWorkspace = useCallback(async (): Promise<string> => {
     try {
       const selected = await openDirectoryDialog({
         directory: true,
@@ -483,7 +535,8 @@ export default function App() {
         dirResolveRef.current = resolve;
       });
     }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace]);
 
   /** "新建任务" only switches to an empty page — it does NOT spawn a process
    * or create a session. A real session is only created on the first message
@@ -491,7 +544,7 @@ export default function App() {
    * workspace MUST be cleared here so that ensureWorkspacePath() will pop up
    * the directory picker on the next send instead of silently reusing the
    * previous session's cwd. */
-  const handleNewSession = async (): Promise<void> => {
+  const handleNewSession = useCallback(async (): Promise<void> => {
     if (isRunning) await acp.stop();
     setPendingApprovals([]);
     setIndeterminate(null);
@@ -499,11 +552,11 @@ export default function App() {
     setActiveSessionId('');
     setWorkspace('');
     setNotice(null);
-  };
+  }, [isRunning]);
 
   /** First real message on the empty page: choose a workspace, spawn the agent
    * and register the session row, so nothing is created until the user sends. */
-  const prepareSessionForTurn = async (): Promise<boolean> => {
+  const prepareSessionForTurn = useCallback(async (): Promise<boolean> => {
     const cwd = await ensureWorkspacePath();
     if (!cwd) return false;
     setWorkspace(cwd);
@@ -533,9 +586,11 @@ export default function App() {
       ...prev,
     ]);
     return true;
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ensureWorkspacePath, showNotice]);
 
-  const handleSelectSession = async (sessionId: string) => {
+  const handleSelectSession = useCallback(
+    async (sessionId: string) => {
     if (sessionId === activeSessionId) return;
     if (isRunning) await acp.stop();
     setPendingApprovals([]);
@@ -564,9 +619,11 @@ export default function App() {
     } catch (e: any) {
       showNotice(`打开会话失败：${e?.message || e}`, 'error');
     }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessionId, isRunning, sessions, workspace, showNotice]);
 
-  const handleSendPrompt = async (text: string, mode: string = 'Auto') => {
+  const handleSendPrompt = useCallback(
+    async (text: string, mode: string = 'Auto') => {
     // ── Mid-stream Steer: input while a turn is running redirects it ──
     // The Composer already gates its own input; this covers the path where
     // isRunning flipped after the composer opened.
@@ -653,9 +710,10 @@ export default function App() {
       showNotice(`发送失败：${e?.message || e}`, 'error');
       setIsRunning(false);
     }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRunning, activeSessionId, prepareSessionForTurn, sessions, workspace, showNotice]);
 
-  const handleRefreshSessions = async () => {
+  const handleRefreshSessions = useCallback(async () => {
     try {
       const list = await acp.listSessions();
       setSessions(list);
@@ -663,18 +721,19 @@ export default function App() {
     } catch (e: any) {
       showNotice(`刷新失败：${e?.message || e}`, 'error');
     }
-  };
+  }, [showNotice]);
 
-  const handleStop = async () => {
+  const handleStop = useCallback(async () => {
     try {
       await acp.stop();
     } catch {
       /* ignore */
     }
     setIsRunning(false);
-  };
+  }, []);
 
-  const handleResolveApproval = async (
+  const handleResolveApproval = useCallback(
+    async (
     approvalId: string,
     action: 'allowed_once' | 'always_allowed' | 'denied' | 'narrowed',
     narrowedParams?: any,
@@ -695,19 +754,22 @@ export default function App() {
       }
       showNotice(`审批回复失败：${e?.message || e}`, 'error');
     }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingApprovals, showNotice]);
 
   /** Show the in-app delete confirmation (window.confirm is unavailable). */
-  const handleDeleteSession = (sessionId: string) => {
+  const handleDeleteSession = useCallback(
+    (sessionId: string) => {
     if (sessionId === activeSessionId) {
       showNotice('当前打开的会话不能删除，请先切换到其他会话', 'error');
       return;
     }
     const target = sessions.find((s) => s.id === sessionId);
     setConfirmDelete({ sessionId, title: target?.title || sessionId });
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessionId, sessions, showNotice]);
 
-  const performDeleteSession = async (sessionId: string) => {
+  const performDeleteSession = useCallback(async (sessionId: string) => {
     try {
       await acp.deleteSession(sessionId);
     } catch (e: any) {
@@ -722,21 +784,19 @@ export default function App() {
     });
     setConfirmDelete(null);
     showNotice('会话已删除');
-  };
+  }, [showNotice]);
 
-  const handleResolveIndeterminate = async (
-    callId: string,
-    resolution: 'succeeded' | 'failed' | 'retry',
-  ) => {
+  const handleResolveIndeterminate = useCallback(
+    async (callId: string, resolution: 'succeeded' | 'failed' | 'retry') => {
     try {
       await acp.resolveIndeterminate(callId, resolution);
     } catch (e: any) {
       showNotice(`裁决失败：${e?.message || e}`, 'error');
     }
     setIndeterminate(null);
-  };
+  }, [showNotice]);
 
-  const noopSteerAdopt = () => showNotice('此版本未提供干预建议');
+  const noopSteerAdopt = useCallback(() => showNotice('此版本未提供干预建议'), [showNotice]);
   const handleOpenDiff = useCallback(
     (diffId?: string) => {
       const id = diffId || lastDiffIds[activeIdRef.current];
@@ -746,7 +806,56 @@ export default function App() {
         showNotice('当前会话还没有文件变更');
       }
     },
-    [lastDiffIds]
+    [lastDiffIds, showNotice]
+  );
+
+  // ── Stable UI toggles (passed to memoized chrome + modals) ─────────
+  const toggleAgentTreePanel = useCallback(() => {
+    setIsAgentTreeOpen((v) => !v);
+    setIsWorkspaceOpen(false);
+  }, []);
+  const toggleWorkspacePanel = useCallback(() => {
+    setIsWorkspaceOpen((v) => !v);
+    setIsAgentTreeOpen(false);
+  }, []);
+  const closeAgentTree = useCallback(() => setIsAgentTreeOpen(false), []);
+  const closeWorkspace = useCallback(() => setIsWorkspaceOpen(false), []);
+  const openSettings = useCallback(() => setIsSettingsOpen(true), []);
+  const openMemory = useCallback(() => setIsMemoryOpen(true), []);
+  const openObservability = useCallback(() => setIsObservabilityOpen(true), []);
+  const closeSettings = useCallback(() => setIsSettingsOpen(false), []);
+  const closeMemory = useCallback(() => setIsMemoryOpen(false), []);
+  const closeObservability = useCallback(() => setIsObservabilityOpen(false), []);
+  const closeDiff = useCallback(() => setIsDiffOpen(false), []);
+  const closePreview = useCallback(() => setPreviewTarget(null), []);
+  const dismissSteer = useCallback(() => {}, []);
+  const resumeCrashedNotice = useCallback(
+    () => showNotice('崩溃恢复：从任务列表重新打开该会话即可续接'),
+    [showNotice]
+  );
+  const clearActiveTimeline = useCallback(() => {
+    setTimelines((prev) => ({ ...prev, [activeIdRef.current]: [] }));
+  }, []);
+  const changeWorkspace = useCallback((ws: string) => setWorkspace(ws), []);
+  const focusAgent = useCallback(
+    (id: string) => showNotice(`已聚焦 ${id}（预览占位）`),
+    [showNotice]
+  );
+  const interruptAgent = useCallback(
+    () => showNotice('子代理中断在当前 ACP 版本暂不支持', 'error'),
+    [showNotice]
+  );
+  const saveSettings = useCallback(
+    async (s: SettingsState) => {
+      setSettings(s);
+      try {
+        await acp.updateToolPermissions(s.permissions);
+        showNotice('工具权限已写入 ~/.grodex/config.toml，agent 已热加载');
+      } catch (e: any) {
+        showNotice(`工具权限写入失败：${e?.message || e}`, 'error');
+      }
+    },
+    [showNotice]
   );
 
   return (
@@ -754,11 +863,13 @@ export default function App() {
       {/* Top Application Header */}
       <Header
         session={activeSession}
-        onToggleAgentTree={() => setIsAgentTreeOpen(!isAgentTreeOpen)}
+        onToggleAgentTree={toggleAgentTreePanel}
         isAgentTreeOpen={isAgentTreeOpen}
-        onOpenSettings={() => setIsSettingsOpen(true)}
-        onOpenMemory={() => setIsMemoryOpen(true)}
-        onOpenObservability={() => setIsObservabilityOpen(true)}
+        onToggleWorkspace={toggleWorkspacePanel}
+        isWorkspaceOpen={isWorkspaceOpen}
+        onOpenSettings={openSettings}
+        onOpenMemory={openMemory}
+        onOpenObservability={openObservability}
       />
 
       {/* Floating toast (notice / compaction) — overlays, never shifts layout */}
@@ -793,11 +904,11 @@ export default function App() {
           activeSessionId={activeSessionId}
           onSelectSession={handleSelectSession}
           onNewSession={handleNewSession}
-          onResumeSession={(sid) => handleSelectSession(sid)}
+          onResumeSession={handleSelectSession}
           onDeleteSession={handleDeleteSession}
           onRefreshSessions={handleRefreshSessions}
           workspace={workspace}
-          onChangeWorkspace={(ws) => setWorkspace(ws)}
+          onChangeWorkspace={changeWorkspace}
           onRunDemo={handleNewSession}
         />
 
@@ -815,17 +926,20 @@ export default function App() {
               modelName={settings.model}
               workspace={workspace}
               onChangeWorkspace={promptForWorkspace}
+              approvalMode={approvalMode}
+              onChangeApprovalMode={applyApprovalMode}
             />
           ) : (
             <>
               <Timeline
                 items={currentTimeline}
                 onOpenDiff={handleOpenDiff}
+                onPreviewFile={handleOpenFile}
                 scrollToKey={timelineReveal}
               />
 
               <Composer
-                onSend={(text, mode) => handleSendPrompt(text, mode)}
+                onSend={handleSendPrompt}
                 onStop={handleStop}
                 isRunning={isRunning}
                 activeSessionId={activeSession?.id || activeSessionId}
@@ -836,25 +950,33 @@ export default function App() {
                 modelName={settings.model || activeSession?.model}
                 steerSuggestion={null}
                 onAdoptSteer={noopSteerAdopt}
-                onDismissSteer={() => {}}
+                onDismissSteer={dismissSteer}
                 onOpenDiff={handleOpenDiff}
-                onResumeCrashed={() => showNotice('崩溃恢复：从任务列表重新打开该会话即可续接')}
-                onClearTimeline={() =>
-                  setTimelines((prev) => ({ ...prev, [activeSessionId]: [] }))
-                }
+                onResumeCrashed={resumeCrashedNotice}
+                onClearTimeline={clearActiveTimeline}
                 workspace={activeSession?.workspace || workspace}
+                approvalMode={approvalMode}
+                onChangeApprovalMode={applyApprovalMode}
               />
             </>
           )}
         </main>
 
-        {/* Right Collapsible Agent Tree Panel */}
+        {/* Right collapsible side panels — mutually exclusive (see Header
+            toggles): workspace files OR the agent tree, never both. */}
+        <WorkspacePanel
+          isOpen={isWorkspaceOpen}
+          onClose={closeWorkspace}
+          workspace={activeSession?.workspace || workspace}
+          onOpenFile={handleOpenFile}
+        />
+
         <AgentTreePanel
           isOpen={isAgentTreeOpen}
-          onClose={() => setIsAgentTreeOpen(false)}
+          onClose={closeAgentTree}
           subagents={subagents}
-          onFocusAgent={(id) => showNotice(`已聚焦 ${id}（预览占位）`)}
-          onInterruptAgent={(id) => showNotice(`子代理中断在当前 ACP 版本暂不支持`, 'error')}
+          onFocusAgent={focusAgent}
+          onInterruptAgent={interruptAgent}
         />
       </div>
 
@@ -1000,39 +1122,32 @@ export default function App() {
       {isSettingsOpen && (
         <SettingsModal
           isOpen={isSettingsOpen}
-          onClose={() => setIsSettingsOpen(false)}
+          onClose={closeSettings}
           settings={settings}
-          onSave={async (s) => {
-            setSettings(s);
-            try {
-              await acp.updateToolPermissions(s.permissions);
-              showNotice('工具权限已写入 ~/.grodex/config.toml，agent 已热加载');
-            } catch (e: any) {
-              showNotice(`工具权限写入失败：${e?.message || e}`, 'error');
-            }
-          }}
+          onSave={saveSettings}
         />
       )}
 
       {/* Memory management panel */}
-      <MemoryManager
-        isOpen={isMemoryOpen}
-        onClose={() => setIsMemoryOpen(false)}
-      />
+      <MemoryManager isOpen={isMemoryOpen} onClose={closeMemory} />
 
       {/* Observability panel */}
       <ObservabilityPanel
         isOpen={isObservabilityOpen}
-        onClose={() => setIsObservabilityOpen(false)}
+        onClose={closeObservability}
         sessions={sessions}
         activeSessionId={activeSessionId}
       />
 
       {/* Structured diff viewer (lazy-loads by diff_id, opened on demand) */}
-      <DiffViewer
-        isOpen={isDiffOpen}
-        onClose={() => setIsDiffOpen(false)}
-        diffId={lastDiffIds[activeSessionId] ?? null}
+      <DiffViewer isOpen={isDiffOpen} onClose={closeDiff} diffId={lastDiffIds[activeSessionId] ?? null} />
+
+      {/* File preview (workspace-contained, UTF-8, size-capped; loads itself) */}
+      <FilePreview
+        isOpen={previewTarget !== null}
+        onClose={closePreview}
+        workspace={activeSession?.workspace || workspace}
+        target={previewTarget}
       />
     </div>
   );

@@ -16,6 +16,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { PermissionRule, SettingsState, ToolName } from '../types';
+import { approvalModeLabel, permissionsToMode } from '../lib/approval';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -24,7 +25,7 @@ interface SettingsModalProps {
   onSave: (newSettings: SettingsState) => Promise<void>;
 }
 
-export const SettingsModal: React.FC<SettingsModalProps> = ({
+const SettingsModalInner: React.FC<SettingsModalProps> = ({
   isOpen,
   onClose,
   settings,
@@ -196,7 +197,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <Shield className="w-3.5 h-3.5 text-accent" />
                 细粒度工具执行策略
               </label>
-              <span className="text-[11px] text-secondary">始终允许 (allow) / 弹窗审批 (ask) / 彻底禁用 (deny)</span>
+              <span className="text-[11px] text-secondary">
+                当前模式：
+                <span className="text-accent font-semibold">
+                  {approvalModeLabel(permissionsToMode(currentSettings.permissions))}
+                </span>
+                {' · '}始终允许 (allow) / 弹窗审批 (ask) / 彻底禁用 (deny)
+              </span>
             </div>
 
             <div className="rounded-2xl border border-hairline bg-white overflow-hidden divide-y divide-hairline-2 shadow-xs">
@@ -283,3 +290,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     </div>
   );
 };
+
+/** Memoized: open modal must not re-render on streaming frame flushes. */
+export const SettingsModal = React.memo(SettingsModalInner);
