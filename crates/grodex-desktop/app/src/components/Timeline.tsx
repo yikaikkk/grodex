@@ -272,7 +272,7 @@ const AssistantMessage = React.memo(({ item, onPreviewFile }: AssistantMessagePr
               {markdown}
             </div>
           )}
-          <div className="flex items-center justify-between mt-3.5 pt-2.5 border-t border-hairline-2 text-[11px] font-sans text-secondary gap-4">
+          <div className="flex items-center justify-between mt-3.5 pt-2.5 border-t border-hairline-2 text-[11px] font-sans text-secondary gap-4 select-none">
             <div className="flex items-center gap-3">
               <span className="flex items-center gap-1 font-sans">
                 <Cpu className="w-3 h-3 text-tertiary" />
@@ -295,7 +295,7 @@ const AssistantMessage = React.memo(({ item, onPreviewFile }: AssistantMessagePr
           </div>
         </div>
         {item.timestamp && (
-          <span className="text-[10px] text-tertiary mt-1 pl-1 font-sans">
+          <span className="text-[10px] text-tertiary mt-1 pl-1 font-sans select-none">
             {item.timestamp}
           </span>
         )}
@@ -358,7 +358,7 @@ export const Timeline = React.memo(({ items, onOpenDiff, onPreviewFile, scrollTo
               </p>
             </div>
             {item.timestamp && (
-              <span className="text-[10px] text-tertiary mt-1 pr-1 font-sans">
+              <span className="text-[10px] text-tertiary mt-1 pr-1 font-sans select-none">
                 {item.timestamp}
               </span>
             )}
@@ -377,7 +377,7 @@ export const Timeline = React.memo(({ items, onOpenDiff, onPreviewFile, scrollTo
     <div
       ref={containerRef}
       id="session-timeline-container"
-      className="flex-1 overflow-y-auto px-4 sm:px-6 py-5 w-full space-y-4 font-sans [contain:content]"
+      className="flex-1 overflow-y-auto px-4 sm:px-6 py-5 w-full space-y-4 font-sans select-text [contain:content]"
     >
       {rows.map((row) =>
         row.kind === 'frame' ? (

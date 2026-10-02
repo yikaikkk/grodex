@@ -1385,3 +1385,23 @@ export async function getDiff(diffId: string): Promise<DiffPayload> {
     });
   });
 }
+
+// ── Device panel (docs/23) ─────────────────────────────────────────────
+
+export interface AdbDevice {
+  serial: string;
+  model: string;
+  /** device | offline | unauthorized | ... */
+  state: string;
+}
+
+export interface AdbDeviceListResult {
+  devices: AdbDevice[];
+  /** [device] enabled = true in ~/.grodex/config.toml */
+  device_tools_enabled: boolean;
+}
+
+/** List adb-attached devices (desktop runs `adb devices -l` directly). */
+export async function listAdbDevices(): Promise<AdbDeviceListResult> {
+  return invoke<AdbDeviceListResult>('list_adb_devices');
+}

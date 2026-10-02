@@ -45,6 +45,7 @@ fn main() {
             commands::update_tool_permissions,
             commands::get_tool_permissions,
             commands::preview_file,
+            commands::list_adb_devices,
             workspace_ui::list_workspace_entries,
             workspace_ui::search_workspace,
             memory_ui::list_memories,

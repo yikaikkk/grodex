@@ -21,6 +21,7 @@ pub mod blob_store;
 pub mod blocking;
 pub mod cancel;
 pub mod common;
+pub mod device;
 pub mod edit;
 pub mod exec;
 pub mod file_observation;

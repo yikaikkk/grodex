@@ -1,5 +1,13 @@
 import React from 'react';
-import { Settings, GitBranch, Brain, Activity, Folder, Files } from 'lucide-react';
+import {
+  Settings,
+  GitBranch,
+  Brain,
+  Activity,
+  Folder,
+  Files,
+  Smartphone,
+} from 'lucide-react';
 import { Session } from '../types';
 
 interface HeaderProps {
@@ -8,6 +16,8 @@ interface HeaderProps {
   isAgentTreeOpen: boolean;
   onToggleWorkspace: () => void;
   isWorkspaceOpen: boolean;
+  onToggleDevices: () => void;
+  isDevicesOpen: boolean;
   onOpenSettings: () => void;
   onOpenMemory: () => void;
   onOpenObservability: () => void;
@@ -19,6 +29,8 @@ const HeaderInner: React.FC<HeaderProps> = ({
   isAgentTreeOpen,
   onToggleWorkspace,
   isWorkspaceOpen,
+  onToggleDevices,
+  isDevicesOpen,
   onOpenSettings,
   onOpenMemory,
   onOpenObservability,
@@ -63,6 +75,19 @@ const HeaderInner: React.FC<HeaderProps> = ({
           title="展开/收起工作区文件面板"
         >
           <Files className="w-4 h-4" />
+        </button>
+
+        <button
+          id="header-devices-toggle-btn"
+          onClick={onToggleDevices}
+          className={`flex items-center gap-1 p-1.5 rounded-lg text-xs font-medium transition-all active:scale-95 ${
+            isDevicesOpen
+              ? 'bg-accent-soft text-accent'
+              : 'text-secondary hover:bg-black/[0.05] hover:text-primary'
+          }`}
+          title="展开/收起设备连接面板"
+        >
+          <Smartphone className="w-4 h-4" />
         </button>
 
         <button

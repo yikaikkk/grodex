@@ -28,6 +28,7 @@ import { MemoryManager } from './components/MemoryManager';
 import { ObservabilityPanel } from './components/ObservabilityPanel';
 import { DiffViewer } from './components/DiffViewer';
 import { WorkspacePanel } from './components/WorkspacePanel';
+import { DevicePanel } from './components/DevicePanel';
 import { FilePreview, FilePreviewTarget } from './components/FilePreview';
 import { AlertTriangle, RotateCcw, XCircle, Check, Loader2, Trash2 } from 'lucide-react';
 
@@ -66,9 +67,10 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [isMemoryOpen, setIsMemoryOpen] = useState<boolean>(false);
   const [isObservabilityOpen, setIsObservabilityOpen] = useState<boolean>(false);
-  // Workspace file panel — mutually exclusive with the agent tree so two
-  // wide side panels never squeeze the timeline at once.
+  // Right side panels are mutually exclusive (device / workspace files /
+  // agent tree) so two wide panels never squeeze the timeline at once.
   const [isWorkspaceOpen, setIsWorkspaceOpen] = useState<boolean>(false);
+  const [isDevicesOpen, setIsDevicesOpen] = useState<boolean>(false);
   // Currently previewed file (FilePreview resolves it against the active
   // workspace; `null` = closed).
   const [previewTarget, setPreviewTarget] = useState<FilePreviewTarget | null>(null);
@@ -824,13 +826,21 @@ export default function App() {
   const toggleAgentTreePanel = useCallback(() => {
     setIsAgentTreeOpen((v) => !v);
     setIsWorkspaceOpen(false);
+    setIsDevicesOpen(false);
   }, []);
   const toggleWorkspacePanel = useCallback(() => {
     setIsWorkspaceOpen((v) => !v);
     setIsAgentTreeOpen(false);
+    setIsDevicesOpen(false);
+  }, []);
+  const toggleDevicesPanel = useCallback(() => {
+    setIsDevicesOpen((v) => !v);
+    setIsAgentTreeOpen(false);
+    setIsWorkspaceOpen(false);
   }, []);
   const closeAgentTree = useCallback(() => setIsAgentTreeOpen(false), []);
   const closeWorkspace = useCallback(() => setIsWorkspaceOpen(false), []);
+  const closeDevices = useCallback(() => setIsDevicesOpen(false), []);
   const openSettings = useCallback(() => setIsSettingsOpen(true), []);
   const openMemory = useCallback(() => setIsMemoryOpen(true), []);
   const openObservability = useCallback(() => setIsObservabilityOpen(true), []);
@@ -878,6 +888,8 @@ export default function App() {
         isAgentTreeOpen={isAgentTreeOpen}
         onToggleWorkspace={toggleWorkspacePanel}
         isWorkspaceOpen={isWorkspaceOpen}
+        onToggleDevices={toggleDevicesPanel}
+        isDevicesOpen={isDevicesOpen}
         onOpenSettings={openSettings}
         onOpenMemory={openMemory}
         onOpenObservability={openObservability}
@@ -976,6 +988,8 @@ export default function App() {
 
         {/* Right collapsible side panels — mutually exclusive (see Header
             toggles): workspace files OR the agent tree, never both. */}
+        <DevicePanel isOpen={isDevicesOpen} onClose={closeDevices} />
+
         <WorkspacePanel
           isOpen={isWorkspaceOpen}
           onClose={closeWorkspace}

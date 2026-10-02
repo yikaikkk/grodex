@@ -689,6 +689,15 @@ impl SessionRuntimeBuilder {
         //   - a shared SamplingActor (so it can actually run sub-agent turns)
         //   - a RolloutWriter clone (so spawn/complete are journaled)
         register_builtin(&coordinator, ReadFileTool::new()).await;
+        // Device control (docs/23): phone_* tools share one lazy gateway
+        // sidecar; only registered when [device] enabled = true so phones
+        // stay out of the tool schema by default.
+        if device_tools_enabled(&cfg) {
+            let device_cfg = parse_device_config(&cfg);
+            for tool in grodex_tools::device::phone_tool_set(device_cfg) {
+                register_builtin(&coordinator, tool).await;
+            }
+        }
         // load_skill:复用 supervisor 的 SkillCatalog 发现(cwd/trusted 一致),
         // 共享一份 Arc<Mutex<_>>,避免重复扫描且保证 load 的是同一批 skill。
         let skill_catalog = Arc::new(std::sync::Mutex::new(
@@ -1453,6 +1462,56 @@ async fn register_builtin(coordinator: &TurnCoordinator, tool: impl grodex_core:
 ///
 /// When neither `[rules]` nor `[[permission_rules]]` is present, a safe
 /// default is applied: `read_file` → Allow, `*` → Ask.
+/// Parse the `[device]` section (docs/23 §8) onto the typed config.
+/// Unspecified fields keep their doc defaults.
+fn parse_device_config(cfg: &toml::Value) -> grodex_tools::device::DeviceConfig {
+    use grodex_tools::device::DeviceConfig;
+    let mut out = DeviceConfig::default();
+    let Some(d) = cfg.get("device") else {
+        return out;
+    };
+    if let Some(cmd) = d.get("gateway_command").and_then(|v| v.as_array()) {
+        let parts: Vec<String> = cmd
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        if !parts.is_empty() {
+            out.gateway_command = parts;
+        }
+    }
+    if let Some(wd) = d.get("working_dir").and_then(|v| v.as_str()) {
+        out.working_dir = Some(std::path::PathBuf::from(wd));
+    }
+    if let Some(serial) = d.get("default_serial").and_then(|v| v.as_str()) {
+        out.default_serial = serial.to_string();
+    }
+    if let Some(idle) = d.get("idle_timeout_secs").and_then(|v| v.as_integer()) {
+        out.idle_timeout_secs = idle.max(0) as u64;
+    }
+    if let Some(guard) = d.get("payment_guard").and_then(|v| v.as_bool()) {
+        out.payment_guard = guard;
+    }
+    if let Some(pkgs) = d.get("payment_packages").and_then(|v| v.as_array()) {
+        let parsed: Vec<String> = pkgs
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        if !parsed.is_empty() {
+            out.payment_packages = parsed;
+        }
+    }
+    out
+}
+
+/// `[device] enabled = true` gates the phone_* tools (docs/23). Absent or
+/// false → devices stay out of the tool schema entirely.
+fn device_tools_enabled(cfg: &toml::Value) -> bool {
+    cfg.get("device")
+        .and_then(|d| d.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn build_permission_policy(cfg: &toml::Value) -> PermissionPolicy {
     let mut policy = PermissionPolicy::new();
 

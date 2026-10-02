@@ -67,14 +67,14 @@ const ToolCardInner: React.FC<ToolCardProps> = ({ item, onOpenDiff, compact }) =
     switch (item.status) {
       case 'pending':
         return (
-          <span className="flex items-center gap-1 text-[11px] px-2.5 py-0.5 rounded-full bg-well text-secondary border border-hairline">
+          <span className="flex items-center gap-1 text-[11px] px-2.5 py-0.5 rounded-full bg-well text-secondary border border-hairline select-none">
             <Clock className="w-3 h-3" />
             排队中
           </span>
         );
       case 'running':
         return (
-          <span className="flex items-center gap-1.5 text-[11px] px-2.5 py-0.5 rounded-full bg-accent-soft text-accent border border-accent-soft font-mono">
+          <span className="flex items-center gap-1.5 text-[11px] px-2.5 py-0.5 rounded-full bg-accent-soft text-accent border border-accent-soft font-mono select-none">
             <Loader2 className="w-3 h-3 animate-spin text-accent" />
             {liveElapsed.toFixed(1)}s
           </span>

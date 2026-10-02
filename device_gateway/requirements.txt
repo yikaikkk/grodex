@@ -1,0 +1,4 @@
+# device_gateway runtime deps — versions pinned per docs/23-device-control-design.md §11
+uiautomator2>=3.2.0,<4
+# raw adb listing (u2 3.x removed its module-level adb)
+adbutils>=2.12,<3

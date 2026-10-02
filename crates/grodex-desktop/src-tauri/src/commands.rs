@@ -287,3 +287,167 @@ fn replace_rules_section(content: &str, new_section: &str) -> String {
         }
     }
 }
+
+// ── Device panel (docs/23) ──────────────────────────────────────────
+
+/// One adb-attached device for the frontend device panel.
+#[derive(serde::Serialize)]
+pub struct AdbDeviceJson {
+    pub serial: String,
+    pub model: String,
+    /// `device` | `offline` | `unauthorized` | ...
+    pub state: String,
+}
+
+/// Is `[device] enabled = true` in ~/.grodex/config.toml? Gates the hint
+/// shown when phone tools are absent from the session schema.
+fn device_tools_enabled() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let path = home.join(".grodex").join("config.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let parsed = toml::from_str::<toml::Value>(&text).ok();
+    parsed
+        .as_ref()
+        .and_then(|v| v.get("device"))
+        .and_then(|d| d.get("enabled"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+}
+
+/// Split one `adb devices -l` line into (serial, rest). Delimiters are
+/// TAB or runs of 2+ spaces — see the note in `list_adb_devices`.
+fn split_adb_line(line: &str) -> Option<(String, String)> {
+    // 1) Unambiguous: TAB or runs of 2+ spaces.
+    let bytes = line.as_bytes();
+    let mut split_at: Option<usize> = None;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\t' {
+            split_at = Some(i);
+            break;
+        }
+        if *b == b' ' && i + 1 < bytes.len() && bytes[i + 1] == b' ' {
+            split_at = Some(i);
+            break;
+        }
+    }
+    if let Some(i) = split_at {
+        let serial = line[..i].trim().to_string();
+        let rest = line[i..].trim().to_string();
+        return Some((serial, rest));
+    }
+    // 2) `adb devices -l` pads short serials with spaces, so a LONG serial
+    //    (wireless mDNS) leaves only a SINGLE space before the state word.
+    //    Find a known state token instead.
+    const STATES: [&str; 6] = [
+        "offline",
+        "unauthorized",
+        "recovering",
+        "no permissions",
+        "seeding",
+        "device",
+    ];
+    for state in STATES {
+        let needle = format!(" {state}");
+        if let Some(pos) = line.find(&needle) {
+            let after = &line[pos + needle.len()..];
+            if after.is_empty() || after.starts_with(' ') {
+                let serial = line[..pos].trim().to_string();
+                if !serial.is_empty() {
+                    let rest = line[pos + 1..].trim().to_string();
+                    return Some((serial, rest));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// List adb-attached devices. Runs `adb devices -l` directly from the
+/// desktop process — independent of whether `grodex serve` is running.
+#[tauri::command]
+pub async fn list_adb_devices() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = std::process::Command::new("adb")
+            .args(["devices", "-l"])
+            .output()
+            .map_err(|e| format!("adb 不可用：请安装 platform-tools 并确认 PATH（{e}）"))?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut devices: Vec<AdbDeviceJson> = Vec::new();
+        // First line is the "List of devices attached" banner.
+        //
+        // Column split must be TAB or runs of 2+ spaces: wireless TLS/mDNS
+        // serials legitimately contain single spaces (e.g.
+        // 'adb-xxxx (2)._adb-tls-connect._tcp'), so split_whitespace would
+        // corrupt the serial.
+        for line in text.lines().skip(1) {
+            let Some((serial, rest)) = split_adb_line(line) else {
+                continue;
+            };
+            let state = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let mut model = String::new();
+            for c in rest.split_whitespace() {
+                if let Some(m) = c.strip_prefix("model:") {
+                    model = m.to_string();
+                }
+            }
+            if serial.is_empty() {
+                continue;
+            }
+            devices.push(AdbDeviceJson {
+                serial,
+                model,
+                state,
+            });
+        }
+        Ok(serde_json::json!({
+            "devices": devices,
+            "device_tools_enabled": device_tools_enabled(),
+        }))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
+}
+#[cfg(test)]
+mod adb_line_tests {
+    use super::split_adb_line;
+
+    #[test]
+    fn mdns_serial_with_spaces() {
+        let line = "adb-dffb9378-f6ME0H (2)._adb-tls-connect._tcp\tdevice product:qssi model:25053RT47C device:qssi";
+        let (serial, rest) = split_adb_line(line).unwrap();
+        assert_eq!(serial, "adb-dffb9378-f6ME0H (2)._adb-tls-connect._tcp");
+        assert!(rest.starts_with("device "));
+        assert!(rest.contains("model:25053RT47C"));
+    }
+
+    #[test]
+    fn two_space_delimiter() {
+        let (serial, rest) = split_adb_line("1A2B3C4D  offline").unwrap();
+        assert_eq!(serial, "1A2B3C4D");
+        assert_eq!(rest, "offline");
+    }
+
+    #[test]
+    fn banner_line_is_rejected() {
+        assert!(split_adb_line("List of devices attached").is_none());
+    }
+
+    #[test]
+    fn single_space_long_serial_dash_l() {
+        // `adb devices -l` with a serial longer than the pad width: the
+        // separator before the state word is a SINGLE space.
+        let line = "adb-dffb9378-f6ME0H (2)._adb-tls-connect._tcp device product:qssi model:25053RT47C device:qssi";
+        let (serial, rest) = split_adb_line(line).unwrap();
+        assert_eq!(serial, "adb-dffb9378-f6ME0H (2)._adb-tls-connect._tcp");
+        assert!(rest.starts_with("device"));
+        assert!(rest.contains("model:25053RT47C"));
+    }
+}
