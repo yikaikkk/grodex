@@ -46,3 +46,7 @@ node_modules/
 dist/
 .vite/
 *.tsbuildinfo
+
+# ── Python 缓存（device_gateway 等）──
+__pycache__/
+*.pyc
